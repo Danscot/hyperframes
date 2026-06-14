@@ -1,9 +1,9 @@
 ---
 title: Rendering
-description: "Render compositions to MP4, MOV, or WebM locally or in Docker."
+description: "Render compositions to MP4, MOV, WebM, GIF, or PNG sequences locally or in Docker."
 ---
 
-Render your Hyperframes [compositions](/concepts/compositions) to MP4, MOV, or WebM with the [CLI](/packages/cli). The rendering pipeline is frame-by-frame and seek-driven — see [Deterministic Rendering](/concepts/determinism) for how this works under the hood.
+Render your Hyperframes [compositions](/concepts/compositions) to MP4, MOV, WebM, GIF, or PNG sequences with the [CLI](/packages/cli). The rendering pipeline is frame-by-frame and seek-driven — see [Deterministic Rendering](/concepts/determinism) for how this works under the hood.
 
 ## Getting Started
 
@@ -116,14 +116,18 @@ Render your Hyperframes [compositions](/concepts/compositions) to MP4, MOV, or W
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
 | `--output` | path | `renders/<name>.mp4` | Output file path |
-| `--format` | mp4, mov, webm, png-sequence | mp4 | Output format (see [Transparent Video](#transparent-video) below) |
+| `--format` | mp4, mov, webm, gif, png-sequence | mp4 | Output format (see [Transparent Video](#transparent-video) below) |
 | `--fps` | 24, 30, 60 | 30 | Frames per second |
+| `--gif-loop` | 0-65535 | 0 | GIF loop count. `0` loops forever |
 | `--quality` | draft, standard, high | standard | Encoding quality preset |
 | `--crf` | 0–51 | — | Override CRF (lower = higher quality). Cannot combine with `--video-bitrate` |
 | `--video-bitrate` | e.g. `10M`, `5000k` | — | Target bitrate encoding. Cannot combine with `--crf` |
 | `--workers` | 1-8 or `auto` | auto | Parallel render workers (see [Workers](#workers) below) |
 | `--max-concurrent-renders` | 1-10 | 2 | Max simultaneous renders via the producer server (see [Concurrent Renders](#concurrent-renders) below) |
-| `--gpu` | — | off | GPU encoding (NVENC, VideoToolbox, VAAPI, QSV) |
+| `--batch` | path | — | JSON array of variable rows (or `{ "rows": [...] }`), rendering one output per row |
+| `--batch-concurrency` | integer | 1 | Maximum batch rows to render at once |
+| `--batch-fail-fast` | — | off | Stop launching new batch rows after the first row failure |
+| `--gpu` | — | off | GPU encoding (NVENC, VideoToolbox, AMF, VAAPI, QSV) |
 | `--browser-gpu` / `--no-browser-gpu` | — | on locally, off in Docker | Use or opt out of host GPU acceleration for local Chrome/WebGL capture |
 | `--hdr` | — | off | Force HDR output even if no HDR sources are detected (MP4 only). See [HDR Rendering](/guides/hdr) |
 | `--sdr` | — | off | Force SDR output even if HDR sources are detected |
@@ -152,11 +156,23 @@ npx hyperframes render --video-bitrate 10M --output controlled.mp4
 
 **Tip**: The default `standard` preset (CRF 18) is visually lossless at 1080p — most people cannot distinguish it from the source. Use `--quality draft` for faster iteration, or `--quality high` / `--crf 10` when file size is no concern.
 
+## Animated GIF
+
+Use GIF when the output needs to autoplay inline in GitHub PRs, READMEs, issue reports, and docs pages:
+
+```bash Terminal
+npx hyperframes render --format gif --fps 15 --gif-loop 0 --output demo.gif
+```
+
+GIF output uses a two-pass FFmpeg palette encode (`palettegen` with diff statistics, then `paletteuse` with Sierra dithering) for better gradients and text edges than a single-pass conversion. GIFs are still much larger than MP4/WebM at the same dimensions, so prefer short compositions. GIF renders are capped at 30fps; pass `--fps 15` for smaller files.
+
+GIF does not carry audio and only has 1-bit transparency. For transparent overlays, use `--format webm`, `--format mov`, or `--format png-sequence` instead.
+
 ## GPU Acceleration
 
 Hyperframes has two separate GPU acceleration surfaces:
 
-- `--gpu` uses a hardware video encoder in FFmpeg when one is available. Supported backends include VideoToolbox on macOS, NVENC on NVIDIA systems, VAAPI on Linux, and Intel QSV on supported Windows/Linux hosts.
+- `--gpu` uses a hardware video encoder in FFmpeg when one is available. Supported backends include VideoToolbox on macOS, NVENC on NVIDIA systems, AMD AMF on Windows, VAAPI on Linux, and Intel QSV on supported Windows/Linux hosts.
 - Browser GPU uses the host GPU for local Chrome/WebGL capture. It is enabled automatically for local renders and disabled in Docker. Use `--no-browser-gpu` to opt out.
 
 ```bash Terminal
@@ -217,6 +233,25 @@ npx hyperframes render --workers 8 --output output.mp4
 - Long compositions (30+ seconds) on a machine with 8+ cores and 16+ GB RAM
 - Dedicated render machines or CI runners
 - Docker mode on a well-provisioned host
+
+## Batch Rendering
+
+Batch rendering runs the same composition once per variables row:
+
+```json rows.json
+[
+  { "name": "Alice", "headline": "Welcome, Alice" },
+  { "name": "Bob", "headline": "Welcome, Bob" }
+]
+```
+
+```bash Terminal
+npx hyperframes render --batch rows.json --output "renders/{name}.mp4" --strict-variables
+```
+
+`--output` is a template. Use `{index}` or any scalar key from the row to make each path unique. Hyperframes preflights the full batch before rendering: malformed rows, missing placeholders, duplicate output paths, and strict variable mismatches fail before the first video starts. A `manifest.json` file is written next to the outputs with per-row status, output path, render time, duration when available, and error details.
+
+Rows continue after failures by default so a bad data row does not discard the rest of the batch. Add `--batch-fail-fast` to stop launching new rows after the first failure, or `--json` to stream machine-readable progress events while the manifest is updated.
 
 ## Concurrent Renders
 

@@ -7,20 +7,8 @@ const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), 
 };
 
 export default defineConfig({
-  // hf#732 lever-4: emit BOTH the CLI bundle and the PNG decode + alpha-blit
-  // worker entry. The producer's `pngDecodeBlitWorkerPool` instantiates a
-  // Node `worker_threads` Worker via `new Worker(<path>)`, which is a
-  // filesystem load — it cannot share the parent module graph. The pool's
-  // path resolver probes for `pngDecodeBlitWorker.js` next to its own loaded
-  // module (which lives inside `dist/cli.js` after the producer is
-  // `noExternal`'d and bundled in). Without this entry the file would not
-  // exist at runtime and the pool would either crash or silently fall back
-  // to inline decode/blit, killing the perf gain.
   entry: {
     cli: "src/cli.ts",
-    pngDecodeBlitWorker: "../producer/src/services/pngDecodeBlitWorker.ts",
-    // hf#677/#732: shader-blend worker. Same `new Worker(<path>)`
-    // bundling rationale as `pngDecodeBlitWorker` above.
     shaderTransitionWorker: "../producer/src/services/shaderTransitionWorker.ts",
   },
   format: ["esm"],
@@ -59,6 +47,12 @@ var __dirname = __hf_dirname(__filename);`,
     // @hyperframes/aws-lambda being a `dependencies` entry in package.json.
     "@hyperframes/aws-lambda",
     "@hyperframes/aws-lambda/sdk",
+    // Same treatment for the GCP adapter: the cloudrun subverb files
+    // dynamic-import `@hyperframes/gcp-cloud-run/sdk` only when the user runs
+    // `hyperframes cloudrun *`. Keep it external; runtime resolution comes
+    // from the `dependencies`/workspace entry, not the bundled CLI.
+    "@hyperframes/gcp-cloud-run",
+    "@hyperframes/gcp-cloud-run/sdk",
   ],
   noExternal: [
     "@hyperframes/core",
@@ -88,10 +82,8 @@ var __dirname = __hf_dirname(__filename);`,
       // which would resolve to `../aws-lambda/src/index.ts/sdk` without
       // an explicit subpath alias. The SDK subpath has its own barrel.
       "@hyperframes/aws-lambda/sdk": resolve(__dirname, "../aws-lambda/src/sdk/index.ts"),
-      // hf#732 lever-4: alias for the PNG decode+blit worker's import.
-      // `alphaBlit.ts` is import-free (only zlib) so the worker survives
-      // the worker_thread loader boundary directly via this TS source.
-      "@hyperframes/engine/alpha-blit": resolve(__dirname, "../engine/src/utils/alphaBlit.ts"),
+      // Same for the GCP adapter's SDK subpath barrel.
+      "@hyperframes/gcp-cloud-run/sdk": resolve(__dirname, "../gcp-cloud-run/src/sdk/index.ts"),
       // hf#677 follow-up: the shader-blend worker imports from
       // `@hyperframes/engine/shader-transitions` (subpath export) — a
       // standalone TS file with zero internal imports that survives the

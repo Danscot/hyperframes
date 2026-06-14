@@ -5,6 +5,7 @@ import type {
   RuntimeTimelineLike,
 } from "./types";
 import { swallow } from "./diagnostics";
+import { readElementPlaybackRate } from "./media";
 import { createRuntimeStartTimeResolver } from "./startResolver";
 
 const AUTHORED_DURATION_ATTR = "data-hf-authored-duration";
@@ -176,7 +177,6 @@ function buildTimelineClipLabel(node: Element, kind: RuntimeTimelineClip["kind"]
 
 export function collectRuntimeTimelinePayload(params: {
   canonicalFps: number;
-  maxTimelineDurationSeconds: number;
 }): RuntimeTimelineMessage {
   const runtimeWindow = window as Window & {
     __timelines?: Record<string, RuntimeTimelineLike | undefined>;
@@ -209,7 +209,7 @@ export function collectRuntimeTimelinePayload(params: {
       parseNum(mediaEl.getAttribute("data-media-start")) ??
       0;
     if (Number.isFinite(mediaEl.duration) && mediaEl.duration > playbackStart) {
-      return Math.max(0, mediaEl.duration - playbackStart);
+      return Math.max(0, (mediaEl.duration - playbackStart) / readElementPlaybackRate(mediaEl));
     }
     return null;
   };
@@ -220,7 +220,9 @@ export function collectRuntimeTimelinePayload(params: {
     if (mediaNodes.length === 0) return null;
     let maxWindowEndSeconds = 0;
     for (const mediaNode of mediaNodes) {
-      const start = startResolver.resolveStartForElement(mediaNode, 0);
+      const start = !mediaNode.hasAttribute("data-hf-auto-start")
+        ? Math.max(0, Number(mediaNode.getAttribute("data-start") ?? 0) || 0)
+        : startResolver.resolveStartForElement(mediaNode, 0);
       if (!Number.isFinite(start)) continue;
       const duration = resolveMediaElementDurationSeconds(mediaNode);
       if (duration == null || duration <= 0) continue;
@@ -345,10 +347,7 @@ export function collectRuntimeTimelinePayload(params: {
           mediaWindowDurationCandidate,
           compositionWindowDurationCandidate,
         ));
-  const rootCompositionDuration =
-    preferredRootDuration != null
-      ? Math.min(preferredRootDuration, params.maxTimelineDurationSeconds)
-      : null;
+  const rootCompositionDuration = preferredRootDuration ?? null;
   const rootCompositionEnd =
     rootCompositionDuration != null ? rootCompositionStart + rootCompositionDuration : null;
   const timelineWindowEnd =
@@ -664,13 +663,7 @@ export function collectRuntimeTimelinePayload(params: {
   // hide structural/background tracks from the timeline UI; if we collapse the
   // payload duration down to the last visible clip end, the controls jump even
   // though playback still runs for the full authored root duration.
-  const safeDuration = Math.max(
-    1,
-    Math.min(
-      Math.max(maxEnd || 1, rootCompositionDuration ?? 0),
-      params.maxTimelineDurationSeconds,
-    ),
-  );
+  const safeDuration = Math.max(1, maxEnd || 1, rootCompositionDuration ?? 0);
   const shouldEmitNonDeterministicInf = timelineLooksLoopInflated && attrDurationCandidate == null;
   const durationInFrames = shouldEmitNonDeterministicInf
     ? Number.POSITIVE_INFINITY

@@ -21,6 +21,8 @@ async function loadRuntimeSourceForDev(
   return null;
 }
 
+const studioPkg = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8"));
+
 // ── Bridge Hono fetch → Node http response ───────────────────────────────────
 
 async function bridgeHonoResponse(
@@ -167,7 +169,7 @@ function devProjectApi(): Plugin {
 export default defineConfig({
   plugins: [react(), devProjectApi()],
   define: {
-    __STUDIO_VERSION__: JSON.stringify(process.env.npm_package_version ?? "dev"),
+    __STUDIO_VERSION__: JSON.stringify(studioPkg.version),
   },
   resolve: {
     alias: {
@@ -180,5 +182,17 @@ export default defineConfig({
   },
   server: {
     port: 5190,
+  },
+  ssr: {
+    // recast / @babel/parser are CommonJS and call `require("fs")`. They are
+    // reachable only server-side via the Node-only `@hyperframes/core/gsap-parser`
+    // subpath (studio-api GSAP mutations + the linter), which the dev server loads
+    // through Vite SSR. Externalizing them makes SSR load the native Node modules
+    // instead of esbuild-transforming the `require` into a shim that throws
+    // "Dynamic require of fs is not supported". Browser bundles never reach them.
+    external: ["recast", "@babel/parser", "ast-types"],
+  },
+  test: {
+    exclude: ["data/**", "node_modules/**"],
   },
 });

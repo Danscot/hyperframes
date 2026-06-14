@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseHTML } from "linkedom";
@@ -15,6 +15,17 @@ function makeTempProject(files: Record<string, string>): string {
     writeFileSync(full, content, "utf-8");
   }
   return dir;
+}
+
+// Mirror the repo convention (preview.test.ts): skip symlink cases on
+// non-symlink-privileged Windows runners rather than crash the suite.
+function tryCreateSymlink(target: string, path: string, type: "dir" | "file"): boolean {
+  try {
+    symlinkSync(target, path, type);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 describe("bundleToSingleHtml", () => {
@@ -48,6 +59,47 @@ describe("bundleToSingleHtml", () => {
     // runtime tag — it stays as its own <script> elsewhere in the document.
     expect(runtimeBlock).not.toContain("window.__timelines.main = { duration:");
     expect(bundled).toContain('document.getElementById("scene")');
+  });
+
+  it("inlines an in-project sub-composition script but not one reached through a symlink escaping the project root", async () => {
+    // Security: a shared/cloned project may carry a symlink pointing outside the
+    // root (e.g. ext -> /etc). The bundler reads+inlines local assets, so it must
+    // refuse to follow such a symlink and leak external file contents.
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><head>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+</head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <div id="scene-host"
+      data-composition-id="scene"
+      data-composition-src="compositions/scene.html"
+      data-start="0" data-duration="5"></div>
+  </div>
+  <script>window.__timelines={}; const tl=gsap.timeline({paused:true}); window.__timelines["main"]=tl;</script>
+</body></html>`,
+      "compositions/scene.html": `<template id="scene-template">
+  <div data-composition-id="scene" data-width="1920" data-height="1080">
+    <script src="assets/local.js"></script>
+    <script src="ext/secret.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      window.__timelines["scene"] = gsap.timeline({ paused: true });
+    </script>
+  </div>
+</template>`,
+      "assets/local.js": `window.__HF_LOCAL__ = "LOCAL_MARKER_INLINED";`,
+    });
+    const external = mkdtempSync(join(tmpdir(), "hf-bundler-external-"));
+    writeFileSync(join(external, "secret.js"), `window.__HF_SECRET__ = "SECRET_MARKER_LEAKED";`);
+    if (!tryCreateSymlink(external, join(dir, "ext"), "dir")) return;
+
+    const bundled = await bundleToSingleHtml(dir);
+
+    // Positive control: the in-project sub-comp script IS inlined, so the bundler
+    // would have inlined the symlinked one too had isSafePath not rejected it.
+    expect(bundled).toContain("LOCAL_MARKER_INLINED");
+    expect(bundled).not.toContain("SECRET_MARKER_LEAKED");
   });
 
   it("produces a self-contained runtime script when no HYPERFRAME_RUNTIME_URL is set", async () => {
@@ -248,6 +300,79 @@ describe("bundleToSingleHtml", () => {
     const hostEl = doc.getElementById("rockets-host");
     expect(hostEl).toBeTruthy();
     expect(hostEl?.hasAttribute("data-composition-src")).toBe(false);
+  });
+
+  it("inlines local scripts referenced by sub-compositions into the bundle", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><head>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+</head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <div id="scene-host"
+      data-composition-id="scene"
+      data-composition-src="compositions/scene.html"
+      data-start="0" data-duration="5"></div>
+  </div>
+  <script>window.__timelines={}; const tl=gsap.timeline({paused:true}); window.__timelines["main"]=tl;</script>
+</body></html>`,
+      "compositions/scene.html": `<template id="scene-template">
+  <div data-composition-id="scene" data-width="1920" data-height="1080">
+    <div id="scene-copy">Scene</div>
+    <script src="vendor/effect-plugin.js"></script>
+    <script src="assets/scene-runtime.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      window.__timelines["scene"] = gsap.timeline({ paused: true });
+    </script>
+  </div>
+</template>`,
+      "vendor/effect-plugin.js": `window.PowerGlitch = { glitch(){ return { startGlitch(){}, stopGlitch(){} }; } };`,
+      "assets/scene-runtime.js": `window.__HF_SHARED_TEST__ = "shared-runtime-loaded";`,
+    });
+
+    const bundled = await bundleToSingleHtml(dir);
+
+    expect(bundled).toContain('__HF_SHARED_TEST__ = "shared-runtime-loaded"');
+    expect(bundled).toContain("window.PowerGlitch = { glitch()");
+    expect(bundled).not.toContain('src="assets/scene-runtime.js"');
+    expect(bundled).not.toContain('src="vendor/effect-plugin.js"');
+  });
+
+  it("preserves local sub-composition script order before inline scene scripts", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><head>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+</head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <div
+      id="scene-host"
+      data-composition-id="scene"
+      data-composition-src="compositions/scene.html"
+      data-start="0" data-duration="5"></div>
+  </div>
+  <script>window.__timelines={}; const tl=gsap.timeline({paused:true}); window.__timelines["main"]=tl;</script>
+</body></html>`,
+      "compositions/scene.html": `<template id="scene-template">
+  <div data-composition-id="scene" data-width="1920" data-height="1080">
+    <script src="assets/component-runtime.js"></script>
+    <script>
+      window.__HF_COMPONENT_CALL__ = true;
+      window.Component.mount("#scene-host");
+    </script>
+  </div>
+</template>`,
+      "assets/component-runtime.js": `window.__HF_COMPONENT_DEF__ = true; window.Component = { mount(){ window.__HF_COMPONENT_MOUNTED__ = true; } };`,
+    });
+
+    const bundled = await bundleToSingleHtml(dir);
+    const componentIndex = bundled.indexOf("__HF_COMPONENT_DEF__");
+    const sceneIndex = bundled.indexOf("__HF_COMPONENT_CALL__");
+
+    expect(componentIndex).toBeGreaterThan(-1);
+    expect(sceneIndex).toBeGreaterThan(-1);
+    expect(componentIndex).toBeLessThan(sceneIndex);
   });
 
   it("does not duplicate CDN scripts already present in the main document", async () => {
@@ -685,6 +810,7 @@ describe("bundleToSingleHtml", () => {
     expect(bundled).toContain('[data-composition-id="scene"] .title { color: red; }');
     expect(bundled).toContain("new Proxy(window.document");
     expect(bundled).toContain("new Proxy(__hfBaseGsap");
+    expect(bundled).toContain("(function(document, gsap, window, __hyperframes)");
     expect(bundled).toContain('tl.to(".title"');
   });
 

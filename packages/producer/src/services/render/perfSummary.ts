@@ -4,15 +4,15 @@
  */
 
 import { fpsToNumber } from "@hyperframes/core";
+import type { CaptureCalibrationSample, CaptureCostEstimate } from "./captureCost.js";
 import type {
   CaptureAttemptSummary,
-  CaptureCalibrationSample,
-  CaptureCostEstimate,
   HdrDiagnostics,
   RenderJob,
   RenderPerfSummary,
 } from "../renderOrchestrator.js";
 import { type HdrPerfCollector, finalizeHdrPerf } from "./hdrPerf.js";
+import type { RenderObservabilitySummary } from "./observability.js";
 
 export function buildRenderPerfSummary(input: {
   job: RenderJob;
@@ -36,6 +36,7 @@ export function buildRenderPerfSummary(input: {
   captureAttempts: CaptureAttemptSummary[];
   hdrDiagnostics: HdrDiagnostics;
   hdrPerf?: HdrPerfCollector;
+  observability?: RenderObservabilitySummary;
   peakRssBytes: number;
   peakHeapUsedBytes: number;
 }): RenderPerfSummary {
@@ -74,6 +75,7 @@ export function buildRenderPerfSummary(input: {
         ? { ...input.hdrDiagnostics }
         : undefined,
     hdrPerf: input.hdrPerf ? finalizeHdrPerf(input.hdrPerf) : undefined,
+    observability: input.observability,
     captureAvgMs:
       input.totalFrames > 0
         ? Math.round((input.perfStages.captureMs ?? 0) / input.totalFrames)

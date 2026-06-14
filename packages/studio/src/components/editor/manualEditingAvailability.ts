@@ -2,7 +2,6 @@ export type StudioFeatureFlagEnv = Record<string, boolean | string | undefined>;
 
 const STUDIO_PREVIEW_MANUAL_DRAGGING_ENV = "VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING";
 const STUDIO_INSPECTOR_PANELS_ENV = "VITE_STUDIO_ENABLE_INSPECTOR_PANELS";
-const STUDIO_MOTION_PANEL_ENV = "VITE_STUDIO_ENABLE_MOTION_PANEL";
 const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes", "on", "enabled"]);
 const FALSY_ENV_VALUES = new Set(["0", "false", "no", "off", "disabled"]);
 
@@ -53,15 +52,37 @@ export const STUDIO_INSPECTOR_PANELS_ENABLED = resolveStudioBooleanEnvFlag(
   true,
 );
 
-export const STUDIO_MOTION_PANEL_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  [STUDIO_MOTION_PANEL_ENV, "VITE_STUDIO_MOTION_PANEL_ENABLED"],
-  false,
-);
-
 export const STUDIO_BLOCKS_PANEL_ENABLED = resolveStudioBooleanEnvFlag(
   env,
   ["VITE_STUDIO_ENABLE_BLOCKS_PANEL", "VITE_STUDIO_BLOCKS_PANEL_ENABLED"],
+  true,
+);
+
+export const STUDIO_GSAP_PANEL_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_ENABLE_GSAP_PANEL", "VITE_STUDIO_GSAP_PANEL_ENABLED"],
+  true,
+);
+
+export const STUDIO_KEYFRAMES_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_ENABLE_KEYFRAMES", "VITE_STUDIO_KEYFRAMES_ENABLED"],
+  false,
+);
+
+export const STUDIO_RAZOR_TOOL_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_ENABLE_RAZOR_TOOL", "VITE_STUDIO_RAZOR_TOOL_ENABLED"],
+  false,
+);
+
+// When disabled (the default), drag/resize/rotate commits always take the CSS
+// persist path instead of being intercepted into GSAP script keyframe
+// mutations. The keyframe intercept rewrites timeline tweens from drag
+// gestures and is opt-in until its recording path is hardened.
+export const STUDIO_GSAP_DRAG_INTERCEPT_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_ENABLE_GSAP_DRAG_INTERCEPT", "VITE_STUDIO_GSAP_DRAG_INTERCEPT_ENABLED"],
   true,
 );
 

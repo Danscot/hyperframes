@@ -33,6 +33,7 @@ import { isAbsolute, join } from "node:path";
 import {
   type CaptureVideoMetadataHint,
   type EngineConfig,
+  type ExtractedFrames,
   type FrameLookupTable,
   type HdrTransfer,
   type VideoColorSpace,
@@ -47,10 +48,10 @@ import { fpsToNumber } from "@hyperframes/core";
 import {
   collectVideoMetadataHints,
   collectVideoReadinessSkipIds,
-  materializeExtractedFramesForCompiledDir,
   type RenderJob,
 } from "../../renderOrchestrator.js";
-import { type CompositionMetadata } from "../shared.js";
+import { materializeExtractedFramesForCompiledDir, type CompositionMetadata } from "../shared.js";
+import type { ProducerLogger } from "../../../logger.js";
 
 export interface ExtractVideosStageInput {
   projectDir: string;
@@ -58,6 +59,7 @@ export interface ExtractVideosStageInput {
   compiledDir: string;
   job: RenderJob;
   cfg: EngineConfig;
+  log?: ProducerLogger;
   /** Mutated in place — audio entries auto-discovered from video files are pushed onto `composition.audios`. */
   composition: CompositionMetadata;
   abortSignal: AbortSignal | undefined;
@@ -102,6 +104,7 @@ export async function runExtractVideosStage(
     compiledDir,
     job,
     cfg,
+    log,
     composition,
     abortSignal,
     assertNotAborted,
@@ -122,6 +125,7 @@ export async function runExtractVideosStage(
   const nativeHdrVideoIds = new Set<string>();
   const videoTransfers = new Map<string, HdrTransfer>();
   if (job.config.hdrMode !== "force-sdr" && composition.videos.length > 0) {
+    log?.info("Probing video color spaces...", { videoCount: composition.videos.length });
     await Promise.all(
       composition.videos.map(async (v) => {
         // Use the shared resolver so a `<video src="../assets/foo">` in a
@@ -175,6 +179,11 @@ export async function runExtractVideosStage(
   }
 
   if (composition.videos.length > 0) {
+    const totalVideos = composition.videos.length;
+    for (let i = 0; i < totalVideos; i++) {
+      const v = composition.videos[i]!;
+      log?.info(`Extracting frames from video ${i + 1}/${totalVideos}: ${v.src}`);
+    }
     extractionResult = await extractAllVideoFrames(
       composition.videos,
       projectDir,
@@ -205,26 +214,7 @@ export async function runExtractVideosStage(
     );
     videoMetadataHints = collectVideoMetadataHints(extractionResult.extracted);
 
-    // Auto-detect audio from video files via ffprobe metadata
-    const existingAudioSrcs = new Set(composition.audios.map((a) => a.src));
-    for (const ext of extractionResult.extracted) {
-      if (ext.metadata.hasAudio) {
-        const video = composition.videos.find((v) => v.id === ext.videoId);
-        if (video && !existingAudioSrcs.has(video.src)) {
-          composition.audios.push({
-            id: `${video.id}-audio`,
-            src: video.src,
-            start: video.start,
-            end: video.end,
-            mediaStart: video.mediaStart,
-            layer: 0,
-            volume: 1.0,
-            type: "video",
-          });
-          existingAudioSrcs.add(video.src);
-        }
-      }
-    }
+    appendAutoDetectedVideoAudio(composition, extractionResult.extracted);
   }
   const videoExtractMs = Date.now() - stage2Start;
 
@@ -241,4 +231,32 @@ export async function runExtractVideosStage(
     imageColorSpaces,
     videoExtractMs,
   };
+}
+
+/**
+ * Auto-detect audio from extracted video files (ffprobe metadata) and append
+ * to composition.audios. Both the file AND the element must declare audio —
+ * a muted <video> whose source contains audio should not leak into the render.
+ */
+export function appendAutoDetectedVideoAudio(
+  composition: Pick<CompositionMetadata, "videos" | "audios">,
+  extracted: ExtractedFrames[],
+): void {
+  const existingAudioSrcs = new Set(composition.audios.map((a) => a.src));
+  for (const ext of extracted) {
+    if (!ext.metadata.hasAudio) continue;
+    const video = composition.videos.find((v) => v.id === ext.videoId);
+    if (!video || !video.hasAudio || existingAudioSrcs.has(video.src)) continue;
+    composition.audios.push({
+      id: `${video.id}-audio`,
+      src: video.src,
+      start: video.start,
+      end: video.end,
+      mediaStart: video.mediaStart,
+      layer: 0,
+      volume: 1.0,
+      type: "video",
+    });
+    existingAudioSrcs.add(video.src);
+  }
 }

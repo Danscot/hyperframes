@@ -57,17 +57,14 @@ import type { ProducerLogger } from "../../../logger.js";
 import { createHdrImageTransferCache } from "../../hdrImageTransferCache.js";
 import {
   type HdrCompositeContext,
-  type HdrDiagnostics,
-  type HdrPerfCollector,
   type HdrTransitionMeta,
   type HdrVideoFrameSource,
-  type ProgressCallback,
-  type RenderJob,
   type TransitionRange,
   closeHdrVideoFrameSource,
-  createHdrPerfCollector,
   resolveCompositeTransfer,
-} from "../../renderOrchestrator.js";
+} from "../../hdrCompositor.js";
+import { type HdrPerfCollector, createHdrPerfCollector } from "../hdrPerf.js";
+import type { HdrDiagnostics, ProgressCallback, RenderJob } from "../../renderOrchestrator.js";
 import type { CompositionMetadata } from "../shared.js";
 import {
   decodeHdrImageBuffers,
@@ -78,6 +75,7 @@ import {
 import { partitionTransitionFrames, shouldUseHybridLayeredPath } from "./captureHdrFrameShared.js";
 import { runSequentialLayeredFrameLoop } from "./captureHdrSequentialLoop.js";
 import { runHybridLayeredFrameLoop } from "./captureHdrHybridLoop.js";
+import { wrapCaptureStageError } from "../captureStageError.js";
 
 export interface CaptureHdrStageInput {
   job: RenderJob;
@@ -461,6 +459,9 @@ export async function runCaptureHdrStage(
     }
     captureDurationMs = Date.now() - stageStart;
     encodeMs = hdrEncodeResult.durationMs;
+  } catch (error) {
+    lastBrowserConsole = domSession.browserConsoleBuffer;
+    throw wrapCaptureStageError(error, lastBrowserConsole);
   } finally {
     if (hdrEncoder && !hdrEncoderClosed) {
       try {

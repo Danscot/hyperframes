@@ -45,6 +45,13 @@ declare global {
      * imperative push signal: `window.addEventListener("hf-seek", e => render(e.detail.time))`.
      */
     __hfTypegpuTime?: number;
+    /**
+     * Re-render GPU adapters (Three.js / WebGPU) at the given time, bypassing
+     * the `"hf-seek"` dedup. Called by the engine after injecting decoded
+     * video frames so GPU compositions re-upload their video textures from the
+     * freshly-injected `__render_frame__` images. See `forceDispatchSeekEvent`.
+     */
+    __hfReseekGpu?: (time: number) => void;
     __HF_PICKER_API?: HyperframePickerApi;
     gsap?: {
       timeline: (params?: { paused?: boolean }) => RuntimeTimelineLike;
@@ -105,6 +112,17 @@ declare global {
      * resolved values for the instance currently executing.
      */
     __hfVariablesByComp?: Record<string, Record<string, unknown>>;
+    /**
+     * Set to `true` while the GSAP tween-batching interceptor (injected via
+     * HF_EARLY_STUB in fileServer.ts) is still draining queued tween calls
+     * through requestAnimationFrame batches. Cleared and the "hf-timelines-built"
+     * CustomEvent is dispatched when all queues are empty.
+     *
+     * init.ts uses this to decide whether to defer `bindRootTimelineIfAvailable`:
+     * if true at DOMContentLoaded time, it adds a one-shot event listener and
+     * rebinds after the event fires.
+     */
+    __hfTimelinesBuilding?: boolean;
   }
 }
 

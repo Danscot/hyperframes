@@ -6,17 +6,14 @@ export type RuntimeJson =
   | RuntimeJson[]
   | { [key: string]: RuntimeJson };
 
+import type { HyperframeControlAction } from "../inline-scripts/runtimeContract.js";
+import type { HyperframePickerElementInfo } from "../inline-scripts/pickerApi.js";
+
 export type RuntimeBridgeControlAction =
-  | "play"
-  | "pause"
-  | "seek"
+  | HyperframeControlAction
   | "tick"
-  | "set-muted"
   | "set-volume"
   | "set-media-output-muted"
-  | "set-playback-rate"
-  | "enable-pick-mode"
-  | "disable-pick-mode"
   | "flash-elements";
 
 export type RuntimeBridgeControlMessage = {
@@ -85,23 +82,7 @@ export type RuntimeDiagnosticMessage = {
   details: Record<string, RuntimeJson>;
 };
 
-export type RuntimePickerBoundingBox = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
-export type RuntimePickerElementInfo = {
-  id: string | null;
-  tagName: string;
-  selector: string;
-  label: string;
-  boundingBox: RuntimePickerBoundingBox;
-  textContent: string | null;
-  src: string | null;
-  dataAttributes: Record<string, string>;
-};
+export type RuntimePickerElementInfo = HyperframePickerElementInfo;
 
 export type RuntimePickerHoveredMessage = {
   source: "hf-preview";
@@ -154,6 +135,20 @@ export type RuntimeMediaAutoplayBlockedMessage = {
 };
 
 /**
+ * Posted by the runtime when `installRuntimeControlBridge` finishes registering
+ * its message listener — signals that subsequent control messages
+ * (`set-muted`, `set-volume`, `set-playback-rate`, etc.) will now be received
+ * and processed. The parent (web component / host app) listens for this and
+ * replays current playback state to repair any race where bridge messages
+ * were posted before the listener was installed. Emitted again on every iframe
+ * reload because the new runtime instance starts with no state.
+ */
+export type RuntimeReadyMessage = {
+  source: "hf-preview";
+  type: "ready";
+};
+
+/**
  * Analytics events emitted by the runtime.
  *
  * The host app receives these via postMessage and forwards to its analytics
@@ -199,6 +194,7 @@ export type RuntimeOutboundMessage =
   | RuntimePickerCancelledMessage
   | RuntimeStageSizeMessage
   | RuntimeMediaAutoplayBlockedMessage
+  | RuntimeReadyMessage
   | RuntimeAnalyticsMessage
   | RuntimePerformanceMessage;
 

@@ -1,7 +1,34 @@
-import { parseGsapScript } from "../../parsers/gsapParser";
-import type { LintContext, HyperframeLintFinding } from "../context";
+interface LintParsedGsap {
+  animations: Array<{
+    targetSelector: string;
+    method: string;
+    position: number | string;
+    properties: Record<string, number | string>;
+    duration?: number;
+    ease?: string;
+    extras?: Record<string, unknown>;
+  }>;
+  timelineVar: string;
+}
+
+// The recast-based GSAP parser lives behind the Node-only
+// `@hyperframes/core/gsap-parser` subpath. The linter runs server-side only
+// (CLI + studio-api `/lint` route), so loading it via dynamic import keeps
+// recast out of any browser/SSR-traced static graph.
+async function loadParseGsapScript(): Promise<(script: string) => LintParsedGsap> {
+  const mod = await import("../../parsers/gsapParser.js");
+  return mod.parseGsapScript as unknown as (script: string) => LintParsedGsap;
+}
+import type { LintContext } from "../context";
+import type { HyperframeLintFinding, LintRule } from "../types";
 import type { OpenTag } from "../utils";
-import { readAttr, truncateSnippet, WINDOW_TIMELINE_ASSIGN_PATTERN } from "../utils";
+import {
+  readAttr,
+  truncateSnippet,
+  stripJsComments,
+  WINDOW_TIMELINE_ASSIGN_PATTERN,
+  TIMELINE_REGISTRY_ASSIGN_PATTERN,
+} from "../utils";
 
 // ── GSAP-specific types ────────────────────────────────────────────────────
 
@@ -22,74 +49,9 @@ type CompositionRange = {
   end: number;
 };
 
-const META_GSAP_KEYS = new Set(["duration", "ease", "repeat", "yoyo", "overwrite", "delay"]);
 const SCENE_BOUNDARY_EPSILON_SECONDS = 0.05;
 
 // ── GSAP parsing utilities ─────────────────────────────────────────────────
-
-function stripJsComments(source: string): string {
-  let out = "";
-  let i = 0;
-  let quote: "'" | '"' | "`" | null = null;
-  let escaped = false;
-
-  while (i < source.length) {
-    const ch = source[i] ?? "";
-    const next = source[i + 1] ?? "";
-
-    if (quote) {
-      out += ch;
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === quote) {
-        quote = null;
-      }
-      i += 1;
-      continue;
-    }
-
-    if (ch === "'" || ch === '"' || ch === "`") {
-      quote = ch;
-      out += ch;
-      i += 1;
-      continue;
-    }
-
-    if (ch === "/" && next === "/") {
-      out += "  ";
-      i += 2;
-      while (i < source.length && source[i] !== "\n" && source[i] !== "\r") {
-        out += " ";
-        i += 1;
-      }
-      continue;
-    }
-
-    if (ch === "/" && next === "*") {
-      out += "  ";
-      i += 2;
-      while (i < source.length) {
-        const blockCh = source[i] ?? "";
-        const blockNext = source[i + 1] ?? "";
-        if (blockCh === "*" && blockNext === "/") {
-          out += "  ";
-          i += 2;
-          break;
-        }
-        out += blockCh === "\n" || blockCh === "\r" ? blockCh : " ";
-        i += 1;
-      }
-      continue;
-    }
-
-    out += ch;
-    i += 1;
-  }
-
-  return out;
-}
 
 function countClassUsage(tags: OpenTag[]): Map<string, number> {
   const counts = new Map<string, number>();
@@ -105,148 +67,76 @@ function countClassUsage(tags: OpenTag[]): Map<string, number> {
 
 function readRegisteredTimelineCompositionId(script: string): string | null {
   const match = script.match(WINDOW_TIMELINE_ASSIGN_PATTERN);
-  return match?.[1] || null;
+  return match?.[1] || match?.[2] || null;
 }
 
-function extractGsapWindows(script: string): GsapWindow[] {
+/** Strip a `__raw:` prefix the parser adds to unresolvable values. */
+function unwrapRaw(value: unknown): string | number | undefined {
+  if (typeof value === "number") return value;
+  if (typeof value !== "string") return undefined;
+  const code = value.startsWith("__raw:") ? value.slice(6) : value;
+  return code.replace(/^\s*["']|["']\s*$/g, "");
+}
+
+function extrasNumber(value: unknown): number {
+  const unwrapped = unwrapRaw(value);
+  const numeric = typeof unwrapped === "number" ? unwrapped : Number(unwrapped);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+/** A readable single-line snippet of a tween for finding messages. */
+function synthesizeWindowRaw(
+  timelineVar: string,
+  anim: LintParsedGsap["animations"][number],
+): string {
+  const entries = Object.entries(anim.properties).map(([k, v]) => {
+    if (typeof v === "string" && v.startsWith("__raw:")) return `${k}: ${v.slice(6)}`;
+    return `${k}: ${typeof v === "string" ? JSON.stringify(v) : v}`;
+  });
+  if (anim.duration !== undefined) entries.push(`duration: ${anim.duration}`);
+  if (anim.ease) entries.push(`ease: ${JSON.stringify(anim.ease)}`);
+  const pos = typeof anim.position === "number" ? anim.position : JSON.stringify(anim.position);
+  return `${timelineVar}.${anim.method}("${anim.targetSelector}", { ${entries.join(", ")} }, ${pos})`;
+}
+
+const gsapWindowsCache = new Map<string, GsapWindow[]>();
+
+async function cachedExtractGsapWindows(scriptContent: string): Promise<GsapWindow[]> {
+  const cached = gsapWindowsCache.get(scriptContent);
+  if (cached) return cached;
+  const windows = await extractGsapWindows(scriptContent);
+  gsapWindowsCache.set(scriptContent, windows);
+  return windows;
+}
+
+// fallow-ignore-next-line complexity
+async function extractGsapWindows(script: string): Promise<GsapWindow[]> {
   if (!/gsap\.timeline/.test(script)) return [];
+  const parseGsapScript = await loadParseGsapScript();
   const parsed = parseGsapScript(script);
   if (parsed.animations.length === 0) return [];
 
   const windows: GsapWindow[] = [];
-  const timelineVar = parsed.timelineVar;
-  const methodPattern = new RegExp(
-    `${timelineVar}\\.(set|to|from|fromTo)\\s*\\(([^)]+(?:\\{[^}]*\\}[^)]*)+)\\)`,
-    "g",
-  );
-
-  let match: RegExpExecArray | null;
-  let index = 0;
-  while ((match = methodPattern.exec(script)) !== null && index < parsed.animations.length) {
-    const raw = match[0];
-    const args = match[2] ?? "";
-    // Skip calls whose first argument is not a quoted selector (e.g. object
-    // targets like `tl.to({ _: 0 }, …)` used to anchor timeline duration).
-    // `parseGsapScript` ignores those, so we must too — otherwise the regex
-    // match index drifts ahead of `parsed.animations[index]` and every
-    // subsequent window picks up the wrong animation's selector/position.
-    if (!/^\s*["']/.test(args)) continue;
-    const meta = parseGsapWindowMeta(match[1] ?? "", args);
-    const animation = parsed.animations[index];
-    index += 1;
-    if (!animation) continue;
+  for (const animation of parsed.animations) {
+    // Skip animations with string positions (e.g. "+=1", "<") — their absolute
+    // timing depends on runtime evaluation and can't be statically linted.
+    if (typeof animation.position !== "number") continue;
+    const repeat = extrasNumber(animation.extras?.repeat);
+    const cycleCount = repeat > 0 ? repeat + 1 : 1;
+    const effectiveDuration =
+      animation.method === "set" ? 0 : (animation.duration ?? 0) * cycleCount;
     windows.push({
       targetSelector: animation.targetSelector,
       position: animation.position,
-      end: animation.position + meta.effectiveDuration,
-      properties: meta.properties.length > 0 ? meta.properties : Object.keys(animation.properties),
-      propertyValues: meta.propertyValues,
-      overwriteAuto: meta.overwriteAuto,
-      method: match[1] ?? "to",
-      raw,
+      end: animation.position + effectiveDuration,
+      properties: Object.keys(animation.properties),
+      propertyValues: animation.properties,
+      overwriteAuto: unwrapRaw(animation.extras?.overwrite) === "auto",
+      method: animation.method,
+      raw: synthesizeWindowRaw(parsed.timelineVar, animation),
     });
   }
   return windows;
-}
-
-function parseGsapWindowMeta(
-  method: string,
-  argsStr: string,
-): {
-  effectiveDuration: number;
-  properties: string[];
-  propertyValues: Record<string, string | number>;
-  overwriteAuto: boolean;
-} {
-  const emptyMeta = {
-    effectiveDuration: 0,
-    properties: [],
-    propertyValues: {},
-    overwriteAuto: false,
-  };
-  const selectorMatch = argsStr.match(/^\s*["']([^"']+)["']\s*,/);
-  if (!selectorMatch) return emptyMeta;
-
-  const afterSelector = argsStr.slice(selectorMatch[0].length);
-  let properties: Record<string, string | number> = {};
-  let fromProperties: Record<string, string | number> = {};
-
-  if (method === "fromTo") {
-    const firstBrace = afterSelector.indexOf("{");
-    const firstEnd = findMatchingBrace(afterSelector, firstBrace);
-    if (firstBrace !== -1 && firstEnd !== -1) {
-      fromProperties = parseLooseObjectLiteral(afterSelector.slice(firstBrace, firstEnd + 1));
-      const secondPart = afterSelector.slice(firstEnd + 1);
-      const secondBrace = secondPart.indexOf("{");
-      const secondEnd = findMatchingBrace(secondPart, secondBrace);
-      if (secondBrace !== -1 && secondEnd !== -1) {
-        properties = parseLooseObjectLiteral(secondPart.slice(secondBrace, secondEnd + 1));
-      }
-    }
-  } else {
-    const braceStart = afterSelector.indexOf("{");
-    const braceEnd = findMatchingBrace(afterSelector, braceStart);
-    if (braceStart !== -1 && braceEnd !== -1) {
-      properties = parseLooseObjectLiteral(afterSelector.slice(braceStart, braceEnd + 1));
-    }
-  }
-
-  const duration = numberValue(properties.duration) || 0;
-  const repeat = numberValue(properties.repeat) || 0;
-  const cycleCount = repeat > 0 ? repeat + 1 : 1;
-  const effectiveDuration = duration * cycleCount;
-  const overwriteAuto = stringValue(properties.overwrite) === "auto";
-
-  const propertyNames = new Set<string>();
-  for (const key of Object.keys(fromProperties)) {
-    if (!META_GSAP_KEYS.has(key)) propertyNames.add(key);
-  }
-  for (const key of Object.keys(properties)) {
-    if (!META_GSAP_KEYS.has(key)) propertyNames.add(key);
-  }
-
-  return {
-    effectiveDuration: method === "set" ? 0 : effectiveDuration,
-    properties: [...propertyNames],
-    propertyValues: properties,
-    overwriteAuto,
-  };
-}
-
-function parseLooseObjectLiteral(source: string): Record<string, string | number> {
-  const result: Record<string, string | number> = {};
-  const cleaned = source.replace(/^\{|\}$/g, "").trim();
-  if (!cleaned) return result;
-  const propertyPattern = /(\w+)\s*:\s*("[^"]*"|'[^']*'|true|false|-?[\d.]+|[a-zA-Z_][\w.]*)/g;
-  let match: RegExpExecArray | null;
-  while ((match = propertyPattern.exec(cleaned)) !== null) {
-    const key = match[1];
-    const rawValue = match[2];
-    if (!key || rawValue == null) continue;
-    if (
-      (rawValue.startsWith('"') && rawValue.endsWith('"')) ||
-      (rawValue.startsWith("'") && rawValue.endsWith("'"))
-    ) {
-      result[key] = rawValue.slice(1, -1);
-      continue;
-    }
-    const numeric = Number(rawValue);
-    result[key] = Number.isFinite(numeric) ? numeric : rawValue;
-  }
-  return result;
-}
-
-function findMatchingBrace(source: string, startIndex: number): number {
-  if (startIndex < 0) return -1;
-  let depth = 0;
-  for (let i = startIndex; i < source.length; i++) {
-    if (source[i] === "{") depth += 1;
-    else if (source[i] === "}") {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
 }
 
 function numberValue(value: string | number | undefined): number | null {
@@ -393,6 +283,7 @@ function getSingleClassSelector(selector: string): string | null {
   return match?.groups?.name || null;
 }
 
+// fallow-ignore-next-line complexity
 function cssTransformToGsapProps(cssTransform: string): string | null {
   const parts: string[] = [];
 
@@ -433,9 +324,11 @@ function cssTransformToGsapProps(cssTransform: string): string | null {
 
 // ── GSAP rules ─────────────────────────────────────────────────────────────
 
-export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
+// fallow-ignore-next-line complexity
+export const gsapRules: LintRule<LintContext>[] = [
   // overlapping_gsap_tweens + gsap_animates_clip_element + unscoped_gsap_selector
-  ({ source, tags, scripts, rootCompositionId }) => {
+  // fallow-ignore-next-line complexity
+  async ({ source, tags, scripts, rootCompositionId }) => {
     const findings: HyperframeLintFinding[] = [];
 
     // Build clip element selector map
@@ -463,7 +356,7 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
 
     for (const script of scripts) {
       const localTimelineCompId = readRegisteredTimelineCompositionId(script.content);
-      const gsapWindows = extractGsapWindows(script.content);
+      const gsapWindows = await cachedExtractGsapWindows(script.content);
       const clipStartBoundaries =
         clipStartBoundariesByComposition.get(localTimelineCompId || rootCompositionId || "") ?? [];
 
@@ -564,7 +457,8 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   },
 
   // gsap_css_transform_conflict
-  ({ styles, scripts, tags }) => {
+  // fallow-ignore-next-line complexity
+  async ({ styles, scripts, tags }) => {
     const findings: HyperframeLintFinding[] = [];
     const cssTranslateSelectors = new Map<string, string>();
     const cssScaleSelectors = new Map<string, string>();
@@ -610,7 +504,7 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
 
     for (const script of scripts) {
       if (!/gsap\.timeline/.test(script.content)) continue;
-      const windows = extractGsapWindows(script.content);
+      const windows = await cachedExtractGsapWindows(script.content);
 
       type Conflict = { cssTransform: string; props: Set<string>; raw: string };
       const conflicts = new Map<string, Conflict>();
@@ -701,6 +595,7 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   },
 
   // audio_reactive_single_tween_per_group
+  // fallow-ignore-next-line complexity
   ({ scripts, styles }) => {
     const findings: HyperframeLintFinding[] = [];
     const isCaptionFile = styles.some((s) => /\.caption[-_]?(?:group|word)/i.test(s.content));
@@ -844,8 +739,36 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     return findings;
   },
 
+  // gsap_timeline_not_registered
+  ({ scripts, rawSource, options }) => {
+    const findings: HyperframeLintFinding[] = [];
+    const canInheritFromHost =
+      options.isSubComposition || rawSource.trimStart().toLowerCase().startsWith("<template");
+
+    for (const script of scripts) {
+      const content = script.content;
+      if (!/gsap\.timeline/.test(content)) continue;
+      const hasRegistration = WINDOW_TIMELINE_ASSIGN_PATTERN.test(content);
+      if (hasRegistration || canInheritFromHost) continue;
+      findings.push({
+        code: "gsap_timeline_not_registered",
+        severity: "warning",
+        message:
+          "GSAP timeline is created but never registered in window.__timelines. " +
+          "The runtime discovers timelines from this registry — without registration, " +
+          "animations will not play during preview or render.",
+        fixHint:
+          "Add `window.__timelines = window.__timelines || {};` and " +
+          '`window.__timelines["root"] = tl;` after creating the timeline (use the ' +
+          "composition's data-composition-id as the key).",
+      });
+    }
+    return findings;
+  },
+
   // gsap_from_opacity_noop — CSS opacity:0 + gsap.from({opacity:0}) = invisible forever
-  ({ styles, scripts, tags }) => {
+  // fallow-ignore-next-line complexity
+  async ({ styles, scripts, tags }) => {
     const findings: HyperframeLintFinding[] = [];
     const cssOpacityZeroSelectors = new Set<string>();
 
@@ -872,7 +795,7 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
 
     for (const script of scripts) {
       if (!/gsap\.timeline/.test(script.content)) continue;
-      const windows = extractGsapWindows(script.content);
+      const windows = await cachedExtractGsapWindows(script.content);
 
       for (const win of windows) {
         if (win.method !== "from") continue;
@@ -896,6 +819,70 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
           snippet: truncateSnippet(win.raw),
         });
       }
+    }
+    return findings;
+  },
+
+  // gsap_group_selector_keyframes
+  ({ scripts }) => {
+    const findings: HyperframeLintFinding[] = [];
+    for (const script of scripts) {
+      const content = stripJsComments(script.content);
+      const pattern = /\.(?:to|from|fromTo)\(\s*["']([^"']+,\s*[^"']+)["']\s*,\s*\{[^}]*keyframes/g;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(content)) !== null) {
+        const selector = match[1]!;
+        const count = selector.split(",").length;
+        const contextStart = Math.max(0, match.index - 20);
+        const contextEnd = Math.min(content.length, match.index + match[0].length + 40);
+        findings.push({
+          code: "gsap_group_selector_keyframes",
+          severity: "warning",
+          message:
+            `GSAP tween targets ${count} elements with shared keyframes ("${truncateSnippet(selector, 60)}"). ` +
+            `Editing one element's keyframes in Studio will affect all ${count} elements. ` +
+            `Split into individual tweens for per-element keyframe control.`,
+          fixHint:
+            `Replace the group selector with individual tl.to() calls per element, ` +
+            `each with their own keyframes object.`,
+          snippet: truncateSnippet(content.slice(contextStart, contextEnd)),
+        });
+      }
+    }
+    return findings;
+  },
+
+  // gsap_studio_edit_blocked
+  // When a script both registers a timeline on window.__timelines AND contains
+  // GSAP mutation calls targeting element selectors, Studio's isElementGsapTargeted
+  // check returns true for those elements and silently skips saving drag/resize
+  // position changes back to source HTML.
+  ({ scripts }) => {
+    const findings: HyperframeLintFinding[] = [];
+    const GSAP_MUTATION_SELECTOR_RE = /\.\s*(?:set|to|from|fromTo)\s*\(\s*["']([#.][^"']+)["']/g;
+
+    for (const script of scripts) {
+      const content = stripJsComments(script.content);
+      if (!TIMELINE_REGISTRY_ASSIGN_PATTERN.test(content)) continue;
+
+      const targets = new Set<string>();
+      let match: RegExpExecArray | null;
+      const re = new RegExp(GSAP_MUTATION_SELECTOR_RE.source, "g");
+      while ((match = re.exec(content)) !== null) {
+        if (match[1]) targets.add(match[1]);
+      }
+      if (targets.size === 0) continue;
+
+      const selList = [...targets].map((s) => `"${s}"`).join(", ");
+      findings.push({
+        code: "gsap_studio_edit_blocked",
+        severity: "warning",
+        message: `GSAP tweens target ${selList} in a registered timeline. Studio cannot save drag/resize edits to these elements — the runtime skips write-back for any element that appears in a registered window.__timelines timeline.`,
+        fixHint:
+          "The hyperframes runtime registers timelines automatically. Do not add a manual window.__timelines script unless GSAP intentionally controls element positions. " +
+          "For initial visibility states, use CSS (e.g. opacity:0) instead of gsap.set(). " +
+          "If GSAP must own these elements' positions, avoid drag-editing them in Studio.",
+      });
     }
     return findings;
   },

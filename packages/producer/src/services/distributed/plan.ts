@@ -128,6 +128,23 @@ export interface DistributedRenderConfig {
   chunkSize?: number;
   /** Default `16`. Caps long renders to fewer-but-longer chunks for operational fairness. */
   maxParallelChunks?: number;
+  /**
+   * Upper bound on frames-per-chunk, in frames. Optional; when omitted (the
+   * default) chunk sizing is unchanged. When set, chunking targets the fewest
+   * chunks whose per-chunk frame count stays at or below this bound, still
+   * capped by `maxParallelChunks`:
+   *
+   *     chunkCount = clamp(ceil(totalFrames / targetChunkFrames), 1, maxParallelChunks)
+   *
+   * This bounds per-chunk render *time* (which scales with frames-per-chunk) so
+   * a single chunk can't exceed a downstream per-chunk timeout on a long video,
+   * while short videos still collapse to few chunks. It is a ceiling, not a
+   * fixed size: a video short enough to fit in fewer chunks gets fewer. Ignored
+   * when `chunkSize` is set (an explicit fixed size already pins per-chunk
+   * frames). Mutually exclusive with `chunkSize` in intent; if both are passed,
+   * `chunkSize` wins and `targetChunkFrames` is a no-op.
+   */
+  targetChunkFrames?: number;
   /** Runtime hint; consumed by future per-runtime budget checks. The current implementation records the value but does not enforce. */
   runtimeCap?: "lambda" | "temporal" | "cloud-run-job" | "k8s-job" | "none";
 
@@ -400,6 +417,7 @@ export function measurePlanDirBytes(planDir: string): number {
  *     resolvedChunkSize   = configChunkSize ?? max(MIN_CHUNK_SIZE, ceil(totalFrames / maxParallelChunks))
  *     chunkCount          = min(maxParallelChunks, ceil(totalFrames / resolvedChunkSize))
  *     effectiveChunkSize  = max(resolvedChunkSize, ceil(totalFrames / chunkCount))
+ *     chunkCount          = min(chunkCount, ceil(totalFrames / effectiveChunkSize))  // drop empty trailing slice
  *
  * Long renders auto-rescale to fewer-but-longer chunks rather than
  * fragmenting infinitely. Returned `chunkCount >= 1` (`totalFrames === 0`
@@ -409,11 +427,18 @@ export function measurePlanDirBytes(planDir: string): number {
  * the caller's fan-out intent: passing `maxParallelChunks=16` without
  * `chunkSize` produces 16 chunks (subject to the `MIN_CHUNK_SIZE` floor
  * on tiny renders). Explicit numbers, including `240`, take precedence.
+ *
+ * Optional `targetChunkFrames` caps per-chunk frames in the auto-sized path:
+ * the auto-sizer then targets `clamp(ceil(totalFrames / targetChunkFrames), 1,
+ * maxParallelChunks)` chunks, so short videos collapse to fewer chunks and long
+ * videos add chunks (up to the cap) to keep each one under the bound. It is a
+ * no-op when omitted, and ignored when `configChunkSize` is set.
  */
 export function resolveChunkPlan(
   totalFrames: number,
   configChunkSize: number | undefined,
   maxParallelChunks: number,
+  targetChunkFrames?: number,
 ): { chunkCount: number; effectiveChunkSize: number } {
   // Integer-only inputs: a fractional `totalFrames` (e.g. 10.5) would
   // otherwise produce a last chunk with non-integer `endFrame`, and the
@@ -429,12 +454,36 @@ export function resolveChunkPlan(
   if (configChunkSize !== undefined) {
     assertPositiveInteger("configChunkSize", configChunkSize);
   }
+  if (targetChunkFrames !== undefined) {
+    assertPositiveInteger("targetChunkFrames", targetChunkFrames);
+  }
+  // `targetChunkFrames` lowers the auto-sizer's effective parallelism so the
+  // chosen chunk count keeps frames-per-chunk at or below the bound, without
+  // ever exceeding `maxParallelChunks`. It only affects the auto-sized path
+  // (`configChunkSize === undefined`); an explicit `chunkSize` already pins
+  // per-chunk frames and takes precedence. When `targetChunkFrames` is
+  // undefined, `autoSizeParallel === maxParallelChunks` and the auto-sized
+  // chunk size is identical to the prior behavior.
+  const autoSizeParallel =
+    targetChunkFrames === undefined
+      ? maxParallelChunks
+      : Math.min(maxParallelChunks, Math.max(1, Math.ceil(totalFrames / targetChunkFrames)));
   const resolvedChunkSize =
-    configChunkSize ?? Math.max(MIN_CHUNK_SIZE, Math.ceil(totalFrames / maxParallelChunks));
+    configChunkSize ?? Math.max(MIN_CHUNK_SIZE, Math.ceil(totalFrames / autoSizeParallel));
   const naiveCount = Math.ceil(totalFrames / resolvedChunkSize);
   const chunkCount = Math.min(maxParallelChunks, Math.max(1, naiveCount));
   const effectiveChunkSize = Math.max(resolvedChunkSize, Math.ceil(totalFrames / chunkCount));
-  return { chunkCount, effectiveChunkSize };
+  // Rounding effectiveChunkSize up can let the first (chunkCount - 1) chunks
+  // already cover every frame, leaving an empty/inverted trailing slice that
+  // buildChunkSlices would still emit and renderChunk would then reject
+  // (framesInChunk <= 0), failing the whole distributed render. Tighten
+  // chunkCount to the number of chunks effectiveChunkSize actually needs so the
+  // union stays exactly [0, totalFrames) with no empty tail. This only ever
+  // lowers chunkCount in the explicit-small-chunkSize case; the auto-sized and
+  // large-chunkSize paths already satisfy ceil(totalFrames / effectiveChunkSize)
+  // >= chunkCount, so it's a no-op there.
+  const tightChunkCount = Math.min(chunkCount, Math.ceil(totalFrames / effectiveChunkSize));
+  return { chunkCount: tightChunkCount, effectiveChunkSize };
 }
 
 function assertPositiveInteger(name: string, value: number): void {
@@ -732,10 +781,22 @@ export async function plan(
     // Distributed renders fail closed on font-fetch errors so the planDir
     // is content-addressed against deterministic fonts only.
     failClosedFontFetch: config.failClosedFontFetch !== false,
+    // Distributed renders must not capture host-specific system fonts —
+    // the Lambda/worker filesystem won't have the same fonts installed.
+    allowSystemFontCapture: false,
   });
   let compiled = compileResult.compiled;
   const composition = compileResult.composition;
-  const { deviceScaleFactor, forceScreenshot } = compileResult;
+  const { deviceScaleFactor } = compileResult;
+  // Apply the same low-memory mode bump that renderOrchestrator does at
+  // renderOrchestrator.ts:1598-1606 — compileStage does not consult
+  // cfg.lowMemoryMode, so the probe would otherwise see forceScreenshot:false
+  // on a constrained host and launch in beginframe mode (the exact bug #1236
+  // fixed for the in-process path).
+  // TODO: move this bump into compileStage so both call sites simplify and
+  // the rule lives in one place (follow-up; out of scope for #1236 fix).
+  let forceScreenshot = compileResult.forceScreenshot;
+  if (cfg.lowMemoryMode) forceScreenshot = true;
   // composition.{width,height} are the authored page dimensions. The
   // post-supersample output dims are `compileResult.outputWidth/outputHeight`
   // — chunks render at output dims, but planHash + composition.json record
@@ -758,6 +819,7 @@ export async function plan(
     workDir,
     job,
     cfg,
+    forceScreenshot,
     log,
     assertNotAborted,
     compiled,
@@ -866,6 +928,7 @@ export async function plan(
     totalFrames,
     config.chunkSize,
     maxParallel,
+    config.targetChunkFrames,
   );
   const chunks = buildChunkSlices(totalFrames, chunkCount, effectiveChunkSize);
 

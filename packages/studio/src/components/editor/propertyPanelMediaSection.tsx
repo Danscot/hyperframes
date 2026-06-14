@@ -3,6 +3,7 @@ import { Check, ClipboardList, Film, Music } from "../../icons/SystemIcons";
 import type { DomEditSelection } from "./domEditing";
 import {
   formatNumericValue,
+  formatTimingValue,
   LABEL,
   parseNumericValue,
   RESPONSIVE_GRID,
@@ -13,11 +14,6 @@ const MEDIA_TAGS = new Set(["video", "audio"]);
 
 export function isMediaElement(element: DomEditSelection): boolean {
   return MEDIA_TAGS.has(element.tagName);
-}
-
-function formatTimingValue(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "0.00s";
-  return `${seconds.toFixed(2)}s`;
 }
 
 export function MediaSection({
@@ -76,7 +72,7 @@ export function MediaSection({
         {srcAttr && (
           <div className="min-w-0">
             <div className="flex items-center justify-between gap-2">
-              <div className="text-[10px] uppercase tracking-[0.12em] text-neutral-500">Source</div>
+              <div className="text-[11px] font-medium text-neutral-500">Source</div>
               <button
                 type="button"
                 onClick={() => {

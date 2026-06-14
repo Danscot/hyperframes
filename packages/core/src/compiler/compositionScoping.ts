@@ -486,7 +486,7 @@ export function wrapScopedCompositionScript(
   var __hfRun = function() {
     try {
       (function(document, gsap, window, __hyperframes) {
-${source}
+${source.replace(/<\/(script)/gi, "<\\/$1")}
       }).call(window, __hfScopedDocument, __hfScopedGsap, __hfScopedWindow, __hfScopedHyperframes);
     } catch (_err) {
       console.error(__hfErrorLabel, __hfCompId, _err);
@@ -495,4 +495,8 @@ ${source}
   __hfFindRoot();
   __hfRun();
 })();`;
+}
+
+export function wrapInlineScriptWithErrorBoundary(source: string, errorLabel: string): string {
+  return `(function(){ try { Function(${JSON.stringify(source)}).call(window); } catch (_err) { console.error(${JSON.stringify(errorLabel)}, _err); } })();`;
 }

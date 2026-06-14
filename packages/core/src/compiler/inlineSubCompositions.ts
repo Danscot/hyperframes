@@ -13,7 +13,11 @@ import {
   rewriteCssAssetUrls,
   rewriteInlineStyleAssetUrls,
 } from "./rewriteSubCompPaths";
-import { scopeCssToComposition, wrapScopedCompositionScript } from "./compositionScoping";
+import {
+  scopeCssToComposition,
+  wrapInlineScriptWithErrorBoundary,
+  wrapScopedCompositionScript,
+} from "./compositionScoping";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -106,6 +110,7 @@ export interface InlineSubCompositionsResult {
   styles: string[];
   scripts: string[];
   externalScriptSrcs: string[];
+  scriptItems: Array<{ kind: "inline"; content: string } | { kind: "external"; src: string }>;
   externalLinks: { href: string; rel: string; crossorigin?: string }[];
   variablesByComp: Record<string, Record<string, unknown>>;
 }
@@ -117,6 +122,24 @@ export interface InlineSubCompositionsResult {
 function defaultBuildScopeSelector(compId: string): string {
   const escaped = compId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return `[data-composition-id="${escaped}"]`;
+}
+
+function emptyCompositionHtmlError(src: string): Error {
+  return new Error(
+    `Composition HTML is empty or could not be parsed: ${src}. Check that the file referenced by data-composition-src contains valid HTML.`,
+  );
+}
+
+function assertNonEmptyCompositionHtml(html: string, src: string): void {
+  if (!html.trim()) {
+    throw emptyCompositionHtmlError(src);
+  }
+}
+
+function assertParsedCompositionDocument(doc: Document, src: string): void {
+  if (!doc.documentElement) {
+    throw emptyCompositionHtmlError(src);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +183,7 @@ export function inlineSubCompositions(
   const styles: string[] = [];
   const scripts: string[] = [];
   const externalScriptSrcs: string[] = [];
+  const scriptItems: InlineSubCompositionsResult["scriptItems"] = [];
   const externalLinks: { href: string; rel: string; crossorigin?: string }[] = [];
   const seenLinkHrefs = new Set<string>();
   const variablesByComp: Record<string, Record<string, unknown>> = {};
@@ -176,7 +200,9 @@ export function inlineSubCompositions(
       continue;
     }
 
+    assertNonEmptyCompositionHtml(compHtml, src);
     const compDoc = parseHtml(compHtml);
+    assertParsedCompositionDocument(compDoc, src);
 
     // Determine composition IDs
     let compId: string | null;
@@ -193,7 +219,9 @@ export function inlineSubCompositions(
     // Find content: prefer <template>, fall back to <body>
     const contentRoot = compDoc.querySelector("template");
     const contentHtml = contentRoot ? contentRoot.innerHTML || "" : compDoc.body?.innerHTML || "";
+    assertNonEmptyCompositionHtml(contentHtml, src);
     const contentDoc = parseHtml(contentHtml);
+    assertParsedCompositionDocument(contentDoc, src);
 
     // Find the inner composition root
     const innerRoot = compId
@@ -232,8 +260,11 @@ export function inlineSubCompositions(
       }
       for (const s of [...compDoc.head.querySelectorAll("script")]) {
         const externalSrc = (s.getAttribute("src") || "").trim();
-        if (externalSrc && !externalScriptSrcs.includes(externalSrc)) {
-          externalScriptSrcs.push(externalSrc);
+        if (externalSrc) {
+          if (!externalScriptSrcs.includes(externalSrc)) {
+            externalScriptSrcs.push(externalSrc);
+          }
+          scriptItems.push({ kind: "external", src: externalSrc });
         }
       }
       for (const link of [
@@ -271,19 +302,20 @@ export function inlineSubCompositions(
         if (!externalScriptSrcs.includes(externalSrc)) {
           externalScriptSrcs.push(externalSrc);
         }
+        scriptItems.push({ kind: "external", src: externalSrc });
       } else {
-        scripts.push(
-          scopeCompId
-            ? wrapScopedCompositionScript(
-                s.textContent || "",
-                scopeCompId,
-                scriptErrorLabel,
-                runtimeScope || undefined,
-                runtimeCompId || scopeCompId,
-                authoredRootId,
-              )
-            : `(function(){ try { ${s.textContent || ""} } catch (_err) { console.error(${JSON.stringify(scriptErrorLabel)}, _err); } })();`,
-        );
+        const wrappedScript = scopeCompId
+          ? wrapScopedCompositionScript(
+              s.textContent || "",
+              scopeCompId,
+              scriptErrorLabel,
+              runtimeScope || undefined,
+              runtimeCompId || scopeCompId,
+              authoredRootId,
+            )
+          : wrapInlineScriptWithErrorBoundary(s.textContent || "", scriptErrorLabel);
+        scripts.push(wrappedScript);
+        scriptItems.push({ kind: "inline", content: wrappedScript });
       }
       s.remove();
     }
@@ -359,5 +391,5 @@ export function inlineSubCompositions(
     hostEl.removeAttribute("data-composition-src");
   }
 
-  return { styles, scripts, externalScriptSrcs, externalLinks, variablesByComp };
+  return { styles, scripts, externalScriptSrcs, scriptItems, externalLinks, variablesByComp };
 }

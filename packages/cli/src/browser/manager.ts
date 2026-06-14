@@ -1,9 +1,23 @@
+// fallow-ignore-file code-duplication
 import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { basename } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Browser, detectBrowserPlatform, getInstalledBrowsers, install } from "@puppeteer/browsers";
+
+type PuppeteerBrowsers = typeof import("@puppeteer/browsers");
+
+async function loadPuppeteerBrowsers(): Promise<PuppeteerBrowsers> {
+  try {
+    return await import("@puppeteer/browsers");
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Failed to load @puppeteer/browsers: ${cause}\n` +
+        `Fix: run \`npm install\` or \`bun install\` to restore missing packages, then retry.`,
+    );
+  }
+}
 
 const CHROME_VERSION = "131.0.6778.85";
 const CACHE_DIR = join(homedir(), ".cache", "hyperframes", "chrome");
@@ -22,6 +36,11 @@ export interface BrowserResult {
 
 export interface EnsureBrowserOptions {
   onProgress?: (downloadedBytes: number, totalBytes: number) => void;
+}
+
+interface CacheLookupResult {
+  result?: BrowserResult;
+  staleHyperframesCachePath?: string;
 }
 
 // --- Internal helpers -------------------------------------------------------
@@ -62,7 +81,7 @@ function findFromEnv(): BrowserResult | undefined {
   return undefined;
 }
 
-async function findFromCache(): Promise<BrowserResult | undefined> {
+async function findFromCache(): Promise<CacheLookupResult> {
   // 1) Puppeteer's managed cache — where `npx @puppeteer/browsers install
   // chrome-headless-shell` lands, and where `puppeteer install` from a project
   // depending on full `puppeteer` (not `puppeteer-core`) lands. The engine's
@@ -77,21 +96,25 @@ async function findFromCache(): Promise<BrowserResult | undefined> {
   // newer binary, not the pinned-stale fallback.
   const fromPuppeteer = findFromPuppeteerCache();
   if (fromPuppeteer) {
-    return fromPuppeteer;
+    return { result: fromPuppeteer };
   }
 
   // 2) Hyperframes-managed cache (populated by `ensureBrowser` below as a
   // download-of-last-resort). This is the fallback path: only reached when
   // no puppeteer-cache binary exists.
   if (existsSync(CACHE_DIR)) {
+    const { Browser, getInstalledBrowsers } = await loadPuppeteerBrowsers();
     const installed = await getInstalledBrowsers({ cacheDir: CACHE_DIR });
     const match = installed.find((b) => b.browser === Browser.CHROMEHEADLESSSHELL);
+    if (match && existsSync(match.executablePath)) {
+      return { result: { executablePath: match.executablePath, source: "cache" } };
+    }
     if (match) {
-      return { executablePath: match.executablePath, source: "cache" };
+      return { staleHyperframesCachePath: match.executablePath };
     }
   }
 
-  return undefined;
+  return {};
 }
 
 /**
@@ -237,7 +260,21 @@ export async function findBrowser(): Promise<BrowserResult | undefined> {
   if (fromEnv) return fromEnv;
 
   const fromCache = await findFromCache();
-  if (fromCache) return fromCache;
+  if (fromCache.result) return fromCache.result;
+  if (fromCache.staleHyperframesCachePath) {
+    console.warn(
+      `[browser] Cached binary missing at ${fromCache.staleHyperframesCachePath} — re-downloading...`,
+    );
+    try {
+      return await downloadBrowser();
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Cached Chrome binary was missing at ${fromCache.staleHyperframesCachePath}, and re-download failed: ${cause}\n` +
+          `Run \`hyperframes browser ensure --force\` to re-download.`,
+      );
+    }
+  }
 
   const fromSystem = findFromSystem();
   if (fromSystem) {
@@ -300,18 +337,37 @@ async function ensureLinuxArmBrowser(options?: EnsureBrowserOptions): Promise<Br
  * Resolution: env var -> cached download -> system Chrome -> auto-download.
  */
 export async function ensureBrowser(options?: EnsureBrowserOptions): Promise<BrowserResult> {
-  const existing = await findBrowser();
-  if (existing) return existing;
+  const fromEnv = findFromEnv();
+  if (fromEnv) return fromEnv;
+
+  const fromCache = await findFromCache();
+  if (fromCache.result) return fromCache.result;
+  if (fromCache.staleHyperframesCachePath) {
+    console.warn(
+      `[browser] Cached binary missing at ${fromCache.staleHyperframesCachePath} — re-downloading...`,
+    );
+    return downloadBrowser(options);
+  }
+
+  const fromSystem = findFromSystem();
+  if (fromSystem) {
+    warnSystemFallbackOnce(fromSystem.executablePath);
+    return fromSystem;
+  }
+
+  return downloadBrowser(options);
+}
+
+async function downloadBrowser(options?: EnsureBrowserOptions): Promise<BrowserResult> {
+  if (isLinuxArm()) {
+    return ensureLinuxArmBrowser(options);
+  }
+
+  const { Browser, detectBrowserPlatform, install } = await loadPuppeteerBrowsers();
 
   const platform = detectBrowserPlatform();
   if (!platform) {
     throw new Error(`Unsupported platform: ${process.platform} ${process.arch}`);
-  }
-
-  // Chrome headless shell has no Linux ARM64 build (e.g. DGX Spark, GB10).
-  // Try to auto-install system Chromium via apt, then find it.
-  if (isLinuxArm()) {
-    return ensureLinuxArmBrowser(options);
   }
 
   const installed = await install({
@@ -338,7 +394,7 @@ export function clearBrowser(): boolean {
 }
 
 export function isLinuxArm(): boolean {
-  return detectBrowserPlatform() === "linux_arm";
+  return process.platform === "linux" && process.arch === "arm64";
 }
 
 export { CHROME_VERSION, CACHE_DIR };

@@ -1,3 +1,4 @@
+// fallow-ignore-file complexity
 /**
  * Frame Capture Service
  *
@@ -56,6 +57,10 @@ export interface CaptureSession {
   pageReleased?: boolean;
   browserReleased?: boolean;
   browserConsoleBuffer: string[];
+  initTelemetry?: {
+    initDurationMs: number;
+    tweenCount: number;
+  };
   capturePerf: {
     frames: number;
     seekMs: number;
@@ -77,6 +82,134 @@ export interface CaptureSession {
 // Complex compositions produce 100+ messages; 50 was too small to capture relevant errors.
 const BROWSER_CONSOLE_BUFFER_SIZE = 200;
 const CAPTURE_SESSION_CLOSE_TIMEOUT_MS = 5_000;
+
+function appendBrowserDiagnostic(session: CaptureSession, text: string): void {
+  session.browserConsoleBuffer.push(text);
+  if (session.browserConsoleBuffer.length > BROWSER_CONSOLE_BUFFER_SIZE) {
+    session.browserConsoleBuffer.shift();
+  }
+}
+
+async function collectSessionInitTelemetry(
+  page: Page,
+  initStart: number,
+): Promise<{ initDurationMs: number; tweenCount: number }> {
+  const initDurationMs = Date.now() - initStart;
+  let tweenCount = 0;
+  try {
+    tweenCount = await page.evaluate(() => {
+      const timelines =
+        (window as unknown as { __timelines?: Record<string, unknown> }).__timelines || {};
+      const seen = new Set<object>();
+      let count = 0;
+      for (const timeline of Object.values(timelines)) {
+        const maybeTimeline = timeline as { getChildren?: unknown };
+        if (typeof maybeTimeline?.getChildren !== "function") continue;
+        const children = maybeTimeline.getChildren(true, true, false) as unknown[];
+        for (const child of children) {
+          if (child && typeof child === "object" && !seen.has(child)) {
+            seen.add(child);
+            count++;
+          }
+        }
+      }
+      return count;
+    });
+  } catch {
+    tweenCount = 0;
+  }
+  return { initDurationMs, tweenCount };
+}
+
+async function recordSessionInitTelemetry(
+  session: CaptureSession,
+  initStart: number,
+): Promise<void> {
+  const telemetry = await collectSessionInitTelemetry(session.page, initStart);
+  session.initTelemetry = telemetry;
+  appendBrowserDiagnostic(
+    session,
+    `[FrameCapture:INIT] complete initDurationMs=${telemetry.initDurationMs} tweenCount=${telemetry.tweenCount}`,
+  );
+}
+
+export function sanitizeDiagnosticUrl(input: string): string {
+  if (!input) return "(empty)";
+  if (input.startsWith("data:")) return "data:<redacted>";
+  if (input.startsWith("blob:")) return "blob:<redacted>";
+  if (input.startsWith("/")) {
+    try {
+      const url = new URL(input, "http://hyperframes.local");
+      return url.pathname;
+    } catch {
+      return input;
+    }
+  }
+
+  try {
+    const url = new URL(input);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return input;
+  }
+}
+
+export function formatNavigationFailureDiagnostic(input: {
+  captureMode: CaptureMode;
+  url: string;
+  timeoutMs: number;
+  elapsedMs: number;
+  error: unknown;
+}): string {
+  const message = input.error instanceof Error ? input.error.message : String(input.error);
+  return (
+    `[FrameCapture:ERROR] page.goto failed ` +
+    `mode=${input.captureMode} timeoutMs=${input.timeoutMs} elapsedMs=${input.elapsedMs} ` +
+    `url=${sanitizeDiagnosticUrl(input.url)} error=${message}`
+  );
+}
+
+export function formatNavigationStartDiagnostic(input: {
+  captureMode: CaptureMode;
+  url: string;
+  timeoutMs: number;
+}): string {
+  return (
+    `[FrameCapture:NAV] page.goto start ` +
+    `mode=${input.captureMode} timeoutMs=${input.timeoutMs} ` +
+    `url=${sanitizeDiagnosticUrl(input.url)}`
+  );
+}
+
+export function formatRequestFailureDiagnostic(input: {
+  method: string;
+  resourceType: string;
+  url: string;
+  failureText: string;
+}): string {
+  return (
+    `[Browser:REQUESTFAILED] ${input.method} ${sanitizeDiagnosticUrl(input.url)} ` +
+    `resource=${input.resourceType} error=${input.failureText}`
+  );
+}
+
+export function formatHttpErrorDiagnostic(input: {
+  method: string;
+  resourceType: string;
+  url: string;
+  status: number;
+  statusText: string;
+}): string {
+  const statusText = input.statusText ? ` ${input.statusText}` : "";
+  return (
+    `[Browser:HTTP${input.status}] ${input.method} ${sanitizeDiagnosticUrl(input.url)} ` +
+    `resource=${input.resourceType}${statusText}`
+  );
+}
 
 /**
  * Fixed warmup-loop iteration count used when `CaptureOptions.lockWarmupTicks`
@@ -172,6 +305,7 @@ async function waitForCloseWithTimeout(promise: Promise<unknown>): Promise<boole
   return !timedOut;
 }
 
+// fallow-ignore-next-line unit-size
 export async function createCaptureSession(
   serverUrl: string,
   outputDir: string,
@@ -349,6 +483,124 @@ async function pollPageExpression(
   return Boolean(await page.evaluate(expression));
 }
 
+const HF_READY_DIAGNOSTIC_EXPR = `(function() {
+  var hf = window.__hf;
+  var player = window.__player;
+  var renderReady = !!window.__renderReady;
+  var hasSeek = !!(hf && typeof hf.seek === "function");
+  var duration = hf ? hf.duration : -1;
+  var hasTimeline = !!(window.__timelines && Object.keys(window.__timelines).length > 0);
+  var root = document.querySelector("[data-composition-id]");
+  var declaredDuration = root ? Number(root.getAttribute("data-duration")) : -1;
+  return {
+    renderReady: renderReady,
+    hasHf: !!hf,
+    hasSeek: hasSeek,
+    hasPlayer: !!player,
+    duration: duration,
+    hasTimeline: hasTimeline,
+    declaredDuration: declaredDuration,
+  };
+})()`;
+
+// fallow-ignore-next-line complexity
+function buildZeroDurationDiagnostic(diag: {
+  renderReady: boolean;
+  hasHf: boolean;
+  hasSeek: boolean;
+  hasPlayer: boolean;
+  duration: number;
+  hasTimeline: boolean;
+  declaredDuration: number;
+}): string {
+  const hints: string[] = [];
+  if (!diag.hasPlayer) {
+    hints.push("window.__player was never set — the HyperFrames runtime did not initialize.");
+  }
+  if (!diag.hasTimeline) {
+    hints.push(
+      "No GSAP timeline registered (window.__timelines is empty). " +
+        "If using CSS/WAAPI/Lottie/Three.js animations, add data-duration to the root element.",
+    );
+  }
+  if (diag.declaredDuration <= 0 && !diag.hasTimeline) {
+    hints.push(
+      'Fix: add data-duration="<seconds>" to your root <div data-composition-id="..."> element.',
+    );
+  }
+  if (diag.hasSeek && diag.duration === 0 && diag.renderReady) {
+    hints.push("The runtime finished initializing but reported zero duration — this is permanent.");
+  }
+  return (
+    `[FrameCapture] Composition has zero duration.\n` +
+    `  Runtime ready: ${diag.renderReady}, __player: ${diag.hasPlayer}, ` +
+    `__hf.seek: ${diag.hasSeek}, GSAP timeline: ${diag.hasTimeline}, ` +
+    `data-duration: ${diag.declaredDuration > 0 ? diag.declaredDuration + "s" : "not set"}\n` +
+    (hints.length > 0 ? hints.map((h) => `  → ${h}`).join("\n") : "")
+  );
+}
+
+interface HfDiagnostic {
+  renderReady: boolean;
+  hasHf: boolean;
+  hasSeek: boolean;
+  hasPlayer: boolean;
+  duration: number;
+  hasTimeline: boolean;
+  declaredDuration: number;
+}
+
+async function evaluateHfDiagnostic(page: Page): Promise<HfDiagnostic> {
+  return (await page.evaluate(HF_READY_DIAGNOSTIC_EXPR)) as HfDiagnostic;
+}
+
+async function pollHfReady(page: Page, timeoutMs: number, intervalMs: number = 100): Promise<void> {
+  const readyExpr = `!!(window.__hf && typeof window.__hf.seek === "function" && window.__hf.duration > 0)`;
+  const FAST_FAIL_AFTER_MS = 10_000;
+  // Throttle diagnostic CDP calls to ~1000ms — running evaluateHfDiagnostic on
+  // every 100ms poll tick after the 10s mark generates ~350 unnecessary CDP
+  // round-trips per failed render. One diagnostic per second is enough.
+  const DIAGNOSTIC_INTERVAL_MS = 1_000;
+  const deadline = Date.now() + timeoutMs;
+  let lastDiagnosticAt = 0;
+
+  while (Date.now() < deadline) {
+    const ready = Boolean(await page.evaluate(readyExpr));
+    if (ready) return;
+
+    const elapsed = timeoutMs - (deadline - Date.now());
+    if (elapsed >= FAST_FAIL_AFTER_MS) {
+      const now = Date.now();
+      if (now - lastDiagnosticAt >= DIAGNOSTIC_INTERVAL_MS) {
+        lastDiagnosticAt = now;
+        const diag = await evaluateHfDiagnostic(page);
+        // Only fast-fail when BOTH signals are permanently zero:
+        //   1. No GSAP timeline registered (GSAP sets duration synchronously
+        //      before __renderReady, so a missing timeline won't self-correct).
+        //   2. No data-duration declared on the root element.
+        // A composition with a GSAP timeline but no data-duration is still
+        // valid — GSAP drives duration via __timelines, not data-duration.
+        if (diag.renderReady && diag.hasSeek && !diag.hasTimeline && diag.declaredDuration <= 0) {
+          throw new Error(buildZeroDurationDiagnostic(diag));
+        }
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  const diag = await evaluateHfDiagnostic(page);
+  if (diag.hasSeek && diag.duration === 0) {
+    throw new Error(buildZeroDurationDiagnostic(diag));
+  }
+  throw new Error(
+    `[FrameCapture] window.__hf not ready after ${timeoutMs}ms. ` +
+      `Page must expose window.__hf = { duration, seek }.\n` +
+      `  State: __hf=${diag.hasHf}, seek=${diag.hasSeek}, player=${diag.hasPlayer}, ` +
+      `renderReady=${diag.renderReady}, duration=${diag.duration}`,
+  );
+}
+
 async function pollSubCompositionTimelines(
   page: Page,
   timeoutMs: number,
@@ -430,12 +682,96 @@ async function pollVideosReady(
   return check();
 }
 
+// Wait for every `<img>` with a non-`data:` src to have settled — either
+// successfully loaded (`complete && naturalWidth > 0`) or failed with a
+// broken-image marker (`complete && naturalWidth === 0`, the HTMLImageElement
+// equivalent of HTMLMediaElement.error). htmlCompiler localises remote `<img>`
+// URLs to the local file server before this point, so in practice this polls
+// for the local fetch to land — but the guard is a defensive net so that any
+// future composition path that leaves a remote URL in place won't capture
+// frames before the pixels arrive. Mirrors `pollVideosReady` for parity with
+// the video-side readiness contract (videos exit-early on `ve.error`; images
+// exit-early on `complete && naturalWidth === 0`).
+/** @internal exported for unit testing only */
+export async function pollImagesReady(
+  page: Page,
+  timeoutMs: number,
+  intervalMs: number = 100,
+): Promise<boolean> {
+  const check = async (): Promise<boolean> => {
+    return Boolean(
+      await page.evaluate(() => {
+        const imgs = Array.from(document.querySelectorAll("img"));
+        return (
+          imgs.length === 0 ||
+          imgs.every((img) => {
+            const ie = img as HTMLImageElement;
+            const src = ie.getAttribute("src") || "";
+            if (!src || src.startsWith("data:")) return true;
+            // A `complete` image with zero naturalWidth has settled with an
+            // error (404 / decode failure / CORS rejection / blocked). Treat
+            // as done — waiting won't make it load — and let the render
+            // continue with the broken-image marker visible. Mirrors how
+            // pollVideosReady treats `ve.error`.
+            if (ie.complete && ie.naturalWidth === 0) return true;
+            if (ie.complete && ie.naturalWidth > 0) return true;
+            return false;
+          })
+        );
+      }),
+    );
+  };
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return check();
+}
+
+// Force every successfully-loaded `<img>` to be GPU-uploaded before the first
+// frame capture. `naturalWidth > 0` means the bitmap has been decoded into
+// CPU memory, but compositor-side GPU upload can still happen lazily on first
+// paint. Calling `img.decode()` returns a Promise that resolves once the image
+// is ready for synchronous painting — eliminating the small first-frame race
+// between "image is technically loaded" and "the rasterized texture is on the
+// GPU and ready to composite".
+//
+// Note this is purely an init-time guard; it doesn't prevent Chrome from
+// evicting decoded pixels mid-render. The producer-side `localizeRemoteImageSources`
+// is what bounds the eviction risk (a re-fetch hits the local file server's
+// disk-backed paging, not S3 over the network).
+//
+// Critical: `decode()` on an in-flight image waits for the fetch to resolve.
+// If `pollImagesReady` timed out with some images still loading (`!complete`),
+// calling `decode()` on them would block here until the network finally
+// completes — or until puppeteer's evaluate timeout fires and throws an
+// uncaught error that aborts the render. Skip in-flight and broken images;
+// only force GPU upload for images that successfully loaded.
+async function decodeAllImages(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const imgs = Array.from(document.querySelectorAll("img"));
+    await Promise.all(
+      imgs.map((img) => {
+        const ie = img as HTMLImageElement;
+        if (typeof ie.decode !== "function") return Promise.resolve();
+        // Skip still-loading images (in-flight decode() would hang) and
+        // broken images (decode() rejects, but pre-filtering is clearer
+        // than relying on the .catch).
+        if (!ie.complete || ie.naturalWidth === 0) return Promise.resolve();
+        return ie.decode().catch(() => undefined);
+      }),
+    );
+  });
+}
+
 async function applyVideoMetadataHints(
   page: Page,
   hints: readonly CaptureVideoMetadataHint[] | undefined,
 ): Promise<void> {
   if (!hints || hints.length === 0) return;
 
+  // fallow-ignore-next-line complexity
   await page.evaluate(
     (metadataHints: CaptureVideoMetadataHint[]) => {
       for (const hint of metadataHints) {
@@ -488,10 +824,12 @@ async function waitForOptionalTailwindReady(page: Page, timeoutMs: number): Prom
   }
 }
 
+// fallow-ignore-next-line unit-size
 export async function initializeSession(session: CaptureSession): Promise<void> {
   const { page, serverUrl } = session;
 
   // Forward browser console to host with [Browser] prefix
+  // fallow-ignore-next-line complexity
   page.on("console", (msg: ConsoleMessage) => {
     const type = msg.type();
     const text = msg.text();
@@ -515,10 +853,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
       console.log(`${prefix} ${text}`);
     }
 
-    session.browserConsoleBuffer.push(`${prefix} ${text}`);
-    if (session.browserConsoleBuffer.length > BROWSER_CONSOLE_BUFFER_SIZE) {
-      session.browserConsoleBuffer.shift();
-    }
+    appendBrowserDiagnostic(session, `${prefix} ${text}`);
   });
 
   page.on("pageerror", (err) => {
@@ -532,34 +867,88 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
       console.error(text);
     }
 
-    session.browserConsoleBuffer.push(text);
-    if (session.browserConsoleBuffer.length > BROWSER_CONSOLE_BUFFER_SIZE) {
-      session.browserConsoleBuffer.shift();
-    }
+    appendBrowserDiagnostic(session, text);
+  });
+
+  page.on("requestfailed", (request) => {
+    appendBrowserDiagnostic(
+      session,
+      formatRequestFailureDiagnostic({
+        method: request.method(),
+        resourceType: request.resourceType(),
+        url: request.url(),
+        failureText: request.failure()?.errorText ?? "unknown",
+      }),
+    );
+  });
+
+  page.on("response", (response) => {
+    const status = response.status();
+    if (status < 400) return;
+
+    const request = response.request();
+    appendBrowserDiagnostic(
+      session,
+      formatHttpErrorDiagnostic({
+        method: request.method(),
+        resourceType: request.resourceType(),
+        url: response.url(),
+        status,
+        statusText: response.statusText(),
+      }),
+    );
   });
 
   // Navigate to the file server
   const url = `${serverUrl}/index.html`;
+  const pageNavigationTimeout =
+    session.config?.pageNavigationTimeout ?? DEFAULT_CONFIG.pageNavigationTimeout;
+  const initStart = Date.now();
+  const logInitPhase = (phase: string) => {
+    console.log(`[initSession:${session.captureMode}] ${phase} (${Date.now() - initStart}ms)`);
+  };
+  const gotoEntryPage = async (): Promise<void> => {
+    appendBrowserDiagnostic(
+      session,
+      formatNavigationStartDiagnostic({
+        captureMode: session.captureMode,
+        url,
+        timeoutMs: pageNavigationTimeout,
+      }),
+    );
+    logInitPhase("page.goto start");
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: pageNavigationTimeout });
+    } catch (error) {
+      appendBrowserDiagnostic(
+        session,
+        formatNavigationFailureDiagnostic({
+          captureMode: session.captureMode,
+          url,
+          timeoutMs: pageNavigationTimeout,
+          elapsedMs: Date.now() - initStart,
+          error,
+        }),
+      );
+      throw error;
+    }
+  };
+
   if (session.captureMode === "screenshot") {
     // Screenshot mode: standard navigation, rAF works normally
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await gotoEntryPage();
+    logInitPhase("page.goto complete");
 
     const pageReadyTimeout =
       session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout;
-    const pageReady = await pollPageExpression(
-      page,
-      `!!(window.__hf && typeof window.__hf.seek === "function" && window.__hf.duration > 0)`,
-      pageReadyTimeout,
-    );
-    if (!pageReady) {
-      throw new Error(
-        `[FrameCapture] window.__hf not ready after ${pageReadyTimeout}ms. Page must expose window.__hf = { duration, seek }.`,
-      );
-    }
+    await pollHfReady(page, pageReadyTimeout);
+    logInitPhase("pollHfReady complete");
 
     await pollSubCompositionTimelines(page, pageReadyTimeout);
+    logInitPhase("pollSubCompositionTimelines complete");
 
     await applyVideoMetadataHints(page, session.options.videoMetadataHints);
+    logInitPhase("applyVideoMetadataHints complete");
 
     // Wait for all video elements to have decoded their CURRENT frame, not
     // just metadata. readyState >= 2 (HAVE_CURRENT_DATA) means a frame is
@@ -578,6 +967,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
       session.options.skipReadinessVideoIds ?? [],
       pageReadyTimeout,
     );
+    logInitPhase("pollVideosReady complete");
     if (!videosReady) {
       const failedVideos = await page.evaluate((skipIdList: readonly string[]) => {
         const skip = new Set(skipIdList);
@@ -593,8 +983,32 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
       );
     }
 
+    const imagesReady = await pollImagesReady(page, pageReadyTimeout);
+    if (!imagesReady) {
+      const failedImages = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll("img"))
+          .filter((img) => {
+            const ie = img as HTMLImageElement;
+            const src = ie.getAttribute("src") || "";
+            if (!src || src.startsWith("data:")) return false;
+            return !(ie.complete && ie.naturalWidth > 0);
+          })
+          .map((img) => (img as HTMLImageElement).src || img.getAttribute("src") || "(no src)")
+          .join(", ");
+      });
+      console.warn(
+        `[FrameCapture] Some image elements did not load within ${pageReadyTimeout}ms: ${failedImages}. ` +
+          `Continuing render — affected images may appear blank/missing in early frames.`,
+      );
+    }
+    await decodeAllImages(page);
+    logInitPhase("images ready + decoded");
+
     await page.evaluate(`document.fonts?.ready`);
+    logInitPhase("fonts ready");
     await waitForOptionalTailwindReady(page, pageReadyTimeout);
+    logInitPhase("tailwind ready");
+    await recordSessionInitTelemetry(session, initStart);
 
     // For PNG captures, force the page background fully transparent so the
     // captured screenshots carry a real alpha channel. Must run AFTER
@@ -660,33 +1074,27 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
     );
   })();
   warmupLoopPromise.catch(() => {});
+  logInitPhase("warmup loop started");
 
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await gotoEntryPage();
+  logInitPhase("page.goto complete");
 
   // Poll for window.__hf readiness using manual evaluate loop (waitForFunction
   // uses rAF polling internally, which won't fire in beginFrame mode).
   const pageReadyTimeout = session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout;
-  const pollDeadline = Date.now() + pageReadyTimeout;
-  while (Date.now() < pollDeadline) {
-    const ready = await page.evaluate(
-      `!!(window.__hf && typeof window.__hf.seek === "function" && window.__hf.duration > 0)`,
-    );
-    if (ready) break;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  const pageReady = await page.evaluate(
-    `!!(window.__hf && typeof window.__hf.seek === "function" && window.__hf.duration > 0)`,
-  );
-  if (!pageReady) {
+  try {
+    await pollHfReady(page, pageReadyTimeout);
+    logInitPhase("pollHfReady complete");
+  } catch (err) {
     warmupState.running = false;
-    throw new Error(
-      `[FrameCapture] window.__hf not ready after ${pageReadyTimeout}ms. Page must expose window.__hf = { duration, seek }.`,
-    );
+    throw err;
   }
 
   await pollSubCompositionTimelines(page, pageReadyTimeout);
+  logInitPhase("pollSubCompositionTimelines complete");
 
   await applyVideoMetadataHints(page, session.options.videoMetadataHints);
+  logInitPhase("applyVideoMetadataHints complete");
 
   // Same readyState contract as the screenshot path above (>= 2 / HAVE_CURRENT_DATA).
   const bfVideosReady = await pollVideosReady(
@@ -708,10 +1116,36 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
         `Continuing render — affected videos will appear as blank/black frames.`,
     );
   }
+  logInitPhase("pollVideosReady complete");
 
-  // Font check (no rAF dependency — uses fonts.ready API directly)
+  // Image readiness — parity with pollVideosReady. Defense against remote
+  // <img> URLs that bypass the htmlCompiler localize step.
+  const bfImagesReady = await pollImagesReady(page, pageReadyTimeout);
+  if (!bfImagesReady) {
+    const failedImages = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll("img"))
+        .filter((img) => {
+          const ie = img as HTMLImageElement;
+          const src = ie.getAttribute("src") || "";
+          if (!src || src.startsWith("data:")) return false;
+          return !(ie.complete && ie.naturalWidth > 0);
+        })
+        .map((img) => (img as HTMLImageElement).src || img.getAttribute("src") || "(no src)")
+        .join(", ");
+    });
+    console.warn(
+      `[FrameCapture] Some image elements did not load within ${pageReadyTimeout}ms: ${failedImages}. ` +
+        `Continuing render — affected images may appear blank/missing in early frames.`,
+    );
+  }
+  await decodeAllImages(page);
+  logInitPhase("images ready + decoded");
+
   await page.evaluate(`document.fonts?.ready`);
+  logInitPhase("fonts ready");
   await waitForOptionalTailwindReady(page, pageReadyTimeout);
+  logInitPhase("tailwind ready");
+  await recordSessionInitTelemetry(session, initStart);
 
   // Stop warmup. Unlocked mode exits on this flag; locked mode keeps ticking
   // until LOCKED_WARMUP_TICKS, so we await its promise to ensure the count is

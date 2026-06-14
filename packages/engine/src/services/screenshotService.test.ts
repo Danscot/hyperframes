@@ -6,6 +6,7 @@ import {
   pageScreenshotCapture,
   cdpSessionCache,
   injectVideoFramesBatch,
+  syncVideoFrameVisibility,
 } from "./screenshotService.js";
 
 // Stub a Page + CDPSession just enough that pageScreenshotCapture can call
@@ -189,5 +190,321 @@ describe("injectVideoFramesBatch replacement layout", () => {
     expect(img?.style.right).toBe("auto");
     expect(img?.style.bottom).toBe("auto");
     expect(img?.style.inset).toBe("auto");
+  });
+});
+
+describe("video-frame injection respects ancestor visibility", () => {
+  // Regression guard: the runtime's `[data-start]` lifecycle hides
+  // out-of-window sub-composition hosts with `visibility:hidden`, but the
+  // injector used to ignore that and paint a replacement <img> for every
+  // active `<video data-start>` element. Inner-PIP videos inside *other*
+  // moments still appear active in the raw time-window check (their auto-
+  // injected `data-start="0"` + probed full-source duration cover the
+  // whole timeline), so the bug produced one full-bleed speaker overlay
+  // per inactive sub-comp — covering whichever moment was actually visible.
+  //
+  // The skip is intentionally narrow: `visibility:hidden` on a regular
+  // `[data-start]` container must NOT skip injection, because the
+  // replacement <img>'s explicit `visibility:visible` overrides the
+  // ancestor (CSS spec) and consumers rely on that to hold the final
+  // GSAP-driven frame when an authored `data-duration` outlives the
+  // composition's GSAP timeline. We therefore only treat
+  // `visibility:hidden` as a skip signal on sub-composition hosts
+  // (`[data-composition-src]` / `[data-composition-file]`). `display:none`,
+  // by contrast, takes the whole subtree out of layout regardless of any
+  // child override, so it always triggers the skip.
+
+  type StyleLike = {
+    display?: string;
+    visibility?: string;
+    opacity?: string;
+    objectFit?: string;
+    objectPosition?: string;
+    zIndex?: string;
+  };
+
+  type HostAttribute = "data-composition-src" | "data-composition-file" | "data-start";
+
+  function setupHostHiddenScenario(
+    hostStyle: StyleLike,
+    options: { hostAttribute?: HostAttribute } = {},
+  ) {
+    const hostAttribute = options.hostAttribute ?? "data-composition-src";
+    const hostAttrMarkup =
+      hostAttribute === "data-start"
+        ? 'data-start="0" data-duration="10"'
+        : `${hostAttribute}="sub.html"`;
+    const { window, document } = parseHTML(
+      `<html><body><div id="host" ${hostAttrMarkup}><div id="pip-frame"><video id="pip" data-start="0" data-duration="10"></video></div></div></body></html>`,
+    );
+
+    Object.defineProperty(window.HTMLImageElement.prototype, "decode", {
+      configurable: true,
+      value: () => Promise.resolve(),
+    });
+
+    const host = document.getElementById("host") as HTMLElement;
+    const pipFrame = document.getElementById("pip-frame") as HTMLElement;
+    const video = document.getElementById("pip") as HTMLVideoElement;
+
+    Object.defineProperties(video, {
+      offsetLeft: { configurable: true, get: () => 0 },
+      offsetTop: { configurable: true, get: () => 0 },
+      offsetWidth: { configurable: true, get: () => 1080 },
+      offsetHeight: { configurable: true, get: () => 1920 },
+    });
+    video.getBoundingClientRect = () =>
+      ({
+        x: 0,
+        y: 0,
+        left: 0,
+        top: 0,
+        right: 1080,
+        bottom: 1920,
+        width: 1080,
+        height: 1920,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+    const styles = new Map<Element, StyleLike>();
+    styles.set(host, hostStyle);
+    styles.set(pipFrame, {});
+    styles.set(video, { opacity: "1", objectFit: "cover", objectPosition: "center", zIndex: "1" });
+
+    Object.defineProperty(window, "getComputedStyle", {
+      configurable: true,
+      value: (el: Element) => {
+        const declared = styles.get(el) ?? {};
+        return {
+          display: declared.display ?? "block",
+          visibility: declared.visibility ?? "visible",
+          opacity: declared.opacity ?? "1",
+          objectFit: declared.objectFit ?? "fill",
+          objectPosition: declared.objectPosition ?? "50% 50%",
+          zIndex: declared.zIndex ?? "auto",
+          getPropertyValue: (prop: string) => {
+            const camel = prop.replace(/-([a-z])/g, (_, c: string) =>
+              c.toUpperCase(),
+            ) as keyof StyleLike;
+            return declared[camel] ?? "";
+          },
+        };
+      },
+    });
+
+    return { window, document, video, host, pipFrame };
+  }
+
+  function withGlobals<T extends { window: Window; document: Document; video: HTMLVideoElement }>(
+    setup: T,
+  ): { teardown: () => void; setup: T } {
+    const globals = globalThis as unknown as { window?: Window; document?: Document };
+    const previousWindow = globals.window;
+    const previousDocument = globals.document;
+    globals.window = setup.window;
+    globals.document = setup.document;
+    return {
+      setup,
+      teardown: () => {
+        globals.window = previousWindow;
+        globals.document = previousDocument;
+      },
+    };
+  }
+
+  function passthroughPage(): Page {
+    return {
+      evaluate: async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+        // The implementation is built to run inside the page sandbox via
+        // `page.evaluate`, but linkedom gives us a DOM compatible enough to
+        // execute the function body directly in Node.
+        Promise.resolve((fn as (...a: unknown[]) => unknown)(...args)),
+    } as unknown as Page;
+  }
+
+  it("skips replacement-frame creation when the video's host has visibility:hidden", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({ visibility: "hidden" }));
+    try {
+      await injectVideoFramesBatch(passthroughPage(), [
+        {
+          videoId: "pip",
+          dataUri:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+        },
+      ]);
+    } finally {
+      teardown();
+    }
+
+    // No replacement <img> should be injected next to the video — the host is
+    // currently hidden, so painting a frame over it would bleed onto whichever
+    // sibling host is actually visible on this seek.
+    const sibling = setup.video.nextElementSibling as HTMLElement | null;
+    expect(sibling).toBeNull();
+  });
+
+  it("skips replacement-frame creation when the video's host has display:none", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({ display: "none" }));
+    try {
+      await injectVideoFramesBatch(passthroughPage(), [
+        {
+          videoId: "pip",
+          dataUri:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+        },
+      ]);
+    } finally {
+      teardown();
+    }
+
+    const sibling = setup.video.nextElementSibling as HTMLElement | null;
+    expect(sibling).toBeNull();
+  });
+
+  it("hides an existing replacement <img> when the host becomes visibility:hidden", async () => {
+    // First seed an existing __render_frame__ <img> next to the video (the
+    // state the page is in after a previous seek when the host was visible).
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({ visibility: "hidden" }));
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    seededImg.style.visibility = "visible";
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+
+    try {
+      await injectVideoFramesBatch(passthroughPage(), [
+        {
+          videoId: "pip",
+          dataUri:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+        },
+      ]);
+    } finally {
+      teardown();
+    }
+
+    expect(seededImg.style.visibility).toBe("hidden");
+  });
+
+  it("syncVideoFrameVisibility hides the replacement <img> for ancestor-hidden actives", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({ visibility: "hidden" }));
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    seededImg.style.visibility = "visible";
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+
+    try {
+      // "pip" IS in the active set (per the raw time-window check) but the
+      // host is hidden. sync must keep the <img> hidden, not flip it to
+      // `visibility: visible`.
+      await syncVideoFrameVisibility(passthroughPage(), ["pip"]);
+    } finally {
+      teardown();
+    }
+
+    expect(seededImg.style.visibility).toBe("hidden");
+  });
+
+  it("still injects when a plain [data-start] host is visibility:hidden (CSS-escapable)", async () => {
+    // Regression guard for the style-9-prod symptom: a regular
+    // `[data-start]` container whose GSAP timeline is shorter than its
+    // authored `data-duration` ends up `visibility: hidden` past the
+    // timeline end. The replacement <img>'s explicit `visibility: visible`
+    // correctly overrides that per CSS spec, so the injector must NOT
+    // short-circuit — it would otherwise drop the final-state frame and
+    // produce blank tail frames.
+    const { teardown, setup } = withGlobals(
+      setupHostHiddenScenario({ visibility: "hidden" }, { hostAttribute: "data-start" }),
+    );
+
+    try {
+      await injectVideoFramesBatch(passthroughPage(), [
+        {
+          videoId: "pip",
+          dataUri:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+        },
+      ]);
+    } finally {
+      teardown();
+    }
+
+    const sibling = setup.video.nextElementSibling as HTMLElement | null;
+    expect(sibling).not.toBeNull();
+    expect(sibling?.classList.contains("__render_frame__")).toBe(true);
+    expect(sibling?.style.visibility).toBe("visible");
+  });
+
+  it("syncVideoFrameVisibility shows the replacement <img> when a plain [data-start] host is visibility:hidden", async () => {
+    const { teardown, setup } = withGlobals(
+      setupHostHiddenScenario({ visibility: "hidden" }, { hostAttribute: "data-start" }),
+    );
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    seededImg.style.visibility = "hidden";
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+
+    try {
+      await syncVideoFrameVisibility(passthroughPage(), ["pip"]);
+    } finally {
+      teardown();
+    }
+
+    // The host's `visibility: hidden` is escapable; sync must flip the
+    // <img> to `visibility: visible` so it overrides the ancestor.
+    expect(seededImg.style.visibility).toBe("visible");
+  });
+
+  // Regression for the layered/HDR mask path: `applyDomLayerMask` writes an
+  // `!important` stylesheet rule `#${showId} *{visibility:visible !important}`
+  // which, if a sub-comp host id appears in the show set, would revive a
+  // plain (non-important) inline `visibility: hidden` on a descendant
+  // `__render_frame__` — the cascade rule is "important stylesheet author
+  // beats non-important inline author". To stay safe regardless of which
+  // layer ends up in `show`, the ancestor-hidden hide must be written with
+  // `!important` so inline `!important` beats stylesheet `!important`.
+  //
+  // linkedom strips `!important` from `cssText`/`getPropertyPriority`, so we
+  // pin the contract on the API call site instead: a `setProperty(name,
+  // value, "important")` invocation on the live `<img>`'s style.
+  it("injectVideoFramesBatch hides a stale <img> with !important so the layer mask cannot revive it", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({ visibility: "hidden" }));
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    seededImg.style.visibility = "visible";
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+    const setPropertySpy = vi.spyOn(seededImg.style, "setProperty");
+
+    try {
+      await injectVideoFramesBatch(passthroughPage(), [
+        {
+          videoId: "pip",
+          dataUri:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=",
+        },
+      ]);
+    } finally {
+      teardown();
+    }
+
+    expect(seededImg.style.visibility).toBe("hidden");
+    expect(setPropertySpy).toHaveBeenCalledWith("visibility", "hidden", "important");
+  });
+
+  it("syncVideoFrameVisibility hides an existing <img> with !important so the layer mask cannot revive it", async () => {
+    const { teardown, setup } = withGlobals(setupHostHiddenScenario({ visibility: "hidden" }));
+    const seededImg = setup.document.createElement("img");
+    seededImg.classList.add("__render_frame__");
+    seededImg.style.visibility = "visible";
+    setup.video.parentNode?.insertBefore(seededImg, setup.video.nextSibling);
+    const setPropertySpy = vi.spyOn(seededImg.style, "setProperty");
+
+    try {
+      await syncVideoFrameVisibility(passthroughPage(), ["pip"]);
+    } finally {
+      teardown();
+    }
+
+    expect(seededImg.style.visibility).toBe("hidden");
+    expect(setPropertySpy).toHaveBeenCalledWith("visibility", "hidden", "important");
   });
 });

@@ -7,6 +7,7 @@ interface CompositionsTabProps {
   onSelect: (comp: string) => void;
   onRenderComposition?: (comp: string) => void;
   isRendering?: boolean;
+  lintFindingsByFile?: Map<string, { count: number; messages: string[] }>;
 }
 
 const DEFAULT_PREVIEW_STAGE = { width: 1920, height: 1080 };
@@ -62,33 +63,46 @@ function parsePositiveNumber(value: string | null): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+// fallow-ignore-next-line complexity
 function resolveIframeDuration(iframe: HTMLIFrameElement | null): number | null {
-  const win = iframe?.contentWindow as PreviewWindow | null;
-  const playerDuration = win?.__player?.getDuration?.();
-  if (Number.isFinite(playerDuration) && playerDuration != null && playerDuration > 0) {
-    return playerDuration;
+  try {
+    const win = iframe?.contentWindow as PreviewWindow | null;
+    const playerDuration = win?.__player?.getDuration?.();
+    if (Number.isFinite(playerDuration) && playerDuration != null && playerDuration > 0) {
+      return playerDuration;
+    }
+  } catch {
+    /* cross-origin iframe */
   }
 
-  const doc = iframe?.contentDocument;
-  const root = doc?.querySelector("[data-composition-id]") ?? doc?.documentElement ?? null;
-  return (
-    parsePositiveNumber(root?.getAttribute("data-composition-duration") ?? null) ??
-    parsePositiveNumber(root?.getAttribute("data-duration") ?? null)
-  );
+  try {
+    const doc = iframe?.contentDocument;
+    const root = doc?.querySelector("[data-composition-id]") ?? doc?.documentElement ?? null;
+    return (
+      parsePositiveNumber(root?.getAttribute("data-composition-duration") ?? null) ??
+      parsePositiveNumber(root?.getAttribute("data-duration") ?? null)
+    );
+  } catch {
+    return null;
+  }
 }
 
 function syncIframePlayback(iframe: HTMLIFrameElement | null, shouldPlay: boolean): boolean {
-  const player = (iframe?.contentWindow as PreviewWindow | null)?.__player;
-  if (!player) return false;
+  try {
+    const player = (iframe?.contentWindow as PreviewWindow | null)?.__player;
+    if (!player) return false;
 
-  if (shouldPlay) {
-    player.play?.();
+    if (shouldPlay) {
+      player.play?.();
+      return true;
+    }
+
+    player.pause?.();
+    player.seek?.(resolveThumbnailSeekTime(resolveIframeDuration(iframe)));
     return true;
+  } catch {
+    return false;
   }
-
-  player.pause?.();
-  player.seek?.(resolveThumbnailSeekTime(resolveIframeDuration(iframe)));
-  return true;
 }
 
 function CompCard({
@@ -98,6 +112,7 @@ function CompCard({
   onSelect,
   onRender,
   isRendering,
+  lintInfo,
 }: {
   projectId: string;
   comp: string;
@@ -105,6 +120,7 @@ function CompCard({
   onSelect: () => void;
   onRender?: () => void;
   isRendering?: boolean;
+  lintInfo?: { count: number; messages: string[] };
 }) {
   const [hovered, setHovered] = useState(false);
   const [stageSize, setStageSize] = useState(DEFAULT_PREVIEW_STAGE);
@@ -202,8 +218,16 @@ function CompCard({
           tabIndex={-1}
         />
       </div>
-      <div className="min-w-0 flex-1">
-        <span className="text-[11px] font-medium text-neutral-300 truncate block">{name}</span>
+      <div
+        className="min-w-0 flex-1"
+        title={lintInfo && lintInfo.count > 0 ? lintInfo.messages.join("\n") : undefined}
+      >
+        <div className="flex items-center gap-1">
+          <span className="text-[11px] font-medium text-neutral-300 truncate">{name}</span>
+          {lintInfo && lintInfo.count > 0 && (
+            <span className="flex-shrink-0 w-2 h-2 rounded-full bg-amber-400" />
+          )}
+        </div>
         <span className="text-[9px] text-neutral-600 truncate block">{comp}</span>
       </div>
       {onRender && (
@@ -249,6 +273,7 @@ export const CompositionsTab = memo(function CompositionsTab({
   onSelect,
   onRenderComposition,
   isRendering,
+  lintFindingsByFile,
 }: CompositionsTabProps) {
   if (compositions.length === 0) {
     return (
@@ -269,6 +294,7 @@ export const CompositionsTab = memo(function CompositionsTab({
           onSelect={() => onSelect(comp)}
           onRender={onRenderComposition ? () => onRenderComposition(comp) : undefined}
           isRendering={isRendering}
+          lintInfo={lintFindingsByFile?.get(comp)}
         />
       ))}
     </div>

@@ -1,9 +1,9 @@
 import type { Hono } from "hono";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { injectScriptsIntoHtml } from "../../compiler/htmlDocument.js";
 import type { StudioApiAdapter } from "../types.js";
-import { isSafePath } from "../helpers/safePath.js";
+import { resolveWithinProject } from "../helpers/safePath.js";
 import { getMimeType } from "../helpers/mime.js";
 import { buildSubCompositionHtml } from "../helpers/subComposition.js";
 import { createProjectSignature } from "../helpers/projectSignature.js";
@@ -11,6 +11,8 @@ import {
   createStudioMotionRenderBodyScript,
   STUDIO_MOTION_PATH,
 } from "../helpers/studioMotionRenderScript.js";
+import { ensureHfIds } from "../../parsers/hfIds.js";
+import { persistHfIdsIfNeeded } from "../helpers/hfIdPersist.js";
 
 const PROJECT_SIGNATURE_META = "hyperframes-project-signature";
 const GSAP_CDN_VERSION = "3.15.0";
@@ -65,12 +67,14 @@ function injectScriptTagIntoHead(html: string, scriptTag: string): string {
 }
 
 function htmlHasGsap(html: string): boolean {
-  // Keep this heuristic conservative: if user source already loads GSAP, Studio does not add another copy.
+  // Only match GSAP references outside <template> elements — scripts inside
+  // templates are inert when cloned and don't make GSAP globally available.
+  const outsideTemplates = html.replace(/<template\b[^>]*>[\s\S]*?<\/template>/gi, "");
   return (
-    /<script\b[^>]*src=["'][^"']*gsap/i.test(html) ||
-    /\/\*\s*inlined:.*gsap/i.test(html) ||
-    /\b(GreenSock|_gsScope)\b/.test(html) ||
-    /\bgsap\.(config|defaults|registerPlugin|version)\b/.test(html)
+    /<script\b[^>]*src=["'][^"']*gsap/i.test(outsideTemplates) ||
+    /\/\*\s*inlined:.*gsap/i.test(outsideTemplates) ||
+    /\b(GreenSock|_gsScope)\b/.test(outsideTemplates) ||
+    /\bgsap\.(config|defaults|registerPlugin|version)\b/.test(outsideTemplates)
   );
 }
 
@@ -194,6 +198,7 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
   });
 
   // Bundled composition preview
+  // fallow-ignore-next-line complexity
   api.get("/projects/:id/preview", async (c) => {
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
@@ -205,14 +210,19 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
       return new Response(null, { status: 304, headers: previewCacheHeaders(etag) });
     }
 
+    // Normalize + persist data-hf-id to disk before bundle reads it. Idempotent.
+    const diskMain = resolveProjectMainHtml(project.dir, project.id);
+    const normalizedDisk = diskMain
+      ? persistHfIdsIfNeeded(join(project.dir, diskMain.compositionPath), diskMain.html)
+      : null;
+
     try {
       let bundled = await adapter.bundle(project.dir);
       let mainCompositionPath = "index.html";
       if (!bundled) {
-        const main = resolveProjectMainHtml(project.dir, project.id);
-        if (!main) return c.text("not found", 404);
-        bundled = main.html;
-        mainCompositionPath = main.compositionPath;
+        if (!diskMain) return c.text("not found", 404);
+        bundled = normalizedDisk ?? diskMain.html;
+        mainCompositionPath = diskMain.compositionPath;
       }
 
       // Inject runtime if not already present (check URL pattern and bundler attribute)
@@ -232,22 +242,33 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
         bundled = bundled.replace(/<head>/i, `<head><base href="${baseHref}">`);
       }
 
+      // ensureHfIds runs after transformPreviewHtml in case the adapter injected
+      // new elements. On the no-bundle path bundled=normalizedDisk (already tagged)
+      // so this is idempotent. On the bundled path the bundler may return untagged
+      // HTML (stale cache); because ids are content-keyed the minted ids will match
+      // the ids already written to disk by persistHfIdsIfNeeded above.
       bundled = injectStudioPreviewAugmentations(
-        await transformPreviewHtml(bundled, adapter, project, mainCompositionPath),
+        ensureHfIds(await transformPreviewHtml(bundled, adapter, project, mainCompositionPath)),
         adapter,
         project.dir,
         mainCompositionPath,
       );
       return c.html(bundled, 200, previewCacheHeaders(etag));
     } catch {
-      const main = resolveProjectMainHtml(project.dir, project.id);
-      if (main) {
+      // Re-read disk on bundle failure so we serve the latest file content,
+      // not the pre-request snapshot that may have been saved over.
+      const fallback = resolveProjectMainHtml(project.dir, project.id);
+      if (fallback) {
+        const fallbackHtml = persistHfIdsIfNeeded(
+          join(project.dir, fallback.compositionPath),
+          fallback.html,
+        );
         return c.html(
           injectStudioPreviewAugmentations(
-            await transformPreviewHtml(main.html, adapter, project, main.compositionPath),
+            await transformPreviewHtml(fallbackHtml, adapter, project, fallback.compositionPath),
             adapter,
             project.dir,
-            main.compositionPath,
+            fallback.compositionPath,
           ),
           200,
           previewCacheHeaders(etag),
@@ -266,12 +287,8 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
     const compPath = decodeURIComponent(
       c.req.path.replace(`/projects/${project.id}/preview/comp/`, "").split("?")[0] ?? "",
     );
-    const compFile = resolve(project.dir, compPath);
-    if (
-      !isSafePath(project.dir, compFile) ||
-      !existsSync(compFile) ||
-      !statSync(compFile).isFile()
-    ) {
+    const compFile = resolveWithinProject(project.dir, compPath);
+    if (!compFile || !existsSync(compFile) || !statSync(compFile).isFile()) {
       return c.text("not found", 404);
     }
 
@@ -284,7 +301,7 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
     const baseHref = `/api/projects/${project.id}/preview/`;
     let html = buildSubCompositionHtml(project.dir, compPath, adapter.runtimeUrl, baseHref);
     if (!html) return c.text("not found", 404);
-    html = await transformPreviewHtml(html, adapter, project, compPath);
+    html = ensureHfIds(await transformPreviewHtml(html, adapter, project, compPath));
     return c.html(
       injectStudioPreviewAugmentations(html, adapter, project.dir, compPath),
       200,
@@ -293,15 +310,19 @@ export function registerPreviewRoutes(api: Hono, adapter: StudioApiAdapter): voi
   });
 
   // Static asset serving (with range request support for audio/video seeking)
+  // fallow-ignore-next-line complexity
   api.get("/projects/:id/preview/*", async (c) => {
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
     const subPath = decodeURIComponent(
       c.req.path.replace(`/projects/${project.id}/preview/`, "").split("?")[0] ?? "",
     );
-    const file = resolve(project.dir, subPath);
+    const file = resolveWithinProject(project.dir, subPath);
+    if (!file) {
+      return c.text("not found", 404);
+    }
     const stat = existsSync(file) ? statSync(file) : null;
-    if (!isSafePath(project.dir, file) || !stat?.isFile()) {
+    if (!stat?.isFile()) {
       return c.text("not found", 404);
     }
     const contentType = getMimeType(subPath);

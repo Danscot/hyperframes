@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { parseHTML } from "linkedom";
-import { scopeCssToComposition, wrapScopedCompositionScript } from "./compositionScoping";
+import {
+  scopeCssToComposition,
+  wrapInlineScriptWithErrorBoundary,
+  wrapScopedCompositionScript,
+} from "./compositionScoping";
 
 describe("composition scoping", () => {
   it("scopes regular selectors while preserving global at-rules", () => {
@@ -566,6 +570,27 @@ window.__afterTimeline = window.__timelines.scene;
 
     // Regular child selectors still get a descendant combinator (space)
     expect(scoped).toContain('[data-composition-id="chrome-overlay"] .child-element');
+  });
+
+  it("escapes </script> in scoped composition script source to prevent injection", () => {
+    const wrapped = wrapScopedCompositionScript(
+      'window.payload = "</script><script>window.pwned = true;</script>";',
+      "scene",
+    );
+
+    expect(wrapped).toContain("(function(document, gsap, window, __hyperframes)");
+    expect(wrapped).not.toContain("</script><script>");
+    expect(wrapped).toContain("<\\/script>");
+  });
+
+  it("wraps unscoped composition script source as a string literal", () => {
+    const wrapped = wrapInlineScriptWithErrorBoundary(
+      'window.payload = "</script><script>window.pwned = true;</script>";',
+      "[HyperFrames] composition script error:",
+    );
+
+    expect(wrapped).toContain("Function(");
+    expect(wrapped).toContain('\\"</script><script>window.pwned = true;</script>\\"');
   });
 
   it("rewrites #id CSS selectors to [data-hf-authored-id] when authoredRootId is provided", () => {

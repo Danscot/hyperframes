@@ -1,6 +1,22 @@
 import { create } from "zustand";
 import { readStudioUiPreferences, writeStudioUiPreferences } from "../../utils/studioUiPreferences";
 
+/** Minimal keyframe cache types — mirrors GsapKeyframesData without pulling in Node-only gsap-parser. */
+export interface KeyframeCacheEntry {
+  format: string;
+  keyframes: Array<{
+    percentage: number;
+    /** Original tween-relative percentage (server mutations need this, not the clip-relative `percentage`). */
+    tweenPercentage?: number;
+    /** Which property group the source tween belongs to (position, scale, rotation, visual, etc.). */
+    propertyGroup?: string;
+    properties: Record<string, number | string>;
+    ease?: string;
+  }>;
+  ease?: string;
+  easeEach?: string;
+}
+
 export interface TimelineElement {
   id: string;
   label?: string;
@@ -10,6 +26,8 @@ export interface TimelineElement {
   duration: number;
   track: number;
   domId?: string;
+  /** Stable `data-hf-id` attribute value — used as primary patch target when present */
+  hfId?: string;
   /** Best-effort selector used when patching source HTML back from timeline edits */
   selector?: string;
   /** Zero-based occurrence index for non-unique selectors */
@@ -31,6 +49,7 @@ export interface TimelineElement {
 }
 
 export type ZoomMode = "fit" | "manual";
+type TimelineTool = "select" | "razor";
 
 interface PlayerState {
   isPlaying: boolean;
@@ -50,6 +69,28 @@ interface PlayerState {
   inPoint: number | null;
   /** Work-area out-point (seconds). When set, loop ends here and E jumps here. */
   outPoint: number | null;
+
+  activeTool: TimelineTool;
+  setActiveTool: (tool: TimelineTool) => void;
+
+  /** Set of selected keyframe keys in format `${elementId}:${percentage}`. */
+  selectedKeyframes: Set<string>;
+  toggleSelectedKeyframe: (key: string) => void;
+  clearSelectedKeyframes: () => void;
+
+  /** Tween-relative percentage of the last-clicked keyframe diamond. Operations
+   *  (drag, resize, rotate) target this instead of recomputing from playhead. */
+  activeKeyframePct: number | null;
+  setActiveKeyframePct: (pct: number | null) => void;
+
+  /** Multi-select: additional selected elements beyond selectedElementId. */
+  selectedElementIds: Set<string>;
+  toggleSelectedElementId: (id: string) => void;
+  clearSelectedElementIds: () => void;
+
+  /** Keyframe data per element id, populated from parsed GSAP animations. */
+  keyframeCache: Map<string, KeyframeCacheEntry>;
+  setKeyframeCache: (elementId: string, data: KeyframeCacheEntry | undefined) => void;
 
   setIsPlaying: (playing: boolean) => void;
   setCurrentTime: (time: number) => void;
@@ -77,6 +118,9 @@ interface PlayerState {
   requestedSeekTime: number | null;
   requestSeek: (time: number) => void;
   clearSeekRequest: () => void;
+
+  lintFindingsByElement: Map<string, { count: number; messages: string[] }>;
+  setLintFindingsByElement: (map: Map<string, { count: number; messages: string[] }>) => void;
 }
 
 // Lightweight pub-sub for current time during playback.
@@ -92,7 +136,7 @@ export const liveTime = {
   },
 };
 
-export const usePlayerStore = create<PlayerState>((set) => ({
+export const usePlayerStore = create<PlayerState>((set, get) => ({
   isPlaying: false,
   currentTime: 0,
   duration: 0,
@@ -107,11 +151,52 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   inPoint: null,
   outPoint: null,
 
+  activeTool: "select",
+  setActiveTool: (tool) => set({ activeTool: tool }),
+
+  selectedKeyframes: new Set(),
+  toggleSelectedKeyframe: (key) =>
+    set((s) => {
+      const next = new Set(s.selectedKeyframes);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return { selectedKeyframes: next };
+    }),
+  clearSelectedKeyframes: () => set({ selectedKeyframes: new Set() }),
+
+  activeKeyframePct: null,
+  setActiveKeyframePct: (pct) => set({ activeKeyframePct: pct }),
+
+  selectedElementIds: new Set<string>(),
+  toggleSelectedElementId: (id: string) =>
+    set((s) => {
+      const next = new Set(s.selectedElementIds);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return { selectedElementIds: next };
+    }),
+  clearSelectedElementIds: () => set({ selectedElementIds: new Set() }),
+
+  keyframeCache: new Map(),
+  setKeyframeCache: (elementId, data) =>
+    set((s) => {
+      const next = new Map(s.keyframeCache);
+      if (data) next.set(elementId, data);
+      else next.delete(elementId);
+      return { keyframeCache: next };
+    }),
+
   requestedSeekTime: null,
   requestSeek: (time) => set({ requestedSeekTime: time }),
   clearSeekRequest: () => set({ requestedSeekTime: null }),
 
-  setIsPlaying: (playing) => set({ isPlaying: playing }),
+  lintFindingsByElement: new Map(),
+  setLintFindingsByElement: (map) => set({ lintFindingsByElement: map }),
+
+  setIsPlaying: (playing) => {
+    if (get().isPlaying === playing) return;
+    set({ isPlaying: playing });
+  },
   setPlaybackRate: (rate) => {
     writeStudioUiPreferences({ playbackRate: rate });
     set({ playbackRate: rate });
@@ -169,5 +254,9 @@ export const usePlayerStore = create<PlayerState>((set) => ({
       selectedElementId: null,
       inPoint: null,
       outPoint: null,
+      activeTool: "select",
+      selectedKeyframes: new Set(),
+      selectedElementIds: new Set(),
+      keyframeCache: new Map(),
     }),
 }));

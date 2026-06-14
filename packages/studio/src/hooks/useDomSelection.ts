@@ -1,6 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import type { TimelineElement } from "../player";
-import { getPreviewTargetFromPointer } from "../utils/studioPreviewHelpers";
+import {
+  getAllPreviewTargetsFromPointer,
+  getPreviewTargetFromPointer,
+} from "../utils/studioPreviewHelpers";
 import { findMatchingTimelineElementId, type RightPanelTab } from "../utils/studioHelpers";
 import {
   domEditSelectionsTargetSame,
@@ -16,6 +19,7 @@ import {
   resolveDomEditSelection,
   type DomEditSelection,
 } from "../components/editor/domEditing";
+import { reapplyPositionEditsAfterSeek } from "../components/editor/manualEdits";
 
 // ── Types ──
 
@@ -60,17 +64,23 @@ export interface UseDomSelectionReturn {
   buildDomSelectionFromTarget: (
     target: HTMLElement,
     options?: { preferClipAncestor?: boolean },
-  ) => DomEditSelection | null;
+  ) => Promise<DomEditSelection | null>;
   resolveDomSelectionFromPreviewPoint: (
     clientX: number,
     clientY: number,
     options?: { preferClipAncestor?: boolean },
-  ) => DomEditSelection | null;
+  ) => Promise<DomEditSelection | null>;
+  resolveAllDomSelectionsFromPreviewPoint: (
+    clientX: number,
+    clientY: number,
+  ) => Promise<DomEditSelection[]>;
   updateDomEditHoverSelection: (selection: DomEditSelection | null) => void;
-  buildDomSelectionForTimelineElement: (element: TimelineElement) => DomEditSelection | null;
-  handleTimelineElementSelect: (element: TimelineElement | null) => void;
-  refreshDomEditSelectionFromPreview: (selection: DomEditSelection) => void;
-  refreshDomEditGroupSelectionsFromPreview: (selections: DomEditSelection[]) => void;
+  buildDomSelectionForTimelineElement: (
+    element: TimelineElement,
+  ) => Promise<DomEditSelection | null>;
+  handleTimelineElementSelect: (element: TimelineElement | null) => Promise<void>;
+  refreshDomEditSelectionFromPreview: (selection: DomEditSelection) => Promise<void>;
+  refreshDomEditGroupSelectionsFromPreview: (selections: DomEditSelection[]) => Promise<void>;
 }
 
 // ── Hook ──
@@ -110,6 +120,7 @@ export function useDomSelection({
   // ── Callbacks ──
 
   const applyDomSelection = useCallback(
+    // fallow-ignore-next-line complexity
     (
       selection: DomEditSelection | null,
       options?: {
@@ -193,25 +204,62 @@ export function useDomSelection({
   }, [applyDomSelection]);
 
   const buildDomSelectionFromTarget = useCallback(
-    (target: HTMLElement, options?: { preferClipAncestor?: boolean }) => {
+    (
+      target: HTMLElement,
+      options?: { preferClipAncestor?: boolean; skipSourceProbe?: boolean },
+    ) => {
       return resolveDomEditSelection(target, {
         activeCompositionPath: activeCompPath,
         isMasterView,
         preferClipAncestor: options?.preferClipAncestor,
+        skipSourceProbe: options?.skipSourceProbe,
+        projectId,
       });
     },
-    [activeCompPath, isMasterView],
+    [activeCompPath, isMasterView, projectId],
   );
 
   const resolveDomSelectionFromPreviewPoint = useCallback(
-    (clientX: number, clientY: number, options?: { preferClipAncestor?: boolean }) => {
+    // fallow-ignore-next-line complexity
+    async (
+      clientX: number,
+      clientY: number,
+      options?: { preferClipAncestor?: boolean; skipSourceProbe?: boolean },
+    ) => {
       const iframe = previewIframeRef.current;
       if (!iframe || captionEditMode) return null;
+      try {
+        if (iframe.contentDocument) reapplyPositionEditsAfterSeek(iframe.contentDocument);
+      } catch {
+        /* cross-origin guard */
+      }
       const target = getPreviewTargetFromPointer(iframe, clientX, clientY, activeCompPath);
       if (!target) return null;
       return buildDomSelectionFromTarget(target, {
         preferClipAncestor: options?.preferClipAncestor,
+        skipSourceProbe: options?.skipSourceProbe,
       });
+    },
+    [activeCompPath, buildDomSelectionFromTarget, captionEditMode, previewIframeRef],
+  );
+
+  const resolveAllDomSelectionsFromPreviewPoint = useCallback(
+    // fallow-ignore-next-line complexity
+    async (clientX: number, clientY: number): Promise<DomEditSelection[]> => {
+      const iframe = previewIframeRef.current;
+      if (!iframe || captionEditMode) return [];
+      try {
+        if (iframe.contentDocument) reapplyPositionEditsAfterSeek(iframe.contentDocument);
+      } catch {
+        /* cross-origin guard */
+      }
+      const targets = getAllPreviewTargetsFromPointer(iframe, clientX, clientY, activeCompPath);
+      const results: DomEditSelection[] = [];
+      for (const target of targets) {
+        const sel = await buildDomSelectionFromTarget(target, { skipSourceProbe: true });
+        if (sel) results.push(sel);
+      }
+      return results;
     },
     [activeCompPath, buildDomSelectionFromTarget, captionEditMode, previewIframeRef],
   );
@@ -223,7 +271,8 @@ export function useDomSelection({
   }, []);
 
   const buildDomSelectionForTimelineElement = useCallback(
-    (element: TimelineElement): DomEditSelection | null => {
+    // fallow-ignore-next-line complexity
+    async (element: TimelineElement): Promise<DomEditSelection | null> => {
       const iframe = previewIframeRef.current;
       let doc: Document | null = null;
       try {
@@ -232,6 +281,8 @@ export function useDomSelection({
         return null;
       }
       if (!doc) return null;
+
+      reapplyPositionEditsAfterSeek(doc);
 
       const targetElement = findElementForTimelineElement(doc, element, {
         activeCompositionPath: activeCompPath,
@@ -248,21 +299,22 @@ export function useDomSelection({
   );
 
   const handleTimelineElementSelect = useCallback(
-    (element: TimelineElement | null) => {
+    async (element: TimelineElement | null) => {
       if (!STUDIO_INSPECTOR_PANELS_ENABLED) return;
       if (!element) {
         applyDomSelection(null, { revealPanel: false });
         return;
       }
 
-      const selection = buildDomSelectionForTimelineElement(element);
+      const selection = await buildDomSelectionForTimelineElement(element);
       if (selection) applyDomSelection(selection);
     },
     [applyDomSelection, buildDomSelectionForTimelineElement],
   );
 
   const refreshDomEditSelectionFromPreview = useCallback(
-    (selection: DomEditSelection) => {
+    // fallow-ignore-next-line complexity
+    async (selection: DomEditSelection) => {
       const iframe = previewIframeRef.current;
       let doc: Document | null = null;
       try {
@@ -275,7 +327,7 @@ export function useDomSelection({
       const element = findElementForSelection(doc, selection, activeCompPath);
       if (!element) return;
 
-      const nextSelection = buildDomSelectionFromTarget(element);
+      const nextSelection = await buildDomSelectionFromTarget(element);
       if (nextSelection) {
         applyDomSelection(nextSelection, {
           revealPanel: false,
@@ -287,7 +339,8 @@ export function useDomSelection({
   );
 
   const refreshDomEditGroupSelectionsFromPreview = useCallback(
-    (selections: DomEditSelection[]) => {
+    // fallow-ignore-next-line complexity
+    async (selections: DomEditSelection[]) => {
       const iframe = previewIframeRef.current;
       let doc: Document | null = null;
       try {
@@ -301,7 +354,7 @@ export function useDomSelection({
       for (const selection of selections) {
         const element = findElementForSelection(doc, selection, activeCompPath);
         if (!element) continue;
-        const nextSelection = buildDomSelectionFromTarget(element);
+        const nextSelection = await buildDomSelectionFromTarget(element);
         if (nextSelection) nextGroup.push(nextSelection);
       }
       if (nextGroup.length === 0) return;
@@ -336,46 +389,29 @@ export function useDomSelection({
 
   // ── Effects ──
 
-  // Clear hover on caption mode change
-  // eslint-disable-next-line no-restricted-syntax
-  useEffect(() => {
-    if (captionEditMode) updateDomEditHoverSelection(null);
-  }, [captionEditMode, updateDomEditHoverSelection]);
-
-  // Clear hover on composition/project/preview change
+  // Clear hover unconditionally on composition/project/preview change
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     updateDomEditHoverSelection(null);
   }, [activeCompPath, projectId, previewIframe, refreshKey, updateDomEditHoverSelection]);
 
-  // Clear hover when matching selection
+  // Clear hover conditionally (caption mode, matches selection, disconnected element)
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     if (!domEditHoverSelection) return;
-    const hoverMatchesSelection = domEditSelectionsTargetSame(
-      domEditHoverSelection,
-      domEditSelection,
-    );
-    const hoverMatchesGroup = domEditSelectionInGroup(
-      domEditGroupSelections,
-      domEditHoverSelection,
-    );
-    if (!hoverMatchesSelection && !hoverMatchesGroup) return;
-    updateDomEditHoverSelection(null);
+    const shouldClear =
+      captionEditMode ||
+      domEditSelectionsTargetSame(domEditHoverSelection, domEditSelection) ||
+      domEditSelectionInGroup(domEditGroupSelections, domEditHoverSelection) ||
+      !domEditHoverSelection.element.isConnected;
+    if (shouldClear) updateDomEditHoverSelection(null);
   }, [
-    domEditGroupSelections,
+    captionEditMode,
     domEditHoverSelection,
     domEditSelection,
+    domEditGroupSelections,
     updateDomEditHoverSelection,
   ]);
-
-  // Clear hover when element disconnected
-  // eslint-disable-next-line no-restricted-syntax
-  useEffect(() => {
-    if (!domEditHoverSelection) return;
-    if (domEditHoverSelection.element.isConnected) return;
-    updateDomEditHoverSelection(null);
-  }, [domEditHoverSelection, updateDomEditHoverSelection]);
 
   // Clear selection on caption mode change
   // eslint-disable-next-line no-restricted-syntax
@@ -410,6 +446,7 @@ export function useDomSelection({
     clearDomSelection,
     buildDomSelectionFromTarget,
     resolveDomSelectionFromPreviewPoint,
+    resolveAllDomSelectionsFromPreviewPoint,
     updateDomEditHoverSelection,
     buildDomSelectionForTimelineElement,
     handleTimelineElementSelect,

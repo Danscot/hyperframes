@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication complexity
 /**
  * Chunk Encoder Service
  *
@@ -18,6 +19,7 @@ import {
 } from "../utils/gpuEncoder.js";
 import { type HdrTransfer, getHdrEncoderColorParams } from "../utils/hdr.js";
 import { formatFfmpegError, runFfmpeg } from "../utils/runFfmpeg.js";
+import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
 import { type Fps, fpsToFfmpegArg } from "@hyperframes/core";
 import type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
 
@@ -35,6 +37,11 @@ export interface EncoderPreset {
   codec: "h264" | "h265" | "vp9" | "prores";
   pixelFormat: string;
   hdr?: { transfer: HdrTransfer };
+}
+
+function appendEncodeTimeoutMessage(error: string, timedOut: boolean, timeoutMs: number): string {
+  if (!timedOut) return error;
+  return `${error}\nFFmpeg killed after exceeding ffmpegEncodeTimeout (${timeoutMs} ms)`;
 }
 
 /**
@@ -140,9 +147,13 @@ export function buildEncoderArgs(
           if (bitrate) args.push("-b:v", bitrate);
           else args.push("-global_quality", String(quality));
           break;
+        case "amf":
+          if (bitrate) args.push("-b:v", bitrate);
+          else args.push("-rc", "cqp", "-qp_i", String(quality), "-qp_p", String(quality));
+          break;
       }
 
-      // Same B-frame story as the SW branch below — nvenc emits B-frames
+      // Same B-frame story as the SW branch below — nvenc/amf emit B-frames
       // by default (qsv via b_strategy, vaapi too), and the negative-DTS
       // freeze hits the same downstream players. The unconditional
       // `-avoid_negative_ts make_zero` near the bottom of this function
@@ -153,7 +164,10 @@ export function buildEncoderArgs(
       // negative DTS in practice on macOS Sonoma+.
       if (
         codec === "h264" &&
-        (gpuEncoder === "nvenc" || gpuEncoder === "qsv" || gpuEncoder === "vaapi")
+        (gpuEncoder === "nvenc" ||
+          gpuEncoder === "qsv" ||
+          gpuEncoder === "vaapi" ||
+          gpuEncoder === "amf")
       ) {
         args.push("-bf", "0");
         if (gpuEncoder === "qsv") {
@@ -404,7 +418,7 @@ export async function encodeFramesFromDir(
   const args = buildEncoderArgs(options, inputArgs, outputPath, gpuEncoder);
 
   return new Promise((resolve) => {
-    const ffmpeg = spawn("ffmpeg", args);
+    const ffmpeg = spawn(getFfmpegBinary(), args);
     trackChildProcess(ffmpeg);
     let stderr = "";
     const onAbort = () => {
@@ -419,7 +433,9 @@ export async function encodeFramesFromDir(
     }
 
     const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       ffmpeg.kill("SIGTERM");
     }, encodeTimeout);
 
@@ -431,7 +447,7 @@ export async function encodeFramesFromDir(
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
       const durationMs = Date.now() - startTime;
-      if (signal?.aborted) {
+      if (signal?.aborted && !timedOut) {
         resolve({
           success: false,
           outputPath,
@@ -443,14 +459,18 @@ export async function encodeFramesFromDir(
         return;
       }
 
-      if (code !== 0) {
+      if (code !== 0 || timedOut) {
         resolve({
           success: false,
           outputPath,
           durationMs,
           framesEncoded: 0,
           fileSize: 0,
-          error: formatFfmpegError(code, stderr),
+          error: appendEncodeTimeoutMessage(
+            formatFfmpegError(code, stderr),
+            timedOut,
+            encodeTimeout,
+          ),
         });
         return;
       }
@@ -468,7 +488,7 @@ export async function encodeFramesFromDir(
         durationMs: Date.now() - startTime,
         framesEncoded: 0,
         fileSize: 0,
-        error: `[FFmpeg] ${err.message}`,
+        error: appendEncodeTimeoutMessage(`[FFmpeg] ${err.message}`, timedOut, encodeTimeout),
       });
     });
   });
@@ -481,6 +501,7 @@ export async function encodeFramesChunkedConcat(
   options: EncoderOptions,
   chunkSizeFrames: number,
   signal?: AbortSignal,
+  config?: Partial<Pick<EngineConfig, "ffmpegEncodeTimeout">>,
 ): Promise<EncodeResult> {
   const start = Date.now();
   const files = readdirSync(framesDir)
@@ -536,18 +557,42 @@ export async function encodeFramesChunkedConcat(
     if (options.useGpu) gpuEncoder = await getCachedGpuEncoder();
     const args = buildEncoderArgs(options, inputArgs, chunkPath, gpuEncoder);
     const chunkResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-      const ffmpeg = spawn("ffmpeg", args);
+      const ffmpeg = spawn(getFfmpegBinary(), args);
       trackChildProcess(ffmpeg);
       let stderr = "";
+      const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        ffmpeg.kill("SIGTERM");
+      }, encodeTimeout);
       ffmpeg.stderr.on("data", (d) => {
         stderr += d.toString();
       });
       ffmpeg.on("close", (code) => {
-        if (code === 0) resolve({ success: true });
-        else resolve({ success: false, error: `Chunk ${i} encode failed: ${stderr.slice(-400)}` });
+        clearTimeout(timer);
+        if (code === 0 && !timedOut) resolve({ success: true });
+        else {
+          resolve({
+            success: false,
+            error: appendEncodeTimeoutMessage(
+              `Chunk ${i} encode failed: ${stderr.slice(-400)}`,
+              timedOut,
+              encodeTimeout,
+            ),
+          });
+        }
       });
       ffmpeg.on("error", (err) => {
-        resolve({ success: false, error: `Chunk ${i} encode error: ${err.message}` });
+        clearTimeout(timer);
+        resolve({
+          success: false,
+          error: appendEncodeTimeoutMessage(
+            `Chunk ${i} encode error: ${err.message}`,
+            timedOut,
+            encodeTimeout,
+          ),
+        });
       });
     });
     if (!chunkResult.success) {
@@ -580,18 +625,42 @@ export async function encodeFramesChunkedConcat(
     outputPath,
   ];
   const concatResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-    const ffmpeg = spawn("ffmpeg", concatArgs);
+    const ffmpeg = spawn(getFfmpegBinary(), concatArgs);
     trackChildProcess(ffmpeg);
     let stderr = "";
+    const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ffmpeg.kill("SIGTERM");
+    }, encodeTimeout);
     ffmpeg.stderr.on("data", (d) => {
       stderr += d.toString();
     });
     ffmpeg.on("close", (code) => {
-      if (code === 0) resolve({ success: true });
-      else resolve({ success: false, error: `Chunk concat failed: ${stderr.slice(-400)}` });
+      clearTimeout(timer);
+      if (code === 0 && !timedOut) resolve({ success: true });
+      else {
+        resolve({
+          success: false,
+          error: appendEncodeTimeoutMessage(
+            `Chunk concat failed: ${stderr.slice(-400)}`,
+            timedOut,
+            encodeTimeout,
+          ),
+        });
+      }
     });
     ffmpeg.on("error", (err) => {
-      resolve({ success: false, error: `Chunk concat error: ${err.message}` });
+      clearTimeout(timer);
+      resolve({
+        success: false,
+        error: appendEncodeTimeoutMessage(
+          `Chunk concat error: ${err.message}`,
+          timedOut,
+          encodeTimeout,
+        ),
+      });
     });
   });
 

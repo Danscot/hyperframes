@@ -1,4 +1,11 @@
 import { swallow } from "./diagnostics";
+import { interpolateVolumeGain, type VolumeKeyframe } from "./mediaVolumeEnvelope.js";
+
+export function readElementPlaybackRate(el: HTMLMediaElement): number {
+  const raw = el.defaultPlaybackRate;
+  return Number.isFinite(raw) && raw > 0 ? Math.max(0.1, Math.min(5, raw)) : 1;
+}
+
 export type RuntimeMediaClip = {
   el: HTMLVideoElement | HTMLAudioElement;
   start: number;
@@ -10,6 +17,13 @@ export type RuntimeMediaClip = {
   loop: boolean;
   /** Source media duration in seconds (from el.duration). Used for loop wrapping. */
   sourceDuration: number | null;
+  /**
+   * Probed volume keyframes from the GSAP timeline (same probe the renderer
+   * uses). When present, `syncRuntimeMedia` drives volume from the envelope
+   * rather than from `data-volume` + GSAP-change tracking, eliminating the
+   * race between the 60 Hz transport tick and GSAP's own seek.
+   */
+  volumeKeyframes?: VolumeKeyframe[];
 };
 
 export function refreshRuntimeMediaCache(params?: {
@@ -38,11 +52,7 @@ export function refreshRuntimeMediaCache(params?: {
     if (!Number.isFinite(start)) continue;
     const mediaStart =
       Number.parseFloat(el.dataset.playbackStart ?? el.dataset.mediaStart ?? "0") || 0;
-    // Read per-element rate from the native defaultPlaybackRate property.
-    // LLMs set this via el.defaultPlaybackRate = 0.5 in a <script> tag.
-    const rawRate = el.defaultPlaybackRate;
-    const playbackRate =
-      Number.isFinite(rawRate) && rawRate > 0 ? Math.max(0.1, Math.min(5, rawRate)) : 1;
+    const playbackRate = readElementPlaybackRate(el);
     const loop = el.loop;
     const sourceDuration = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
     let duration =
@@ -110,6 +120,7 @@ function clampVolume(volume: number): number {
   return Math.max(0, Math.min(1, volume));
 }
 
+// fallow-ignore-next-line complexity
 export function syncRuntimeMedia(params: {
   clips: RuntimeMediaClip[];
   timeSeconds: number;
@@ -149,8 +160,15 @@ export function syncRuntimeMedia(params: {
     const { el } = clip;
     if (!el.isConnected) continue;
     let relTime = (params.timeSeconds - clip.start) * clip.playbackRate + clip.mediaStart;
+    // An ended non-loop element has played its file to natural completion.
+    // Don't restart it — if the authored duration extends past the file's
+    // actual length, the element sits silently until the composition ends.
+    // (el.ended resets to false when the user scrubs back, so seeks work.)
     const isActive =
-      params.timeSeconds >= clip.start && params.timeSeconds < clip.end && relTime >= 0;
+      params.timeSeconds >= clip.start &&
+      params.timeSeconds <= clip.end &&
+      relTime >= 0 &&
+      (!el.ended || clip.loop);
     if (isActive) {
       // Loop wrapping: when media reaches end, restart from mediaStart
       if (clip.loop && clip.sourceDuration != null && clip.sourceDuration > 0) {
@@ -163,11 +181,26 @@ export function syncRuntimeMedia(params: {
       const fallbackAuthorVolume = clampVolume(clip.volume ?? 1);
       const previousRuntimeVolume = lastRuntimeAppliedVolume.get(el);
       const currentElementVolume = clampVolume(el.volume);
-      const authorVolume =
-        previousRuntimeVolume !== undefined &&
-        Math.abs(currentElementVolume - previousRuntimeVolume) > 0.0001
-          ? currentElementVolume
-          : fallbackAuthorVolume;
+
+      let authorVolume: number;
+      if (clip.volumeKeyframes && clip.volumeKeyframes.length > 0) {
+        // Keyframes probed from the GSAP timeline — same source as the renderer.
+        // Use the interpolated envelope value directly; no need to track GSAP changes.
+        authorVolume = clampVolume(interpolateVolumeGain(clip.volumeKeyframes, relTime));
+      } else if (previousRuntimeVolume === undefined) {
+        // First tick this clip is active. The transport has already seeked GSAP
+        // to the current time (seekTimelineAndAdapters runs before syncRuntimeMedia),
+        // so el.volume reflects the animated value — trust it rather than falling
+        // back to data-volume, which would clobber the GSAP-seeked position.
+        authorVolume = currentElementVolume;
+      } else if (Math.abs(currentElementVolume - previousRuntimeVolume) > 0.0001) {
+        // GSAP (or user code) changed el.volume between ticks — track it.
+        authorVolume = currentElementVolume;
+      } else {
+        // Volume unchanged since last tick — use data-volume as the baseline.
+        authorVolume = fallbackAuthorVolume;
+      }
+
       const effectiveVolume = clampVolume(authorVolume * userVol);
       el.volume = effectiveVolume;
       lastRuntimeAppliedVolume.set(el, effectiveVolume);

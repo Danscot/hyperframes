@@ -26,13 +26,13 @@ describe("parseHtml", () => {
     const result = parseHtml(html);
 
     expect(result.elements).toHaveLength(2);
-    expect(result.elements[0].id).toBe("text1");
+    expect(result.elements[0].id).toMatch(/^hf-[a-z0-9]{4}$/);
     expect(result.elements[0].startTime).toBe(0);
     expect(result.elements[0].duration).toBe(5);
     expect(result.elements[0].name).toBe("Title");
     expect(result.elements[0].type).toBe("text");
 
-    expect(result.elements[1].id).toBe("text2");
+    expect(result.elements[1].id).toMatch(/^hf-[a-z0-9]{4}$/);
     expect(result.elements[1].startTime).toBe(2);
     expect(result.elements[1].duration).toBe(5);
   });
@@ -53,7 +53,7 @@ describe("parseHtml", () => {
 
     expect(result.elements).toHaveLength(1);
     expect(result.elements[0].type).toBe("composition");
-    expect(result.elements[0].id).toBe("comp1");
+    expect(result.elements[0].id).toMatch(/^hf-[a-z0-9]{4}$/);
     if (result.elements[0].type === "composition") {
       expect(result.elements[0].compositionId).toBe("abc123");
       expect(result.elements[0].src).toBe("/compositions/abc123");
@@ -76,20 +76,20 @@ describe("parseHtml", () => {
 
     expect(result.elements).toHaveLength(3);
 
-    const video = result.elements.find((e) => e.id === "vid1");
+    const video = result.elements.find((e) => e.type === "video");
     expect(video).toBeDefined();
-    expect(video?.type).toBe("video");
+    expect(video?.id).toMatch(/^hf-[a-z0-9]{4}$/);
     if (video?.type === "video") {
       expect(video.src).toBe("video.mp4");
     }
 
-    const audio = result.elements.find((e) => e.id === "aud1");
+    const audio = result.elements.find((e) => e.type === "audio");
     expect(audio).toBeDefined();
-    expect(audio?.type).toBe("audio");
+    expect(audio?.id).toMatch(/^hf-[a-z0-9]{4}$/);
 
-    const img = result.elements.find((e) => e.id === "img1");
+    const img = result.elements.find((e) => e.type === "image");
     expect(img).toBeDefined();
-    expect(img?.type).toBe("image");
+    expect(img?.id).toMatch(/^hf-[a-z0-9]{4}$/);
   });
 
   it("handles missing attributes gracefully", () => {
@@ -123,7 +123,7 @@ describe("parseHtml", () => {
     const result = parseHtml(html);
 
     expect(result.elements).toHaveLength(1);
-    expect(result.elements[0].id).toMatch(/^element-\d+$/);
+    expect(result.elements[0].id).toMatch(/^hf-[a-z0-9]{4}$/);
   });
 
   it("extracts GSAP script from script tags", () => {
@@ -398,9 +398,12 @@ describe("parseHtml", () => {
     `;
     const result = parseHtml(html);
 
-    expect(result.keyframes["text1"]).toBeDefined();
-    expect(result.keyframes["text1"]).toHaveLength(2);
-    expect(result.keyframes["text1"][0].id).toBe("kf1");
+    const elId = result.elements[0]?.id ?? "";
+    expect(elId).toMatch(/^hf-[a-z0-9]{4}$/);
+    const kfs = result.keyframes[elId];
+    expect(kfs).toBeDefined();
+    expect(kfs).toHaveLength(2);
+    expect(kfs[0].id).toBe("kf1");
   });
 
   it("parses stage zoom keyframes", () => {
@@ -638,5 +641,109 @@ describe("extractCompositionMetadata", () => {
     expect(meta.variables[0].type).toBe("string");
     expect(meta.variables[1].id).toBe("count");
     expect(meta.variables[1].type).toBe("number");
+  });
+
+  // T9 — CompositionVariable font/image parse (spec for R1).
+  // These tests are intentionally red until R1 adds "font" and "image" to
+  // CompositionVariableType and updates parseCompositionVariables accordingly.
+  // Currently failing (spec): tests 1, 2, 3 — filter rejects unknown types.
+  // Currently passing (baseline): test 4 — unknown type graceful rejection already works.
+
+  it.fails("[spec] parses a font variable (type: font) with name and source", () => {
+    const variables = JSON.stringify([
+      {
+        id: "brand-font-primary",
+        type: "font",
+        label: "Heading font",
+        default: "Inter",
+        source: "https://fonts.googleapis.com/css2?family=Inter",
+        default_name: "sans-serif",
+        default_source: "",
+      },
+    ]);
+    const html = `<!DOCTYPE html>
+<html data-composition-id="c" data-composition-duration="5" data-composition-variables='${variables}'>
+<body></body></html>`;
+    const meta = extractCompositionMetadata(html);
+    const v = meta.variables.find((x) => x.id === "brand-font-primary");
+    expect(v).toBeDefined();
+    expect(v?.type).toBe("font");
+    // source, default_name, default_source are load-bearing for brand-kit font apply.
+    expect((v as Record<string, unknown>)?.source).toBe(
+      "https://fonts.googleapis.com/css2?family=Inter",
+    );
+    expect((v as Record<string, unknown>)?.default_name).toBe("sans-serif");
+    expect((v as Record<string, unknown>)?.default_source).toBe("");
+  });
+
+  it.fails("[spec] parses an image variable with brandRole logo:primary", () => {
+    const variables = JSON.stringify([
+      { id: "brand-logo", type: "image", label: "Logo", default: "", brandRole: "logo:primary" },
+    ]);
+    const html = `<!DOCTYPE html>
+<html data-composition-id="c" data-composition-duration="5" data-composition-variables='${variables}'>
+<body></body></html>`;
+    const meta = extractCompositionMetadata(html);
+    const v = meta.variables.find((x) => x.id === "brand-logo");
+    expect(v).toBeDefined();
+    expect(v?.type).toBe("image");
+    // TODO(R1): remove cast once ImageVariable.brandRole is typed
+    expect((v as Record<string, unknown>)?.brandRole).toBe("logo:primary");
+  });
+
+  it("[spec] parses a color variable with brandRole and preserves the brandRole field", () => {
+    const variables = JSON.stringify([
+      {
+        id: "brand-color-primary",
+        type: "color",
+        label: "Primary",
+        default: "#0066cc",
+        brandRole: "color:primary",
+      },
+    ]);
+    const html = `<!DOCTYPE html>
+<html data-composition-id="c" data-composition-duration="5" data-composition-variables='${variables}'>
+<body></body></html>`;
+    const meta = extractCompositionMetadata(html);
+    const v = meta.variables.find((x) => x.id === "brand-color-primary");
+    expect(v).toBeDefined();
+    // TODO(R1): remove cast once ColorVariable.brandRole is typed
+    expect((v as Record<string, unknown>)?.brandRole).toBe("color:primary");
+  });
+
+  it("color variable without brandRole parses normally (brandRole is optional)", () => {
+    const variables = JSON.stringify([
+      { id: "accent", type: "color", label: "Accent", default: "#ff0000" },
+    ]);
+    const html = `<!DOCTYPE html>
+<html data-composition-id="c" data-composition-duration="5" data-composition-variables='${variables}'>
+<body></body></html>`;
+    const meta = extractCompositionMetadata(html);
+    const v = meta.variables.find((x) => x.id === "accent");
+    expect(v).toBeDefined();
+    expect(v?.type).toBe("color");
+    expect((v as Record<string, unknown>)?.brandRole).toBeUndefined();
+  });
+
+  it.todo(
+    "[spec] font variable without source field is rejected (source is required for brand-kit font apply)",
+  );
+
+  it.todo(
+    "[spec] image variable without default is rejected gracefully (default is required for image variables)",
+  );
+
+  it("unknown variable type is rejected gracefully (does not throw, variable is skipped)", () => {
+    const variables = JSON.stringify([
+      { id: "ok", type: "string", label: "Ok", default: "yes" },
+      { id: "x", type: "widget", label: "Unknown", default: null },
+    ]);
+    const html = `<!DOCTYPE html>
+<html data-composition-id="c" data-composition-duration="5" data-composition-variables='${variables}'>
+<body></body></html>`;
+    expect(() => extractCompositionMetadata(html)).not.toThrow();
+    const meta = extractCompositionMetadata(html);
+    expect(meta.variables.find((v) => v.id === "x")).toBeUndefined();
+    expect(meta.variables.find((v) => v.id === "ok")).toBeDefined();
   });
 });

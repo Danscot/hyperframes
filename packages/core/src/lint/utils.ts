@@ -21,10 +21,14 @@ export const SCRIPT_BLOCK_PATTERN = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
 const COMPOSITION_ID_IN_CSS_PATTERN = /\[data-composition-id=["']([^"']+)["']\]/g;
 export const TIMELINE_REGISTRY_INIT_PATTERN =
   /window\.__timelines\s*=\s*window\.__timelines\s*\|\|\s*\{\}|window\.__timelines\s*=\s*\{\}|window\.__timelines\s*\?\?=\s*\{\}/i;
-export const TIMELINE_REGISTRY_ASSIGN_PATTERN = /window\.__timelines\[[^\]]+\]\s*=/i;
+export const TIMELINE_REGISTRY_ASSIGN_PATTERN =
+  /window\.__timelines(?:\[[^\]]+\]|\.[A-Za-z_$][\w$]*)\s*=/i;
 export const WINDOW_TIMELINE_ASSIGN_PATTERN =
-  /window\.__timelines\[\s*["']([^"']+)["']\s*\]\s*=\s*([A-Za-z_$][\w$]*)/i;
+  /window\.__timelines(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))\s*=\s*([A-Za-z_$][\w$]*)/i;
 export const INVALID_SCRIPT_CLOSE_PATTERN = /<script[^>]*>[\s\S]*?<\s*\/\s*script(?!>)/i;
+
+const TIMELINE_REGISTRY_KEY_PATTERN =
+  /window\.__timelines(?:\[\s*["']([^"']+)["']\s*\]|\.\s*([A-Za-z_$][\w$]*))\s*=/g;
 
 export function extractOpenTags(source: string): OpenTag[] {
   const tags: OpenTag[] = [];
@@ -141,6 +145,20 @@ export function extractCompositionIdsFromCss(css: string): string[] {
   return [...ids];
 }
 
+export function extractTimelineRegistryKeys(source: string): string[] {
+  const keys = new Set<string>();
+  let match: RegExpExecArray | null;
+  const pattern = new RegExp(
+    TIMELINE_REGISTRY_KEY_PATTERN.source,
+    TIMELINE_REGISTRY_KEY_PATTERN.flags,
+  );
+  while ((match = pattern.exec(source)) !== null) {
+    const key = match[1] ?? match[2];
+    if (key) keys.add(key);
+  }
+  return [...keys];
+}
+
 export function getInlineScriptSyntaxError(source: string): string | null {
   if (!source.trim()) return null;
   try {
@@ -151,6 +169,80 @@ export function getInlineScriptSyntaxError(source: string): string | null {
     if (error instanceof Error) return error.message;
     return String(error);
   }
+}
+
+// fallow-ignore-next-line complexity
+export function stripJsComments(source: string): string {
+  let out = "";
+  let i = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  let escaped = false;
+
+  while (i < source.length) {
+    const ch = source[i] ?? "";
+    const next = source[i + 1] ?? "";
+
+    if (quote) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      out += "  ";
+      i += 2;
+      while (i < source.length && source[i] !== "\n" && source[i] !== "\r") {
+        out += " ";
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      out += "  ";
+      i += 2;
+      while (i < source.length) {
+        const blockCh = source[i] ?? "";
+        const blockNext = source[i + 1] ?? "";
+        if (blockCh === "*" && blockNext === "/") {
+          out += "  ";
+          i += 2;
+          break;
+        }
+        out += blockCh === "\n" || blockCh === "\r" ? blockCh : " ";
+        i += 1;
+      }
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
+export function extractScriptTextsAndSrcs(scripts: ExtractedBlock[]): {
+  texts: string[];
+  srcs: string[];
+} {
+  const texts = scripts.filter((s) => !/\bsrc\s*=/.test(s.attrs)).map((s) => s.content);
+  const srcs = scripts.map((s) => readAttr(`<script ${s.attrs}>`, "src") || "").filter(Boolean);
+  return { texts, srcs };
 }
 
 export function isMediaTag(tagName: string): boolean {

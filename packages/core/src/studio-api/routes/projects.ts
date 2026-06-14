@@ -1,6 +1,25 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { Hono } from "hono";
 import type { StudioApiAdapter } from "../types.js";
-import { walkDir } from "../helpers/safePath.js";
+import { isInHiddenOrVendorDir, walkDir } from "../helpers/safePath.js";
+
+const COMPOSITION_ID_RE = /data-composition-id\s*=/;
+
+async function filterCompositionFiles(projectDir: string, files: string[]): Promise<string[]> {
+  const htmlFiles = files.filter((f) => f.endsWith(".html") && !isInHiddenOrVendorDir(f));
+  const checks = await Promise.all(
+    htmlFiles.map(async (f) => {
+      try {
+        const content = await readFile(join(projectDir, f), "utf-8");
+        return COMPOSITION_ID_RE.test(content);
+      } catch {
+        return false;
+      }
+    }),
+  );
+  return htmlFiles.filter((_, i) => checks[i]);
+}
 
 export function registerProjectRoutes(api: Hono, adapter: StudioApiAdapter): void {
   // List all projects
@@ -25,6 +44,7 @@ export function registerProjectRoutes(api: Hono, adapter: StudioApiAdapter): voi
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
     const files = walkDir(project.dir);
-    return c.json({ id: project.id, dir: project.dir, title: project.title, files });
+    const compositions = await filterCompositionFiles(project.dir, files);
+    return c.json({ id: project.id, dir: project.dir, title: project.title, files, compositions });
   });
 }

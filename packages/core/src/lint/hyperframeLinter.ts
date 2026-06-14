@@ -21,16 +21,16 @@ const ALL_RULES = [
   ...fontRules,
 ];
 
-export function lintHyperframeHtml(
+export async function lintHyperframeHtml(
   html: string,
   options: HyperframeLinterOptions = {},
-): HyperframeLintResult {
+): Promise<HyperframeLintResult> {
   const ctx = buildLintContext(html, options);
   const findings: HyperframeLintFinding[] = [];
   const seen = new Set<string>();
 
   for (const rule of ALL_RULES) {
-    for (const finding of rule(ctx)) {
+    for (const finding of await Promise.resolve(rule(ctx))) {
       const dedupeKey = [
         finding.code,
         finding.severity,
@@ -143,85 +143,6 @@ export async function lintMediaUrls(
         message: `<${tagName}${elementId ? ` id="${elementId}"` : ""}> references an unreachable URL (${reason}): ${url.slice(0, 100)}`,
         elementId,
         fixHint: "This URL is not accessible. Replace with a valid, reachable media URL.",
-        snippet,
-      });
-    }
-  });
-
-  await Promise.all(checks);
-  return findings;
-}
-
-function extractScriptUrls(html: string): Array<{ url: string; snippet: string }> {
-  const results: Array<{ url: string; snippet: string }> = [];
-  const scriptRe = /<script\b[^>]*>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = scriptRe.exec(html)) !== null) {
-    const raw = match[0];
-    const src = readAttr(raw, "src");
-    if (!src) continue;
-    if (/^https?:\/\//i.test(src)) {
-      results.push({
-        url: src,
-        snippet: truncateSnippet(raw) ?? "",
-      });
-    }
-  }
-  return results;
-}
-
-/**
- * Async lint pass: HEAD-checks every external script URL in the HTML.
- * Returns findings for URLs that are unreachable (non-2xx status or network error).
- *
- * Call this after `lintHyperframeHtml()` and merge the findings.
- *
- * @param timeoutMs - per-request timeout (default 8000ms)
- */
-export async function lintScriptUrls(
-  html: string,
-  options: { timeoutMs?: number } = {},
-): Promise<HyperframeLintFinding[]> {
-  const urls = extractScriptUrls(html);
-  if (urls.length === 0) return [];
-
-  const timeout = options.timeoutMs ?? 8000;
-  const findings: HyperframeLintFinding[] = [];
-
-  const seen = new Set<string>();
-  const unique = urls.filter((u) => {
-    if (seen.has(u.url)) return false;
-    seen.add(u.url);
-    return true;
-  });
-
-  const checks = unique.map(async ({ url, snippet }) => {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
-      const resp = await fetch(url, {
-        method: "HEAD",
-        signal: controller.signal,
-        redirect: "follow",
-      });
-      clearTimeout(timer);
-      if (!resp.ok) {
-        findings.push({
-          code: "inaccessible_script_url",
-          severity: "error",
-          message: `<script> references a URL that returned HTTP ${resp.status}: ${url.slice(0, 120)}`,
-          fixHint:
-            "This script URL is not accessible. Remove it or replace with a valid URL. The HyperFrames runtime is injected automatically — do not load it manually.",
-          snippet,
-        });
-      }
-    } catch (err) {
-      const reason = err instanceof Error ? err.name : "unknown";
-      findings.push({
-        code: "inaccessible_script_url",
-        severity: "error",
-        message: `<script> references an unreachable URL (${reason}): ${url.slice(0, 120)}`,
-        fixHint: "This script URL is not accessible. Remove it or replace with a valid URL.",
         snippet,
       });
     }

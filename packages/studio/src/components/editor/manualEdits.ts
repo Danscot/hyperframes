@@ -3,9 +3,7 @@ export {
   STUDIO_OFFSET_X_PROP,
   STUDIO_OFFSET_Y_PROP,
   STUDIO_WIDTH_PROP,
-  STUDIO_HEIGHT_PROP,
   STUDIO_ROTATION_PROP,
-  type StudioManualEditSeekWindow,
   type StudioBoxSizeSnapshot,
   type StudioRotationSnapshot,
   type StudioPathOffsetSnapshot,
@@ -27,8 +25,6 @@ export {
   applyStudioRotation,
   applyStudioRotationDraft,
   reapplyPositionEditsAfterSeek,
-  buildMotionPatches,
-  buildClearMotionPatches,
 } from "./manualEditsDom";
 
 export {
@@ -50,7 +46,6 @@ import {
   STUDIO_MANUAL_EDITS_PLAYBACK_FRAME_PROP,
 } from "./manualEditsTypes";
 import { finiteNumber } from "./manualEditsParsing";
-import { isStudioManualEditGestureActive } from "./manualEditsDom";
 
 /* ── Seek/play reapply wrappers ───────────────────────────────────── */
 function markWrapped(fn: (...args: unknown[]) => unknown): void {
@@ -245,6 +240,7 @@ export function installStudioManualEditSeekReapply(win: Window, apply: () => voi
     "renderSeek",
   );
   const wrappedTimelineSeek = wrapSeekReapplyFunction(studioWin, studioWin.__timeline, "seek");
+  wrapSeekReapplyFunction(studioWin, studioWin.__timeline, "totalTime");
   const wrappedPlayerPlay = wrapPlayReapplyFunction(studioWin, studioWin.__player, "play");
   const wrappedTimelinePlay = wrapPlayReapplyFunction(studioWin, studioWin.__timeline, "play");
   const wrappedPlayerPause = wrapApplyAfterFunction(studioWin, studioWin.__player, "pause");
@@ -255,10 +251,34 @@ export function installStudioManualEditSeekReapply(win: Window, apply: () => voi
   for (const timeline of Object.values(studioWin.__timelines ?? {})) {
     wrappedNamedTimelineSeek =
       wrapSeekReapplyFunction(studioWin, timeline, "seek") || wrappedNamedTimelineSeek;
+    wrapSeekReapplyFunction(studioWin, timeline, "totalTime");
     wrappedNamedTimelinePlay =
       wrapPlayReapplyFunction(studioWin, timeline, "play") || wrappedNamedTimelinePlay;
     wrappedNamedTimelinePause =
       wrapApplyAfterFunction(studioWin, timeline, "pause") || wrappedNamedTimelinePause;
+  }
+
+  // Auto-wrap timelines registered AFTER this install runs. GSAP compositions
+  // register via `window.__timelines[id] = tl` which may happen after the
+  // Studio hook runs. The Proxy intercepts new registrations and wraps
+  // seek/play/pause immediately, closing the gap that causes translate doubling.
+  if (studioWin.__timelines && !(studioWin.__timelines as Record<string, unknown>).__proxied) {
+    const original = studioWin.__timelines;
+    studioWin.__timelines = new Proxy(original, {
+      set(target, prop, value) {
+        target[prop as string] = value;
+        if (typeof value === "object" && value !== null) {
+          const tl = value as Record<string, unknown>;
+          wrapSeekReapplyFunction(studioWin, tl, "seek");
+          wrapSeekReapplyFunction(studioWin, tl, "totalTime");
+          wrapPlayReapplyFunction(studioWin, tl, "play");
+          wrapApplyAfterFunction(studioWin, tl, "pause");
+          studioWin.__hfStudioManualEditsApply?.();
+        }
+        return true;
+      },
+    });
+    (studioWin.__timelines as Record<string, unknown>).__proxied = true;
   }
 
   if (isStudioManualEditPlaybackActive(studioWin)) {
@@ -279,6 +299,3 @@ export function installStudioManualEditSeekReapply(win: Window, apply: () => voi
     wrappedNamedTimelinePause
   );
 }
-
-// Re-export for internal use (seek hooks need this)
-export { isStudioManualEditGestureActive };

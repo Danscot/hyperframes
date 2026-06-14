@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initSandboxRuntimeModular } from "./init";
 import type { RuntimeTimelineLike } from "./types";
@@ -70,6 +71,22 @@ function createManualRaf() {
   };
 }
 
+function withStudioIframe(run: () => void): void {
+  const originalParent = window.parent;
+  Object.defineProperty(window, "parent", {
+    configurable: true,
+    value: {},
+  });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(window, "parent", {
+      configurable: true,
+      value: originalParent,
+    });
+  }
+}
+
 describe("initSandboxRuntimeModular", () => {
   const originalRequestAnimationFrame = window.requestAnimationFrame;
   const originalCancelAnimationFrame = window.cancelAnimationFrame;
@@ -92,6 +109,7 @@ describe("initSandboxRuntimeModular", () => {
     delete window.__player;
     delete window.__playerReady;
     delete window.__renderReady;
+    delete window.__hfTimelinesBuilding;
     vi.restoreAllMocks();
     window.requestAnimationFrame = originalRequestAnimationFrame;
     window.cancelAnimationFrame = originalCancelAnimationFrame;
@@ -280,6 +298,47 @@ describe("initSandboxRuntimeModular", () => {
     expect(slide3.style.visibility).toBe("visible");
   });
 
+  it("extends the playable duration to the root's declared data-duration when the timeline ends short", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-duration", "250.5");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    // GSAP timeline ends 0.1s short of the declared duration — the declared
+    // data-duration must win, or duration-gated consumers (studio adapter
+    // selection) reject the runtime player and audio is silently lost.
+    window.__timelines = {
+      main: createMockTimeline(250.4),
+    };
+
+    initSandboxRuntimeModular();
+
+    expect(window.__player?.getDuration()).toBe(250.5);
+  });
+
+  it("keeps the timeline duration when it exceeds the root's declared data-duration", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-duration", "10");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    window.__timelines = {
+      main: createMockTimeline(12),
+    };
+
+    initSandboxRuntimeModular();
+
+    expect(window.__player?.getDuration()).toBe(12);
+  });
+
   it("pauses nested media that is outside the timed-media cache after a seek", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -368,6 +427,207 @@ describe("initSandboxRuntimeModular", () => {
 
     expect(sceneA.style.visibility).toBe("hidden");
     expect(sceneB.style.visibility).toBe("visible");
+  });
+
+  it("hides GSAP tween targets inside a hidden timed clip (issue #1387)", () => {
+    withStudioIframe(() => {
+      const root = document.createElement("div");
+      root.setAttribute("data-composition-id", "main");
+      root.setAttribute("data-root", "true");
+      root.setAttribute("data-start", "0");
+      root.setAttribute("data-duration", "8");
+      root.setAttribute("data-width", "1920");
+      root.setAttribute("data-height", "1080");
+      document.body.appendChild(root);
+
+      const captionOne = document.createElement("div");
+      captionOne.id = "t01";
+      captionOne.setAttribute("data-start", "0");
+      captionOne.setAttribute("data-duration", "4");
+      root.appendChild(captionOne);
+
+      const lineOne = document.createElement("div");
+      lineOne.className = "line";
+      // Studio stamps full-duration pseudo-clips on GSAP tween targets.
+      lineOne.setAttribute("data-start", "0");
+      lineOne.setAttribute("data-duration", "8");
+      captionOne.appendChild(lineOne);
+
+      const captionTwo = document.createElement("div");
+      captionTwo.id = "t02";
+      captionTwo.setAttribute("data-start", "4");
+      captionTwo.setAttribute("data-duration", "4");
+      root.appendChild(captionTwo);
+
+      const lineTwo = document.createElement("div");
+      lineTwo.className = "line";
+      lineTwo.setAttribute("data-start", "0");
+      lineTwo.setAttribute("data-duration", "8");
+      captionTwo.appendChild(lineTwo);
+
+      window.__timelines = {
+        main: createMockTimeline(8),
+      };
+
+      initSandboxRuntimeModular();
+
+      const player = window.__player;
+      expect(player).toBeDefined();
+
+      player?.seek(1);
+
+      expect(captionOne.style.visibility).toBe("visible");
+      expect(lineOne.style.visibility).toBe("visible");
+      expect(captionTwo.style.visibility).toBe("hidden");
+      expect(lineTwo.style.visibility).toBe("hidden");
+
+      player?.seek(5);
+
+      expect(captionOne.style.visibility).toBe("hidden");
+      expect(lineOne.style.visibility).toBe("hidden");
+      expect(captionTwo.style.visibility).toBe("visible");
+      expect(lineTwo.style.visibility).toBe("visible");
+    });
+  });
+
+  it("does not suppress descendant visibility in render mode (top-level page)", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-duration", "8");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const panel = document.createElement("div");
+    panel.id = "panel";
+    panel.setAttribute("data-start", "0");
+    panel.setAttribute("data-duration", "2");
+    root.appendChild(panel);
+
+    const headline = document.createElement("h1");
+    headline.className = "headline";
+    // Authored child window outlives the parent clip — render keeps legacy behavior.
+    headline.setAttribute("data-start", "0");
+    headline.setAttribute("data-duration", "8");
+    panel.appendChild(headline);
+
+    window.__timelines = {
+      main: createMockTimeline(8),
+    };
+
+    initSandboxRuntimeModular();
+
+    const player = window.__player;
+    expect(player).toBeDefined();
+
+    player?.seek(3);
+
+    expect(panel.style.visibility).toBe("hidden");
+    expect(headline.style.visibility).toBe("visible");
+  });
+
+  it("does not stamp Studio timing on GSAP targets inside authored timed clips", () => {
+    withStudioIframe(() => {
+      const root = document.createElement("div");
+      root.setAttribute("data-composition-id", "main");
+      root.setAttribute("data-root", "true");
+      root.setAttribute("data-start", "0");
+      root.setAttribute("data-duration", "8");
+      root.setAttribute("data-width", "1920");
+      root.setAttribute("data-height", "1080");
+      document.body.appendChild(root);
+
+      const caption = document.createElement("div");
+      caption.id = "t01";
+      caption.setAttribute("data-start", "0");
+      caption.setAttribute("data-duration", "4");
+      root.appendChild(caption);
+
+      const line = document.createElement("div");
+      line.className = "line";
+      caption.appendChild(line);
+
+      const tweenTarget = {
+        targets: () => [line],
+      };
+      const timeline = createMockTimeline(8) as RuntimeTimelineLike & {
+        getChildren: (nested?: boolean) => Array<{ targets: () => Element[] }>;
+      };
+      timeline.getChildren = () => [tweenTarget];
+
+      window.__timelines = {
+        main: timeline,
+      };
+
+      initSandboxRuntimeModular();
+
+      expect(line.hasAttribute("data-start")).toBe(false);
+      expect(line.hasAttribute("data-duration")).toBe(false);
+    });
+  });
+
+  it("hides tween targets inside inactive multi-panel beats (niemmo panel stack)", () => {
+    withStudioIframe(() => {
+      const root = document.createElement("div");
+      root.setAttribute("data-composition-id", "niemmo-launch-50");
+      root.setAttribute("data-root", "true");
+      root.setAttribute("data-start", "0");
+      root.setAttribute("data-duration", "50");
+      root.setAttribute("data-width", "1280");
+      root.setAttribute("data-height", "720");
+      document.body.appendChild(root);
+
+      const panelA = document.createElement("div");
+      panelA.className = "panel clip";
+      panelA.setAttribute("data-composition-id", "cold-open");
+      panelA.setAttribute("data-start", "0");
+      panelA.setAttribute("data-duration", "2");
+      root.appendChild(panelA);
+
+      const headlineA = document.createElement("h1");
+      headlineA.className = "co-headline";
+      headlineA.setAttribute("data-start", "0");
+      headlineA.setAttribute("data-duration", "50");
+      panelA.appendChild(headlineA);
+
+      const panelB = document.createElement("div");
+      panelB.className = "panel clip";
+      panelB.setAttribute("data-composition-id", "problem-dev-beat");
+      panelB.setAttribute("data-start", "2");
+      panelB.setAttribute("data-duration", "2.5");
+      root.appendChild(panelB);
+
+      const headlineB = document.createElement("h1");
+      headlineB.className = "pb-headline";
+      headlineB.setAttribute("data-start", "0");
+      headlineB.setAttribute("data-duration", "50");
+      panelB.appendChild(headlineB);
+
+      window.__timelines = {
+        "niemmo-launch-50": createMockTimeline(50),
+      };
+
+      initSandboxRuntimeModular();
+
+      const player = window.__player;
+      expect(player).toBeDefined();
+
+      player?.seek(1);
+
+      expect(panelA.style.visibility).toBe("visible");
+      expect(headlineA.style.visibility).toBe("visible");
+      expect(panelB.style.visibility).toBe("hidden");
+      expect(headlineB.style.visibility).toBe("hidden");
+
+      player?.seek(3);
+
+      expect(panelA.style.visibility).toBe("hidden");
+      expect(headlineA.style.visibility).toBe("hidden");
+      expect(panelB.style.visibility).toBe("visible");
+      expect(headlineB.style.visibility).toBe("visible");
+    });
   });
 
   it("clamps nested media to the authored host window on seek", () => {
@@ -477,6 +737,125 @@ describe("initSandboxRuntimeModular", () => {
     expect(hookHost.style.visibility).toBe("visible");
   });
 
+  it("shows pip video at global start time even when host composition starts late", () => {
+    // Regression: resolveStartForElement used to add the host composition's start on top of
+    // the video's own data-start, causing double-offset. A pip video with data-start="45.40"
+    // inside a host at data-start="45.40" would resolve to 90.80 and stay permanently hidden.
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const host = document.createElement("div");
+    host.setAttribute("data-composition-id", "scene-pip");
+    host.setAttribute("data-start", "45.40");
+    host.setAttribute("data-duration", "7.06");
+    root.appendChild(host);
+
+    const innerRoot = document.createElement("div");
+    innerRoot.setAttribute("data-composition-id", "scene-pip");
+    host.appendChild(innerRoot);
+
+    // pip-wired video: data-start is authored in global time (same value as host)
+    const pipVideo = document.createElement("video");
+    pipVideo.setAttribute("data-start", "45.40");
+    pipVideo.setAttribute("data-duration", "7.06");
+    Object.defineProperty(pipVideo, "paused", { value: true, configurable: true });
+    Object.defineProperty(pipVideo, "readyState", { value: 0, configurable: true });
+    Object.defineProperty(pipVideo, "currentTime", {
+      value: 0,
+      writable: true,
+      configurable: true,
+    });
+    pipVideo.load = () => {};
+    innerRoot.appendChild(pipVideo);
+
+    (window as Window & { __timelines?: Record<string, RuntimeTimelineLike> }).__timelines = {
+      main: createMockTimeline(60),
+      "scene-pip": createMockTimeline(7.06),
+    };
+
+    initSandboxRuntimeModular();
+
+    const player = (
+      window as Window & {
+        __player?: { seek: (timeSeconds: number) => void };
+      }
+    ).__player;
+    expect(player).toBeDefined();
+
+    // Before the fix: resolveStartForElement(pipVideo) = 45.40 + 45.40 = 90.80, so the
+    // video would be hidden at t=46 (90.80 > 46). After the fix: start = 45.40, visible.
+    player?.seek(46);
+    expect(pipVideo.style.visibility).toBe("visible");
+
+    player?.seek(53);
+    expect(pipVideo.style.visibility).toBe("hidden");
+
+    player?.seek(44);
+    expect(pipVideo.style.visibility).toBe("hidden");
+  });
+
+  it("shows auto-injected video at host time, not at t=0", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const host = document.createElement("div");
+    host.setAttribute("data-composition-id", "intro");
+    host.setAttribute("data-start", "10");
+    host.setAttribute("data-duration", "5");
+    root.appendChild(host);
+
+    const innerRoot = document.createElement("div");
+    innerRoot.setAttribute("data-composition-id", "intro");
+    host.appendChild(innerRoot);
+
+    const video = document.createElement("video");
+    video.setAttribute("data-start", "0");
+    video.setAttribute("data-hf-auto-start", "");
+    video.setAttribute("data-duration", "5");
+    Object.defineProperty(video, "paused", { value: true, configurable: true });
+    Object.defineProperty(video, "readyState", { value: 0, configurable: true });
+    Object.defineProperty(video, "currentTime", {
+      value: 0,
+      writable: true,
+      configurable: true,
+    });
+    video.load = () => {};
+    innerRoot.appendChild(video);
+
+    (window as Window & { __timelines?: Record<string, RuntimeTimelineLike> }).__timelines = {
+      main: createMockTimeline(30),
+      intro: createMockTimeline(5),
+    };
+
+    initSandboxRuntimeModular();
+
+    const player = (
+      window as Window & {
+        __player?: { seek: (timeSeconds: number) => void };
+      }
+    ).__player;
+    expect(player).toBeDefined();
+
+    player?.seek(12);
+    expect(video.style.visibility).toBe("visible");
+
+    player?.seek(5);
+    expect(video.style.visibility).toBe("hidden");
+
+    player?.seek(16);
+    expect(video.style.visibility).toBe("hidden");
+  });
+
   it("plays scheduled child timelines without a captured root timeline when audio has failed", () => {
     const raf = createManualRaf();
     vi.spyOn(performance, "now").mockImplementation(() => raf.now());
@@ -557,6 +936,37 @@ describe("initSandboxRuntimeModular", () => {
     expect(window.__player).toBeDefined();
   });
 
+  it("waits for GSAP batching to finish before publishing render readiness", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    let timelineDuration = 0;
+    const timeline = createMockTimeline(0);
+    timeline.duration = () => timelineDuration;
+    window.__timelines = {
+      main: timeline,
+    };
+    window.__hfTimelinesBuilding = true;
+
+    initSandboxRuntimeModular();
+
+    expect(window.__playerReady).toBe(true);
+    expect(window.__renderReady).toBe(false);
+    expect(window.__player?.getDuration()).toBe(0);
+
+    timelineDuration = 10;
+    window.__hfTimelinesBuilding = false;
+    window.dispatchEvent(new CustomEvent("hf-timelines-built"));
+
+    expect(window.__renderReady).toBe(true);
+    expect(window.__player?.getDuration()).toBe(10);
+  });
+
   it("sets __renderReady even without a GSAP timeline (CSS/WAAPI compositions)", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -572,5 +982,117 @@ describe("initSandboxRuntimeModular", () => {
 
     expect(window.__playerReady).toBe(true);
     expect(window.__renderReady).toBe(true);
+  });
+
+  it("seeks captured timeline to currentTime on initial bind", () => {
+    const seekTimes: number[] = [];
+    const tl = createMockTimeline(5);
+    const origTotalTime = tl.totalTime;
+    tl.totalTime = ((time: number, ...rest: unknown[]) => {
+      seekTimes.push(time);
+      (origTotalTime as Function).call(tl, time, ...rest);
+    }) as RuntimeTimelineLike["totalTime"];
+
+    document.body.innerHTML = `
+      <div data-composition-id="root" data-duration="5" data-width="1920" data-height="1080"></div>
+    `;
+    window.__timelines = { root: tl };
+    initSandboxRuntimeModular();
+
+    expect(seekTimes.length).toBeGreaterThanOrEqual(2);
+    expect(seekTimes[seekTimes.length - 1]).toBe(0);
+  });
+
+  it("onSetMuted preserves authored muted attribute on video elements", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "root");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const video = document.createElement("video");
+    video.setAttribute("muted", "");
+    video.muted = true; // browsers auto-sync from attribute; jsdom doesn't
+    video.setAttribute("src", "avatar.mp4");
+    root.appendChild(video);
+
+    const audio = document.createElement("audio");
+    audio.setAttribute("data-start", "0");
+    audio.setAttribute("data-duration", "10");
+    audio.setAttribute("src", "voiceover.mp3");
+    root.appendChild(audio);
+
+    window.__timelines = { root: createMockTimeline(10) };
+    initSandboxRuntimeModular();
+
+    expect(video.defaultMuted).toBe(true);
+    expect(video.muted).toBe(true);
+    expect(audio.muted).toBe(false);
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { source: "hf-parent", type: "control", action: "set-muted", muted: false },
+      }),
+    );
+
+    expect(video.muted).toBe(true);
+    expect(audio.muted).toBe(false);
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { source: "hf-parent", type: "control", action: "set-muted", muted: true },
+      }),
+    );
+
+    expect(video.muted).toBe(true);
+    expect(audio.muted).toBe(true);
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { source: "hf-parent", type: "control", action: "set-muted", muted: false },
+      }),
+    );
+
+    expect(video.muted).toBe(true);
+    expect(audio.muted).toBe(false);
+  });
+
+  it("onSetMediaOutputMuted preserves authored muted attribute on video elements", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "root");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const video = document.createElement("video");
+    video.setAttribute("muted", "");
+    video.muted = true;
+    video.setAttribute("src", "avatar.mp4");
+    root.appendChild(video);
+
+    const audio = document.createElement("audio");
+    audio.setAttribute("data-start", "0");
+    audio.setAttribute("data-duration", "10");
+    audio.setAttribute("src", "voiceover.mp3");
+    root.appendChild(audio);
+
+    window.__timelines = { root: createMockTimeline(10) };
+    initSandboxRuntimeModular();
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: {
+          source: "hf-parent",
+          type: "control",
+          action: "set-media-output-muted",
+          muted: false,
+        },
+      }),
+    );
+
+    expect(video.muted).toBe(true);
+    expect(audio.muted).toBe(false);
   });
 });

@@ -1,14 +1,99 @@
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+// fallow-ignore-file code-duplication
+import { createContext, useCallback, useContext, useMemo, useRef, type ReactNode } from "react";
 import type { useDomEditSession } from "../hooks/useDomEditSession";
 
 type DomEditValue = ReturnType<typeof useDomEditSession>;
 
-const DomEditContext = createContext<DomEditValue | null>(null);
+export interface DomEditActionsValue extends Pick<
+  DomEditValue,
+  | "handleTimelineElementSelect"
+  | "handlePreviewCanvasMouseDown"
+  | "handlePreviewCanvasPointerMove"
+  | "handlePreviewCanvasPointerLeave"
+  | "applyDomSelection"
+  | "clearDomSelection"
+  | "handleDomStyleCommit"
+  | "handleDomAttributeCommit"
+  | "handleDomHtmlAttributeCommit"
+  | "handleDomPathOffsetCommit"
+  | "handleDomGroupPathOffsetCommit"
+  | "handleDomZIndexReorderCommit"
+  | "handleDomBoxSizeCommit"
+  | "handleDomRotationCommit"
+  | "handleDomManualEditsReset"
+  | "handleDomTextCommit"
+  | "handleDomTextFieldStyleCommit"
+  | "handleDomAddTextField"
+  | "handleDomRemoveTextField"
+  | "handleAskAgent"
+  | "handleAgentModalSubmit"
+  | "handleBlockedDomMove"
+  | "handleDomManualDragStart"
+  | "handleDomEditElementDelete"
+  | "buildDomSelectionFromTarget"
+  | "buildDomSelectionForTimelineElement"
+  | "updateDomEditHoverSelection"
+  | "resolveImportedFontAsset"
+  | "setAgentModalOpen"
+  | "setAgentPromptSelectionContext"
+  | "setAgentModalAnchorPoint"
+  | "handleGsapUpdateProperty"
+  | "handleGsapUpdateMeta"
+  | "handleGsapDeleteAnimation"
+  | "handleGsapDeleteAllForElement"
+  | "handleGsapAddAnimation"
+  | "handleGsapAddProperty"
+  | "handleGsapRemoveProperty"
+  | "handleGsapUpdateFromProperty"
+  | "handleGsapAddFromProperty"
+  | "handleGsapRemoveFromProperty"
+  | "handleGsapAddKeyframe"
+  | "handleGsapAddKeyframeBatch"
+  | "handleGsapRemoveKeyframe"
+  | "handleGsapConvertToKeyframes"
+  | "handleGsapRemoveAllKeyframes"
+  | "handleResetSelectedElementKeyframes"
+  | "commitAnimatedProperty"
+  | "handleSetArcPath"
+  | "handleUpdateArcSegment"
+  | "invalidateGsapCache"
+  | "previewIframeRef"
+  | "commitMutation"
+> {}
 
-export function useDomEditContext(): DomEditValue {
-  const ctx = useContext(DomEditContext);
-  if (!ctx) throw new Error("useDomEditContext must be used within DomEditProvider");
+export interface DomEditSelectionValue extends Pick<
+  DomEditValue,
+  | "domEditSelection"
+  | "domEditGroupSelections"
+  | "domEditHoverSelection"
+  | "domEditSelectionRef"
+  | "selectedGsapAnimations"
+  | "gsapMultipleTimelines"
+  | "gsapUnsupportedTimelinePattern"
+  | "agentModalOpen"
+  | "agentModalAnchorPoint"
+  | "copiedAgentPrompt"
+  | "agentPromptSelectionContext"
+> {}
+
+const DomEditActionsContext = createContext<DomEditActionsValue | null>(null);
+const DomEditSelectionContext = createContext<DomEditSelectionValue | null>(null);
+
+export function useDomEditActionsContext(): DomEditActionsValue {
+  const ctx = useContext(DomEditActionsContext);
+  if (!ctx) throw new Error("useDomEditActionsContext must be used within DomEditProvider");
   return ctx;
+}
+
+export function useDomEditSelectionContext(): DomEditSelectionValue {
+  const ctx = useContext(DomEditSelectionContext);
+  if (!ctx) throw new Error("useDomEditSelectionContext must be used within DomEditProvider");
+  return ctx;
+}
+
+/** @deprecated Prefer useDomEditActionsContext or useDomEditSelectionContext. */
+export function useDomEditContext(): DomEditValue {
+  return { ...useDomEditActionsContext(), ...useDomEditSelectionContext() };
 }
 
 export function DomEditProvider({
@@ -32,11 +117,11 @@ export function DomEditProvider({
     handleDomHtmlAttributeCommit,
     handleDomPathOffsetCommit,
     handleDomGroupPathOffsetCommit,
+    handleDomZIndexReorderCommit,
     handleDomBoxSizeCommit,
     handleDomRotationCommit,
     handleDomManualEditsReset,
-    handleDomMotionCommit,
-    handleDomMotionClear,
+
     handleDomTextCommit,
     handleDomTextFieldStyleCommit,
     handleDomAddTextField,
@@ -53,22 +138,47 @@ export function DomEditProvider({
     setAgentModalOpen,
     setAgentPromptSelectionContext,
     setAgentModalAnchorPoint,
+    selectedGsapAnimations,
+    gsapMultipleTimelines,
+    gsapUnsupportedTimelinePattern,
+    handleGsapUpdateProperty,
+    handleGsapUpdateMeta,
+    handleGsapDeleteAnimation,
+    handleGsapDeleteAllForElement,
+    handleGsapAddAnimation,
+    handleGsapAddProperty,
+    handleGsapRemoveProperty,
+    handleGsapUpdateFromProperty,
+    handleGsapAddFromProperty,
+    handleGsapRemoveFromProperty,
+    handleGsapAddKeyframe,
+    handleGsapAddKeyframeBatch,
+    handleGsapRemoveKeyframe,
+    handleGsapConvertToKeyframes,
+    handleGsapRemoveAllKeyframes,
+    handleResetSelectedElementKeyframes,
+    commitAnimatedProperty,
+    handleSetArcPath,
+    handleUpdateArcSegment,
+    invalidateGsapCache,
+    previewIframeRef,
+    commitMutation,
   },
   children,
 }: {
   value: DomEditValue;
   children: ReactNode;
 }) {
-  const stable = useMemo<DomEditValue>(
+  const commitMutationRef = useRef(commitMutation);
+  commitMutationRef.current = commitMutation;
+
+  const stableCommitMutation = useCallback<DomEditActionsValue["commitMutation"]>(
+    (mutation, options) => commitMutationRef.current(mutation, options),
+    [],
+  );
+
+  const actions = useMemo<DomEditActionsValue>(
     () => ({
-      domEditSelection,
-      domEditGroupSelections,
-      domEditHoverSelection,
-      agentModalOpen,
-      agentModalAnchorPoint,
-      copiedAgentPrompt,
-      agentPromptSelectionContext,
-      domEditSelectionRef,
       handleTimelineElementSelect,
       handlePreviewCanvasMouseDown,
       handlePreviewCanvasPointerMove,
@@ -80,11 +190,10 @@ export function DomEditProvider({
       handleDomHtmlAttributeCommit,
       handleDomPathOffsetCommit,
       handleDomGroupPathOffsetCommit,
+      handleDomZIndexReorderCommit,
       handleDomBoxSizeCommit,
       handleDomRotationCommit,
       handleDomManualEditsReset,
-      handleDomMotionCommit,
-      handleDomMotionClear,
       handleDomTextCommit,
       handleDomTextFieldStyleCommit,
       handleDomAddTextField,
@@ -101,49 +210,117 @@ export function DomEditProvider({
       setAgentModalOpen,
       setAgentPromptSelectionContext,
       setAgentModalAnchorPoint,
+      handleGsapUpdateProperty,
+      handleGsapUpdateMeta,
+      handleGsapDeleteAnimation,
+      handleGsapDeleteAllForElement,
+      handleGsapAddAnimation,
+      handleGsapAddProperty,
+      handleGsapRemoveProperty,
+      handleGsapUpdateFromProperty,
+      handleGsapAddFromProperty,
+      handleGsapRemoveFromProperty,
+      handleGsapAddKeyframe,
+      handleGsapAddKeyframeBatch,
+      handleGsapRemoveKeyframe,
+      handleGsapConvertToKeyframes,
+      handleGsapRemoveAllKeyframes,
+      handleResetSelectedElementKeyframes,
+      commitAnimatedProperty,
+      handleSetArcPath,
+      handleUpdateArcSegment,
+      invalidateGsapCache,
+      previewIframeRef,
+      commitMutation: stableCommitMutation,
+    }),
+    [
+      handleTimelineElementSelect,
+      handlePreviewCanvasMouseDown,
+      handlePreviewCanvasPointerMove,
+      handlePreviewCanvasPointerLeave,
+      applyDomSelection,
+      clearDomSelection,
+      handleDomStyleCommit,
+      handleDomAttributeCommit,
+      handleDomHtmlAttributeCommit,
+      handleDomPathOffsetCommit,
+      handleDomGroupPathOffsetCommit,
+      handleDomZIndexReorderCommit,
+      handleDomBoxSizeCommit,
+      handleDomRotationCommit,
+      handleDomManualEditsReset,
+      handleDomTextCommit,
+      handleDomTextFieldStyleCommit,
+      handleDomAddTextField,
+      handleDomRemoveTextField,
+      handleAskAgent,
+      handleAgentModalSubmit,
+      handleBlockedDomMove,
+      handleDomManualDragStart,
+      handleDomEditElementDelete,
+      buildDomSelectionFromTarget,
+      buildDomSelectionForTimelineElement,
+      updateDomEditHoverSelection,
+      resolveImportedFontAsset,
+      setAgentModalOpen,
+      setAgentPromptSelectionContext,
+      setAgentModalAnchorPoint,
+      handleGsapUpdateProperty,
+      handleGsapUpdateMeta,
+      handleGsapDeleteAnimation,
+      handleGsapDeleteAllForElement,
+      handleGsapAddAnimation,
+      handleGsapAddProperty,
+      handleGsapRemoveProperty,
+      handleGsapUpdateFromProperty,
+      handleGsapAddFromProperty,
+      handleGsapRemoveFromProperty,
+      handleGsapAddKeyframe,
+      handleGsapAddKeyframeBatch,
+      handleGsapRemoveKeyframe,
+      handleGsapConvertToKeyframes,
+      handleGsapRemoveAllKeyframes,
+      handleResetSelectedElementKeyframes,
+      commitAnimatedProperty,
+      handleSetArcPath,
+      handleUpdateArcSegment,
+      invalidateGsapCache,
+      previewIframeRef,
+      stableCommitMutation,
+    ],
+  );
+
+  const selection = useMemo<DomEditSelectionValue>(
+    () => ({
+      domEditSelection,
+      domEditGroupSelections,
+      domEditHoverSelection,
+      domEditSelectionRef,
+      selectedGsapAnimations,
+      gsapMultipleTimelines,
+      gsapUnsupportedTimelinePattern,
+      agentModalOpen,
+      agentModalAnchorPoint,
+      copiedAgentPrompt,
+      agentPromptSelectionContext,
     }),
     [
       domEditSelection,
       domEditGroupSelections,
       domEditHoverSelection,
+      domEditSelectionRef,
+      selectedGsapAnimations,
+      gsapMultipleTimelines,
+      gsapUnsupportedTimelinePattern,
       agentModalOpen,
       agentModalAnchorPoint,
       copiedAgentPrompt,
       agentPromptSelectionContext,
-      domEditSelectionRef,
-      handleTimelineElementSelect,
-      handlePreviewCanvasMouseDown,
-      handlePreviewCanvasPointerMove,
-      handlePreviewCanvasPointerLeave,
-      applyDomSelection,
-      clearDomSelection,
-      handleDomStyleCommit,
-      handleDomAttributeCommit,
-      handleDomHtmlAttributeCommit,
-      handleDomPathOffsetCommit,
-      handleDomGroupPathOffsetCommit,
-      handleDomBoxSizeCommit,
-      handleDomRotationCommit,
-      handleDomManualEditsReset,
-      handleDomMotionCommit,
-      handleDomMotionClear,
-      handleDomTextCommit,
-      handleDomTextFieldStyleCommit,
-      handleDomAddTextField,
-      handleDomRemoveTextField,
-      handleAskAgent,
-      handleAgentModalSubmit,
-      handleBlockedDomMove,
-      handleDomManualDragStart,
-      handleDomEditElementDelete,
-      buildDomSelectionFromTarget,
-      buildDomSelectionForTimelineElement,
-      updateDomEditHoverSelection,
-      resolveImportedFontAsset,
-      setAgentModalOpen,
-      setAgentPromptSelectionContext,
-      setAgentModalAnchorPoint,
     ],
   );
-  return <DomEditContext value={stable}>{children}</DomEditContext>;
+  return (
+    <DomEditActionsContext value={actions}>
+      <DomEditSelectionContext value={selection}>{children}</DomEditSelectionContext>
+    </DomEditActionsContext>
+  );
 }

@@ -1,9 +1,7 @@
 import type { RightPanelTab } from "./studioHelpers";
 import { buildProjectHash, parseProjectHashRoute } from "./projectRouting";
-import {
-  STUDIO_INSPECTOR_PANELS_ENABLED,
-  STUDIO_MOTION_PANEL_ENABLED,
-} from "../components/editor/manualEditingAvailability";
+import { STUDIO_INSPECTOR_PANELS_ENABLED } from "../components/editor/manualEditingAvailability";
+import { roundTo3 } from "./rounding";
 
 export interface StudioUrlSelectionState {
   sourceFile?: string;
@@ -21,22 +19,19 @@ export interface StudioUrlState {
   selection: StudioUrlSelectionState | null;
 }
 
-const VALID_TABS: RightPanelTab[] = ["layers", "design", "motion", "renders"];
+const VALID_TABS: RightPanelTab[] = ["layers", "design", "renders"];
 
 export function normalizeStudioUrlPanelTab(
   tab: RightPanelTab | null,
   options: {
     inspectorPanelsEnabled?: boolean;
-    motionPanelEnabled?: boolean;
   } = {},
 ): RightPanelTab | null {
   if (!tab) return null;
   if (!VALID_TABS.includes(tab)) return null;
   const inspectorPanelsEnabled = options.inspectorPanelsEnabled ?? STUDIO_INSPECTOR_PANELS_ENABLED;
-  const motionPanelEnabled = options.motionPanelEnabled ?? STUDIO_MOTION_PANEL_ENABLED;
 
   if (!inspectorPanelsEnabled && tab !== "renders") return "renders";
-  if (tab === "motion" && !motionPanelEnabled) return "design";
   return tab;
 }
 
@@ -117,7 +112,7 @@ export function buildStudioHash(projectId: string, state: StudioUrlState): strin
   params.set("v", "1");
   if (state.activeCompPath) params.set("comp", state.activeCompPath);
   if (state.currentTime != null && Number.isFinite(state.currentTime)) {
-    params.set("t", String(Math.max(0, Math.round(state.currentTime * 1000) / 1000)));
+    params.set("t", String(Math.max(0, roundTo3(state.currentTime))));
   }
   if (state.rightPanelTab) params.set("tab", state.rightPanelTab);
   if (state.rightCollapsed != null) params.set("rc", state.rightCollapsed ? "1" : "0");

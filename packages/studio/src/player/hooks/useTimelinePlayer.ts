@@ -4,19 +4,16 @@ import { useMountEffect } from "../../hooks/useMountEffect";
 import { usePlaybackKeyboard } from "./usePlaybackKeyboard";
 import { useTimelineSyncCallbacks } from "./useTimelineSyncCallbacks";
 
-// Re-export public API consumed by tests and external modules.
-// All of these were previously defined in this file; they now live in focused
-// sub-modules but are re-exported here so existing import sites don't change.
 export type { ClipManifestClip } from "../lib/playbackTypes";
 export { createStaticSeekPlaybackAdapter } from "../lib/playbackAdapter";
 export {
-  getTimelineElementSelector,
-  readTimelineDurationFromDocument,
-  parseTimelineFromDOM,
+  buildStandaloneRootTimelineElement,
   createTimelineElementFromManifestClip,
   findTimelineDomNodeForClip,
-  buildStandaloneRootTimelineElement,
+  getTimelineElementSelector,
   mergeTimelineElementsPreservingDowngrades,
+  parseTimelineFromDOM,
+  readTimelineDurationFromDocument,
   resolveStandaloneRootCompositionSrc,
   resolveIframe,
 } from "../lib/timelineDOM";
@@ -25,12 +22,14 @@ export {
   shouldIgnorePlaybackShortcutTarget,
 } from "../lib/playbackShortcuts";
 
-import type { PlaybackAdapter, RuntimePlaybackAdapter, IframeWindow } from "../lib/playbackTypes";
+import type { PlaybackAdapter, IframeWindow } from "../lib/playbackTypes";
 import {
   getAdapterDuration,
   wrapTimeline,
-  createStaticSeekPlaybackAdapter,
   getDefaultStaticSeekPlaybackClock,
+  releaseStaticSeekCache,
+  resolveStaticSeekFallback,
+  type StaticSeekCacheEntry,
 } from "../lib/playbackAdapter";
 import {
   readTimelineDurationFromDocument,
@@ -43,10 +42,7 @@ import {
   shouldMutePreviewAudio,
 } from "../lib/timelineIframeHelpers";
 import { probeMediaUrl, getCachedProbe } from "../lib/mediaProbe";
-
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
+import { shouldResumeForwardPlaybackAfterSeek, shouldStopAfterSeek } from "../lib/playbackSeek";
 
 export function useTimelinePlayer() {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -59,14 +55,9 @@ export function useTimelinePlayer() {
   const shuttleSpeedIndexRef = useRef(0);
   const iframeShortcutCleanupRef = useRef<(() => void) | null>(null);
   const lastTimelineMessageRef = useRef<number>(0);
-  const staticSeekAdapterRef = useRef<{
-    player: RuntimePlaybackAdapter | PlaybackAdapter;
-    duration: number;
-    adapter: PlaybackAdapter;
-  } | null>(null);
+  const staticSeekAdapterRef = useRef<StaticSeekCacheEntry | null>(null);
+  const staticSeekWarnedRef = useRef(false);
 
-  // ZERO store subscriptions — this hook never causes re-renders.
-  // All reads use getState() (point-in-time), all writes use the stable setters.
   const { setIsPlaying, setCurrentTime, setDuration, setTimelineReady, setElements } =
     usePlayerStore.getState();
 
@@ -149,6 +140,7 @@ export function useTimelinePlayer() {
       const adapterDur = getAdapterDuration(playerAdapter);
 
       if (adapterDur > 0 && docDuration <= adapterDur) {
+        releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
         return playerAdapter;
       }
 
@@ -156,24 +148,28 @@ export function useTimelinePlayer() {
       if (win.__timeline) {
         const adapter = wrapTimeline(win.__timeline);
         const dur = getAdapterDuration(adapter);
-        if (dur > 0 && docDuration <= dur) return adapter;
+        if (dur > 0 && docDuration <= dur) {
+          releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
+          return adapter;
+        }
         if (dur > 0) timelineAdapter ??= adapter;
       }
 
       if (win.__timelines) {
         const keys = Object.keys(win.__timelines);
         if (keys.length > 0) {
-          // Resolve the root composition id from the DOM — the outermost
-          // `[data-composition-id]` element is the master. Without this,
-          // Object.keys() order would let a sub-composition's timeline
-          // hijack play/pause/seek and the duration readout.
+          // Resolve the root composition id from the DOM — the outermost [data-composition-id]
+          // is the master; otherwise Object.keys() order lets a sub-composition hijack transport.
           const rootId = iframe?.contentDocument
             ?.querySelector("[data-composition-id]")
             ?.getAttribute("data-composition-id");
           const key = rootId && rootId in win.__timelines ? rootId : keys[keys.length - 1];
           const adapter = wrapTimeline(win.__timelines[key]);
           const dur = getAdapterDuration(adapter);
-          if (dur > 0 && docDuration <= dur) return adapter;
+          if (dur > 0 && docDuration <= dur) {
+            releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
+            return adapter;
+          }
           if (dur > 0) timelineAdapter ??= adapter;
         }
       }
@@ -192,23 +188,15 @@ export function useTimelinePlayer() {
         effectiveDuration > 0 &&
         ("renderSeek" in bestAdapter || typeof bestAdapter.seek === "function")
       ) {
-        const cached = staticSeekAdapterRef.current;
-        if (cached?.player === bestAdapter && cached.duration === effectiveDuration) {
-          return cached.adapter;
-        }
-        cached?.adapter.pause();
-        const adapter = createStaticSeekPlaybackAdapter(
+        return resolveStaticSeekFallback({
+          cache: staticSeekAdapterRef,
+          warned: staticSeekWarnedRef,
           bestAdapter,
           effectiveDuration,
-          getDefaultStaticSeekPlaybackClock(win),
-          () => usePlayerStore.getState().playbackRate,
-        );
-        staticSeekAdapterRef.current = {
-          player: bestAdapter,
-          duration: effectiveDuration,
-          adapter,
-        };
-        return adapter;
+          docDuration,
+          clock: getDefaultStaticSeekPlaybackClock(win),
+          getPlaybackRate: () => usePlayerStore.getState().playbackRate,
+        });
       }
 
       return bestAdapter;
@@ -226,17 +214,19 @@ export function useTimelinePlayer() {
     const tick = () => {
       const adapter = getAdapter();
       if (adapter) {
-        const time = adapter.getTime();
+        const rawTime = adapter.getTime();
         const dur = adapter.getDuration();
+        const time = dur > 0 ? Math.min(rawTime, dur) : rawTime;
         liveTime.notify(time); // direct DOM updates, no React re-render
         const { inPoint, outPoint } = usePlayerStore.getState();
-        const rawLoopEnd = outPoint !== null ? outPoint : dur;
+        const rawLoopEnd = outPoint !== null ? Math.min(outPoint, dur) : dur;
         const rawLoopStart = inPoint !== null ? inPoint : 0;
         const loopEnd = rawLoopStart < rawLoopEnd ? rawLoopEnd : dur;
         const loopStart = rawLoopStart < rawLoopEnd ? rawLoopStart : 0;
         if (time >= loopEnd) {
           if (usePlayerStore.getState().loopEnabled && dur > 0) {
-            adapter.seek(loopStart);
+            // keepPlaying skips the adapter's implicit pause; play() below is then a no-op.
+            adapter.seek(loopStart, { keepPlaying: true });
             liveTime.notify(loopStart);
             adapter.play();
             setIsPlaying(true);
@@ -258,7 +248,6 @@ export function useTimelinePlayer() {
   const stopRAFLoop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
   }, []);
-
   const applyPlaybackRate = useCallback((rate: number) => {
     const iframe = iframeRef.current;
     if (!iframe) return;
@@ -280,7 +269,6 @@ export function useTimelinePlayer() {
       console.warn("[useTimelinePlayer] Could not set playback rate (cross-origin)", err);
     }
   }, []);
-
   const applyPreviewAudioState = useCallback((playbackRateOverride?: number) => {
     const { audioMuted, playbackRate } = usePlayerStore.getState();
     const effectivePlaybackRate = playbackRateOverride ?? playbackRate;
@@ -289,7 +277,6 @@ export function useTimelinePlayer() {
       shouldMutePreviewAudio(audioMuted, effectivePlaybackRate),
     );
   }, []);
-
   const play = useCallback(() => {
     stopRAFLoop();
     stopReverseLoop();
@@ -313,7 +300,6 @@ export function useTimelinePlayer() {
     stopRAFLoop,
     stopReverseLoop,
   ]);
-
   const playBackward = useCallback(
     (rate: number) => {
       stopRAFLoop();
@@ -334,7 +320,7 @@ export function useTimelinePlayer() {
         const elapsed = ((now - startedAt) / 1000) * speed;
         let nextTime = startTime - elapsed;
         const { inPoint, outPoint } = usePlayerStore.getState();
-        const rawLoopEnd = outPoint !== null ? outPoint : duration;
+        const rawLoopEnd = outPoint !== null ? Math.min(outPoint, duration) : duration;
         const rawLoopStart = inPoint !== null ? inPoint : 0;
         const loopEnd = rawLoopStart < rawLoopEnd ? rawLoopEnd : duration;
         const loopStart = rawLoopStart < rawLoopEnd ? rawLoopStart : 0;
@@ -373,7 +359,6 @@ export function useTimelinePlayer() {
       stopReverseLoop,
     ],
   );
-
   const pause = useCallback(() => {
     stopReverseLoop();
     const adapter = getAdapter();
@@ -385,11 +370,8 @@ export function useTimelinePlayer() {
     shuttleSpeedIndexRef.current = 0;
     stopRAFLoop();
   }, [getAdapter, setCurrentTime, setIsPlaying, stopRAFLoop, stopReverseLoop]);
-
   const seek = useCallback(
     (time: number, options?: { keepPlaying?: boolean }) => {
-      // Reverse shuttle is always stopped: the RAF reverse tick can't survive
-      // a seek anyway, so `keepPlaying` only preserves forward playback.
       const wasReverseShuttle = shuttleDirectionRef.current === "backward";
       stopReverseLoop();
       const adapter = getAdapter();
@@ -399,10 +381,27 @@ export function useTimelinePlayer() {
       }
       const duration = Math.max(0, adapter.getDuration());
       const nextTime = Math.max(0, duration > 0 ? Math.min(duration, time) : time);
+      const keepPlaying = options?.keepPlaying === true;
+      const shouldResumeAfterSeek = shouldResumeForwardPlaybackAfterSeek({
+        keepPlaying,
+        wasReverseShuttle,
+        storeWasPlaying: usePlayerStore.getState().isPlaying,
+        duration,
+        nextTime,
+      });
       adapter.seek(nextTime, options);
       liveTime.notify(nextTime); // Direct DOM updates (playhead, timecode, progress) — no re-render
       setCurrentTime(nextTime); // sync store so Split/Delete have accurate time
-      if (!options?.keepPlaying || wasReverseShuttle) {
+      if (shouldResumeAfterSeek) {
+        stopRAFLoop();
+        applyPlaybackRate(usePlayerStore.getState().playbackRate);
+        applyPreviewAudioState();
+        adapter.play();
+        setIsPlaying(true);
+        shuttleDirectionRef.current = "forward";
+        shuttleSpeedIndexRef.current = 0;
+        startRAFLoop();
+      } else if (shouldStopAfterSeek({ keepPlaying, wasReverseShuttle })) {
         stopRAFLoop();
         if (usePlayerStore.getState().isPlaying) setIsPlaying(false);
         shuttleDirectionRef.current = null;
@@ -415,14 +414,16 @@ export function useTimelinePlayer() {
       pendingSeekRef,
       setCurrentTime,
       setIsPlaying,
+      startRAFLoop,
       stopRAFLoop,
       stopReverseLoop,
+      applyPlaybackRate,
+      applyPreviewAudioState,
       shuttleDirectionRef,
       shuttleSpeedIndexRef,
     ],
   );
 
-  // Handle seek requests from outside the player loop (e.g. LayersPanel).
   useEffect(() => {
     return usePlayerStore.subscribe((state, prev) => {
       if (state.requestedSeekTime !== null && state.requestedSeekTime !== prev.requestedSeekTime) {
@@ -431,7 +432,6 @@ export function useTimelinePlayer() {
       }
     });
   }, [seek]);
-
   const { playbackKeyDownRef, playbackKeyUpRef, attachIframeShortcutListeners, togglePlay } =
     usePlaybackKeyboard({
       iframeRef,
@@ -460,7 +460,6 @@ export function useTimelinePlayer() {
       attachIframeShortcutListeners,
       applyPreviewAudioState,
     });
-
   const saveSeekPosition = useCallback(() => {
     const adapter = getAdapter();
     pendingSeekRef.current = adapter
@@ -471,19 +470,15 @@ export function useTimelinePlayer() {
     stopReverseLoop();
     setIsPlaying(false);
   }, [getAdapter, stopRAFLoop, setIsPlaying, stopReverseLoop]);
-
   const refreshPlayer = useCallback(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
-
     saveSeekPosition();
-
     const src = iframe.src;
     const url = new URL(src, window.location.origin);
     url.searchParams.set("_t", String(Date.now()));
     iframe.src = url.toString();
   }, [saveSeekPosition]);
-
   const getAdapterRef = useRef(getAdapter);
   getAdapterRef.current = getAdapter;
 
@@ -491,12 +486,8 @@ export function useTimelinePlayer() {
     const handleWindowKeyDown = (e: KeyboardEvent) => playbackKeyDownRef.current(e);
     const handleWindowKeyUp = (e: KeyboardEvent) => playbackKeyUpRef.current(e);
 
-    // Listen for timeline messages from the iframe runtime.
-    // The runtime sends this AFTER all external compositions load,
-    // so we get the complete clip list (not just the first few).
     const handleMessage = (e: MessageEvent) => {
       const data = e.data;
-      // Only process messages from the main preview iframe — ignore MediaPanel/ClipThumbnail iframes
       const ourIframe = iframeRef.current;
       if (e.source && ourIframe && e.source !== ourIframe.contentWindow) {
         return;
@@ -510,10 +501,6 @@ export function useTimelinePlayer() {
               processTimelineMessageRef.current(manifest);
             }
           }
-          // Enrich only when the timeline has settled — skip during the window
-          // right after a "timeline" message to avoid the enrichment adding
-          // elements that fight with the manifest's authoritative element list,
-          // causing duration oscillation.
           const msSinceTimeline = Date.now() - lastTimelineMessageRef.current;
           if (msSinceTimeline > 500) {
             enrichMissingCompositionsRef.current();
@@ -546,7 +533,6 @@ export function useTimelinePlayer() {
       }
     };
 
-    // Pause video when tab loses focus
     const handleVisibilityChange = () => {
       if (document.hidden && usePlayerStore.getState().isPlaying) {
         const adapter = getAdapterRef.current?.();
@@ -571,11 +557,11 @@ export function useTimelinePlayer() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       stopRAFLoop();
       stopReverseLoop();
+      releaseStaticSeekCache(staticSeekAdapterRef, staticSeekWarnedRef);
       if (probeIntervalRef.current) clearInterval(probeIntervalRef.current);
     };
   });
 
-  /** Reset the player store (elements, duration, etc.) — call when switching sessions. */
   const resetPlayer = useCallback(() => {
     stopRAFLoop();
     stopReverseLoop();

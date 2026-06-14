@@ -10,12 +10,8 @@ import type {
   StageZoomKeyframe,
   CompositionVariable,
 } from "../core.types";
-import {
-  parseGsapScript,
-  validateCompositionGsap,
-  gsapAnimationsToKeyframes,
-  getAnimationsForElement,
-} from "./gsapParser";
+import { validateCompositionGsap } from "./gsapSerialize";
+import { ensureHfIds } from "./hfIds.js";
 import type { ValidationResult } from "../core.types";
 
 const MEDIA_TYPES = new Set<string>(["video", "image", "audio"]);
@@ -143,26 +139,24 @@ function parseResolutionFromHtml(doc: Document): CanvasResolution | null {
   return null;
 }
 
+const UHD_SQUARE_MIN = 2160;
+const UHD_RECT_MIN = 3840;
+
 function resolveResolutionFromDimensions(width: number, height: number): CanvasResolution {
   const longSide = Math.max(width, height);
-  // UHD cutoff is the long side of the 4K presets (3840 for `landscape-4k` /
-  // `portrait-4k`, 2160 for `square-4k`). A looser threshold (e.g. >= 2560)
-  // would silently misclassify QHD/1440p (2560x1440) as 4K, which is the
-  // wrong default for a common authoring resolution closer to 1080p than to
-  // UHD. Authors who genuinely want the 4K preset can still set
-  // `data-resolution="..."` explicitly.
   if (width === height) {
-    return longSide >= 2160 ? "square-4k" : "square";
+    return longSide >= UHD_SQUARE_MIN ? "square-4k" : "square";
   }
   const isLandscape = width > height;
-  const isUhd = longSide >= 3840;
+  const isUhd = longSide >= UHD_RECT_MIN;
   if (isLandscape) return isUhd ? "landscape-4k" : "landscape";
   return isUhd ? "portrait-4k" : "portrait";
 }
 
 export function parseHtml(html: string): ParsedHtml {
+  const withIds = ensureHfIds(html);
   const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
+  const doc = parser.parseFromString(withIds, "text/html");
 
   const elements: TimelineElement[] = [];
   const keyframes: Record<string, Keyframe[]> = {};
@@ -195,7 +189,16 @@ export function parseHtml(html: string): ParsedHtml {
       duration = 5;
     }
 
-    const id = el.id || `element-${++idCounter}`;
+    // R1: stable hf- id minted by ensureHfIds above; clips just read it.
+    // Legacy/migration note: ensureHfIds pins a pre-existing `data-hf-id`, and
+    // the generator emits `data-hf-id="${element.id}"`. So a clip authored
+    // before R1 with `id="my-title"` round-trips as `data-hf-id="my-title"` —
+    // a non-`hf-`-shaped but still stable, exact-match handle. This is safe
+    // indefinitely: targeting uses exact `[data-hf-id="…"]` match (it does not
+    // require the hf- prefix). ensureHfIds skips elements that already carry
+    // data-hf-id, so legacy values are NOT re-minted automatically — they
+    // persist until the user re-saves the composition through Studio. Not a bug.
+    const id = el.getAttribute("data-hf-id") || el.id || `element-${++idCounter}`;
     const name = getElementName(el);
     const zIndex = getZIndex(el);
 
@@ -375,24 +378,6 @@ export function parseHtml(html: string): ParsedHtml {
     }
   }
 
-  // Extract x/y positions and scale from GSAP script
-  if (gsapScript) {
-    const positionMap = extractPositionsFromGsap(gsapScript);
-    for (const element of elements) {
-      const pos = positionMap.get(element.id);
-      if (pos) {
-        if (pos.x !== undefined) element.x = pos.x;
-        if (pos.y !== undefined) element.y = pos.y;
-        if (
-          pos.scale !== undefined &&
-          (element.type === "video" || element.type === "image" || element.type === "composition")
-        ) {
-          (element as TimelineMediaElement | TimelineCompositionElement).scale = pos.scale;
-        }
-      }
-    }
-  }
-
   // Normalize keyframes (clamp negative time, convert absolute -> relative if detected)
   for (const element of elements) {
     const elementKeyframes = keyframes[element.id];
@@ -427,32 +412,6 @@ export function parseHtml(html: string): ParsedHtml {
   const styles = customStyles ?? customStylesFromTags ?? null;
 
   const resolution = parseResolutionFromHtml(doc) ?? parseResolutionFromCss(doc, allStyles);
-
-  // Extract keyframes from GSAP animations for elements that don't have data-keyframes
-  if (gsapScript) {
-    const parsed = parseGsapScript(gsapScript);
-    for (const element of elements) {
-      // Only extract from GSAP if we don't have explicit data-keyframes
-      if (keyframes[element.id]) continue;
-
-      const elementAnimations = getAnimationsForElement(parsed.animations, element.id);
-      if (elementAnimations.length > 0) {
-        const elementKeyframes = gsapAnimationsToKeyframes(elementAnimations, element.startTime, {
-          baseX: element.x ?? 0,
-          baseY: element.y ?? 0,
-          baseScale:
-            element.type === "video" || element.type === "image" || element.type === "composition"
-              ? ((element as TimelineMediaElement | TimelineCompositionElement).scale ?? 1)
-              : 1,
-          clampTimeToZero: true,
-          skipBaseSet: true,
-        });
-        if (elementKeyframes.length > 0) {
-          keyframes[element.id] = elementKeyframes;
-        }
-      }
-    }
-  }
 
   // Parse stage zoom keyframes from zoom container
   const stageZoomKeyframes = parseStageZoomKeyframes(doc);
@@ -499,52 +458,6 @@ function parseStageZoomKeyframes(doc: Document): StageZoomKeyframe[] {
   }
 
   return [];
-}
-
-/**
- * Extract x/y positions and scale from GSAP set() calls at position 0
- * Returns a map of elementId -> { x, y, scale }
- */
-function extractPositionsFromGsap(
-  script: string,
-): Map<string, { x?: number; y?: number; scale?: number }> {
-  const positionMap = new Map<string, { x?: number; y?: number; scale?: number }>();
-
-  try {
-    const parsed = parseGsapScript(script);
-
-    // Look for set() calls at position 0 with x/y/scale properties
-    for (const anim of parsed.animations) {
-      if (anim.method === "set" && anim.position === 0) {
-        // Extract element ID from selector (e.g., "#element-1" -> "element-1")
-        const selectorMatch = anim.targetSelector.match(/^#(.+)$/);
-        if (!selectorMatch) continue;
-
-        const elementId = selectorMatch[1] ?? "";
-        const x = typeof anim.properties.x === "number" ? anim.properties.x : undefined;
-        const y = typeof anim.properties.y === "number" ? anim.properties.y : undefined;
-        const scale = typeof anim.properties.scale === "number" ? anim.properties.scale : undefined;
-
-        // Only add to map if x, y, or scale is defined and non-default
-        if (
-          (x !== undefined && x !== 0) ||
-          (y !== undefined && y !== 0) ||
-          (scale !== undefined && scale !== 1)
-        ) {
-          const existing = positionMap.get(elementId) || {};
-          positionMap.set(elementId, {
-            x: x !== undefined ? x : existing.x,
-            y: y !== undefined ? y : existing.y,
-            scale: scale !== undefined ? scale : existing.scale,
-          });
-        }
-      }
-    }
-  } catch {
-    // skip GSAP position parsing failure
-  }
-
-  return positionMap;
 }
 
 function normalizeKeyframes(
@@ -696,16 +609,20 @@ export function addElementToHtml(
 
   let newEl: Element;
 
+  function applyMediaAttrs(el: Element, mediaEl: TimelineMediaElement): void {
+    if (mediaEl.src) el.setAttribute("src", mediaEl.src);
+    if (mediaEl.volume !== undefined && mediaEl.volume !== 1) {
+      el.setAttribute("data-volume", String(mediaEl.volume));
+    }
+  }
+
   switch (element.type) {
     case "video": {
       const mediaEl = element as TimelineMediaElement;
       newEl = doc.createElement("video");
       newEl.setAttribute("muted", "");
       newEl.setAttribute("playsinline", "");
-      if (mediaEl.src) newEl.setAttribute("src", mediaEl.src);
-      if (mediaEl.volume !== undefined && mediaEl.volume !== 1) {
-        newEl.setAttribute("data-volume", String(mediaEl.volume));
-      }
+      applyMediaAttrs(newEl, mediaEl);
       if (mediaEl.hasAudio) {
         newEl.setAttribute("data-has-audio", "true");
       }
@@ -721,10 +638,7 @@ export function addElementToHtml(
     case "audio": {
       const mediaEl = element as TimelineMediaElement;
       newEl = doc.createElement("audio");
-      if (mediaEl.src) newEl.setAttribute("src", mediaEl.src);
-      if (mediaEl.volume !== undefined && mediaEl.volume !== 1) {
-        newEl.setAttribute("data-volume", String(mediaEl.volume));
-      }
+      applyMediaAttrs(newEl, mediaEl);
       break;
     }
     case "text":

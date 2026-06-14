@@ -6,6 +6,12 @@
  * fallbacks for backward compatibility during migration.
  */
 
+import {
+  getSystemTotalMb,
+  isLowMemorySystem,
+  LOW_MEMORY_TOTAL_MB_THRESHOLD,
+} from "./services/systemMemory.js";
+
 /**
  * Full engine configuration. All fields are wired through the config
  * object; env vars serve as backward-compatible fallbacks resolved
@@ -48,6 +54,16 @@ export interface EngineConfig {
   expectedChromiumMajor?: number;
   /** Force screenshot capture mode (skip BeginFrame even on Linux). */
   forceScreenshot: boolean;
+  /**
+   * Low-memory render profile. When `true`, the orchestrator collapses the
+   * pipeline to its cheapest shape on memory-constrained hosts: it skips the
+   * throwaway auto-worker calibration browser, pins capture to a single
+   * worker (unless the user passed an explicit `--workers`), and prefers
+   * screenshot capture over BeginFrame. Resolved automatically from total
+   * RAM (`isLowMemorySystem()`); force on/off via `PRODUCER_LOW_MEMORY_MODE`
+   * or the `--low-memory-mode` CLI flag.
+   */
+  lowMemoryMode: boolean;
   /**
    * Opt-in: page-side shader-transition compositing.
    *
@@ -129,6 +145,16 @@ export interface EngineConfig {
   // ── Timeouts ─────────────────────────────────────────────────────────
   playerReadyTimeout: number;
   renderReadyTimeout: number;
+  /**
+   * Puppeteer `page.goto()` navigation timeout for the entry HTML, in ms.
+   * The browser must reach `domcontentloaded` within this budget — heavy
+   * compositions (many videos, large fonts, hundreds of asset requests)
+   * can blow past the default 60s on cold cache. Default: 60_000.
+   *
+   * Env fallback: `PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS`.
+   * CLI flag: `--browser-timeout <seconds>`.
+   */
+  pageNavigationTimeout: number;
 
   // ── Runtime ──────────────────────────────────────────────────────────
   /** Verify Hyperframe runtime SHA256 checksums. */
@@ -182,6 +208,9 @@ export const DEFAULT_CONFIG: EngineConfig = {
   browserTimeout: 120_000,
   protocolTimeout: 300_000,
   forceScreenshot: false,
+  // Auto-detected per host in `resolveConfig`; defaults off for the raw
+  // DEFAULT_CONFIG (used directly by tests and worker-sizing fallbacks).
+  lowMemoryMode: false,
   enablePageSideCompositing: true,
 
   enableChunkedEncode: false,
@@ -202,11 +231,26 @@ export const DEFAULT_CONFIG: EngineConfig = {
 
   playerReadyTimeout: 45_000,
   renderReadyTimeout: 15_000,
+  pageNavigationTimeout: 60_000,
 
   verifyRuntime: true,
 
   debug: false,
 };
+
+function memoryAdaptiveCacheLimit(): number {
+  const total = getSystemTotalMb();
+  if (total < 4096) return 32;
+  if (total <= LOW_MEMORY_TOTAL_MB_THRESHOLD) return 64;
+  return DEFAULT_CONFIG.frameDataUriCacheLimit;
+}
+
+function memoryAdaptiveCacheBytesMb(): number {
+  const total = getSystemTotalMb();
+  if (total < 4096) return 128;
+  if (total <= LOW_MEMORY_TOTAL_MB_THRESHOLD) return 256;
+  return DEFAULT_CONFIG.frameDataUriCacheBytesLimitMb;
+}
 
 /**
  * Resolve configuration by merging: defaults ← env vars ← explicit overrides.
@@ -230,6 +274,13 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     const raw = env("PRODUCER_BROWSER_GPU_MODE");
     if (raw === "hardware" || raw === "software" || raw === "auto") return raw;
     return DEFAULT_CONFIG.browserGpuMode;
+  };
+  // Tri-state: explicit on/off via env, otherwise auto-detect from total RAM.
+  const resolveLowMemoryMode = (): boolean => {
+    const raw = env("PRODUCER_LOW_MEMORY_MODE")?.toLowerCase();
+    if (raw === "true" || raw === "on" || raw === "1") return true;
+    if (raw === "false" || raw === "off" || raw === "0") return false;
+    return isLowMemorySystem();
   };
 
   // Env-var layer (backward compat)
@@ -256,6 +307,7 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       : undefined,
 
     forceScreenshot: envBool("PRODUCER_FORCE_SCREENSHOT", DEFAULT_CONFIG.forceScreenshot),
+    lowMemoryMode: resolveLowMemoryMode(),
     enablePageSideCompositing: envBool(
       "HF_PAGE_SIDE_COMPOSITING",
       DEFAULT_CONFIG.enablePageSideCompositing,
@@ -298,14 +350,11 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     audioGain: envNum("PRODUCER_AUDIO_GAIN", DEFAULT_CONFIG.audioGain),
     frameDataUriCacheLimit: Math.max(
       32,
-      envNum("PRODUCER_FRAME_DATA_URI_CACHE_LIMIT", DEFAULT_CONFIG.frameDataUriCacheLimit),
+      envNum("PRODUCER_FRAME_DATA_URI_CACHE_LIMIT", memoryAdaptiveCacheLimit()),
     ),
     frameDataUriCacheBytesLimitMb: Math.max(
       64,
-      envNum(
-        "PRODUCER_FRAME_DATA_URI_CACHE_BYTES_MB",
-        DEFAULT_CONFIG.frameDataUriCacheBytesLimitMb,
-      ),
+      envNum("PRODUCER_FRAME_DATA_URI_CACHE_BYTES_MB", memoryAdaptiveCacheBytesMb()),
     ),
 
     playerReadyTimeout: envNum(
@@ -315,6 +364,10 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     renderReadyTimeout: envNum(
       "PRODUCER_RENDER_READY_TIMEOUT_MS",
       DEFAULT_CONFIG.renderReadyTimeout,
+    ),
+    pageNavigationTimeout: envNum(
+      "PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS",
+      DEFAULT_CONFIG.pageNavigationTimeout,
     ),
 
     verifyRuntime: env("PRODUCER_VERIFY_HYPERFRAME_RUNTIME") !== "false",

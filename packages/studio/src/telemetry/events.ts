@@ -25,3 +25,35 @@ export function trackStudioRenderStart(props: {
     composition: props.composition,
   });
 }
+
+function getBrowserDoctorSummary(): string {
+  try {
+    const nav = navigator as Navigator & {
+      deviceMemory?: number;
+      connection?: { effectiveType?: string };
+      userAgentData?: { platform?: string };
+    };
+    const platform = nav.userAgentData?.platform ?? navigator.platform ?? "unknown";
+    const parts = [
+      `ua=${platform}`,
+      `screen=${screen.width}x${screen.height}@${devicePixelRatio}x`,
+      `lang=${navigator.language}`,
+    ];
+    if (nav.deviceMemory) parts.push(`mem=${nav.deviceMemory}GB`);
+    if (nav.connection?.effectiveType) parts.push(`net=${nav.connection.effectiveType}`);
+    if (navigator.hardwareConcurrency) parts.push(`cpu=${navigator.hardwareConcurrency}cores`);
+    return parts.join(" ");
+  } catch {
+    return "";
+  }
+}
+
+export function trackStudioFeedback(props: { rating: number; comment?: string }): void {
+  trackEvent("survey sent", {
+    $survey_id: "studio_experience",
+    $survey_response: props.rating,
+    ...(props.comment ? { $survey_response_2: props.comment } : {}),
+    doctor_summary: getBrowserDoctorSummary(),
+    source: "studio",
+  });
+}

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { refreshRuntimeMediaCache, syncRuntimeMedia } from "./media";
+import { readElementPlaybackRate, refreshRuntimeMediaCache, syncRuntimeMedia } from "./media";
 import type { RuntimeMediaClip } from "./media";
 
 function createVideo(attrs: Record<string, string>): HTMLVideoElement {
@@ -22,6 +22,37 @@ function createAudio(attrs: Record<string, string>): HTMLAudioElement {
   document.body.appendChild(el);
   return el;
 }
+
+describe("readElementPlaybackRate", () => {
+  it("reads defaultPlaybackRate from element", () => {
+    const el = document.createElement("video");
+    Object.defineProperty(el, "defaultPlaybackRate", { value: 0.5, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(0.5);
+  });
+
+  it("defaults to 1 when not set", () => {
+    const el = document.createElement("video");
+    expect(readElementPlaybackRate(el)).toBe(1);
+  });
+
+  it("clamps to [0.1, 5]", () => {
+    const el = document.createElement("video");
+    Object.defineProperty(el, "defaultPlaybackRate", { value: 0.01, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(0.1);
+    Object.defineProperty(el, "defaultPlaybackRate", { value: 10, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(5);
+  });
+
+  it("defaults to 1 for NaN/negative/zero", () => {
+    const el = document.createElement("video");
+    Object.defineProperty(el, "defaultPlaybackRate", { value: NaN, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(1);
+    Object.defineProperty(el, "defaultPlaybackRate", { value: -1, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(1);
+    Object.defineProperty(el, "defaultPlaybackRate", { value: 0, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(1);
+  });
+});
 
 describe("refreshRuntimeMediaCache", () => {
   afterEach(() => {
@@ -131,6 +162,26 @@ describe("refreshRuntimeMediaCache", () => {
     expect(result.mediaClips[0].duration).toBe(20);
   });
 
+  it("resolveDurationSeconds must account for playbackRate (regression: clip clipped early)", () => {
+    const el = createVideo({ "data-start": "0", "data-duration": "10" });
+    Object.defineProperty(el, "defaultPlaybackRate", { value: 0.5, writable: true });
+    Object.defineProperty(el, "duration", { value: 5, writable: true });
+    const result = refreshRuntimeMediaCache({
+      resolveDurationSeconds: (element) => {
+        const mediaStart =
+          Number.parseFloat(element.dataset.playbackStart ?? element.dataset.mediaStart ?? "0") ||
+          0;
+        const playbackRate = readElementPlaybackRate(element);
+        return Number.isFinite(element.duration) && element.duration > mediaStart
+          ? Math.max(0, (element.duration - mediaStart) / playbackRate)
+          : null;
+      },
+    });
+    // 5s source at 0.5x = 10s effective; should NOT be capped to 5s
+    expect(result.mediaClips[0].duration).toBe(10);
+    expect(result.mediaClips[0].end).toBe(10);
+  });
+
   it("reads native loop attribute", () => {
     createVideo({ "data-start": "0", "data-duration": "15", loop: "" });
     const result = refreshRuntimeMediaCache();
@@ -167,6 +218,13 @@ describe("syncRuntimeMedia", () => {
     // Default: audio has been playing — so drift-seek forward is allowed.
     // Tests that exercise the "cold first play" guard call fakePlayedRanges(el, []).
     fakePlayedRanges(el, [[0, 1]]);
+    // Mirror bindMediaMetadataListeners: pre-set el.volume to data-volume so the
+    // first-tick path in syncRuntimeMedia sees the correct baseline (not the browser
+    // default of 1) and GSAP-change detection works correctly from the first tick.
+    const dataVolume = overrides?.volume;
+    if (dataVolume != null && Number.isFinite(dataVolume)) {
+      el.volume = Math.max(0, Math.min(1, dataVolume));
+    }
     return {
       el,
       start: 0,
@@ -311,6 +369,39 @@ describe("syncRuntimeMedia", () => {
     Object.defineProperty(clip.el, "paused", { value: false, writable: true });
     syncRuntimeMedia({ clips: [clip], timeSeconds: 2, playing: true, playbackRate: 1 });
     expect(clip.el.pause).toHaveBeenCalled();
+  });
+
+  it("does not restart a non-loop clip that has naturally ended before the clip's end time", () => {
+    // Reproduces: bg-music WAV is 60s but data-duration="68.6" (composition duration).
+    // At t=62 the file has ended; without this guard the runtime calls el.play() every
+    // rAF tick, resetting currentTime to 0 and causing audible stutter for 8.6s.
+    const clip = createMockClip({ start: 0, end: 68.6, loop: false });
+    Object.defineProperty(clip.el, "paused", { value: true, writable: true });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 62, playing: true, playbackRate: 1 });
+    expect(clip.el.play).not.toHaveBeenCalled();
+  });
+
+  it("does restart a loop clip that has naturally ended while still within its active window", () => {
+    const clip = createMockClip({ start: 0, end: 68.6, loop: true, sourceDuration: 60 });
+    Object.defineProperty(clip.el, "paused", { value: true, writable: true });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 62, playing: true, playbackRate: 1 });
+    expect(clip.el.play).toHaveBeenCalled();
+  });
+
+  it("resumes a previously-ended non-loop clip after a backward seek resets el.ended", () => {
+    // el.ended resets to false when the browser processes a seek (per WHATWG spec).
+    // This test pins the contract: silent at t=62 (ended), playable again at t=30 (seeked back).
+    const clip = createMockClip({ start: 0, end: 68.6, loop: false });
+    Object.defineProperty(clip.el, "paused", { value: true, writable: true });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 62, playing: true, playbackRate: 1 });
+    expect(clip.el.play).not.toHaveBeenCalled();
+    // Simulate backward seek: browser resets ended to false before committing new currentTime
+    Object.defineProperty(clip.el, "ended", { value: false, writable: true, configurable: true });
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 30, playing: true, playbackRate: 1 });
+    expect(clip.el.play).toHaveBeenCalledTimes(1);
   });
 
   it("sets volume when clip has volume", () => {

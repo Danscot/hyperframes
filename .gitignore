@@ -32,9 +32,12 @@ videos/
 coverage/
 .debug/
 
-# Producer regression test failures (generated debugging artifacts)
-packages/producer/tests/*/failures/
-packages/producer/tests/distributed/*/failures/
+# Producer regression test failures (generated debugging artifacts).
+# RECURSIVE (`**`) so a failures/ dump at ANY fixture depth is ignored — the
+# old non-recursive `tests/*/failures/` + `tests/distributed/*/failures/` rules
+# only matched one level deep, so a nested fixture like
+# `tests/hdr-regression/hdr-pq/failures/` could still get committed.
+packages/producer/tests/**/failures/
 packages/producer/tests/parity/fixtures/hyperframe.runtime.iife.js
 
 # Player perf test results (generated each run, attached as CI artifact)
@@ -66,15 +69,23 @@ tmp/
 packages/core/src/generated/
 packages/producer/src/services/fontData.generated.ts
 
+# Plan documents (working artifacts, not committed)
+docs/plans/
+
 # Local proof / test artifacts
 qa-artifacts/
 my-video/
+.hyperframes/backup/
 examples/*
 # Tracked OSS examples — negations override the blanket `examples/*` ignore.
 !examples/aws-lambda
 !examples/aws-lambda/**
 !examples/k8s-jobs
 !examples/k8s-jobs/**
+!examples/gcp-cloud-run
+!examples/gcp-cloud-run/**
+# …but never the local smoke run's build/render artifacts.
+examples/gcp-cloud-run/scripts/gcp-smoke-artifacts/
 packages/studio/data/
 
 .desloppify/

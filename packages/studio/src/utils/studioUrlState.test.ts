@@ -53,7 +53,7 @@ function renderStudioUrlStateHarness(
     timelineVisible: true,
     activeCompPathHydrated: true,
     domEditSelection: null,
-    buildDomSelectionFromTarget: () => null,
+    buildDomSelectionFromTarget: () => Promise.resolve(null),
     applyDomSelection: () => {},
     initialState: {
       activeCompPath: null,
@@ -159,10 +159,9 @@ describe("studio url state", () => {
   it("normalizes url tabs against feature flags", () => {
     expect(normalizeStudioUrlPanelTab("renders")).toBe("renders");
     expect(normalizeStudioUrlPanelTab("layers", { inspectorPanelsEnabled: false })).toBe("renders");
-    expect(normalizeStudioUrlPanelTab("motion", { motionPanelEnabled: false })).toBe("design");
   });
 
-  it("hydrates seek first, preserves the initial url state, then restores selection", () => {
+  it("hydrates seek first, preserves the initial url state, then restores selection", async () => {
     vi.useFakeTimers();
     window.history.replaceState(null, "", "#project/demo?t=4.2&tab=design&selId=hero");
     const requestSeek = vi.fn();
@@ -209,7 +208,7 @@ describe("studio url state", () => {
       rightPanelTab: "design",
       rightCollapsed: false,
       applyDomSelection,
-      buildDomSelectionFromTarget: () => restoredSelection,
+      buildDomSelectionFromTarget: () => Promise.resolve(restoredSelection),
       initialState: {
         activeCompPath: null,
         currentTime: 4.2,
@@ -231,9 +230,20 @@ describe("studio url state", () => {
     expect(window.location.hash).toContain("t=4.2");
     expect(applyDomSelection).not.toHaveBeenCalled();
 
-    harness.rerender({ currentTime: 4.2 });
+    // Drive the hook's internal currentTime read. Per #1311 the hook stopped
+    // taking currentTime as a prop and now subscribes to the player store
+    // directly (usePlayerStore((s) => s.currentTime)). The harness prop is a
+    // no-op; the selection-hydration useEffect's time-stability guard
+    // (`Math.abs(currentTime - stableTimeRef.current) > 0.05`) only passes
+    // once the store's currentTime catches up to the seek target.
     act(() => {
+      usePlayerStore.setState({ currentTime: 4.2 });
+    });
+    harness.rerender({ currentTime: 4.2 });
+    await act(async () => {
       vi.advanceTimersByTime(250);
+      // Flush microtasks so the async buildDomSelectionFromTarget Promise resolves
+      await Promise.resolve();
     });
     expect(applyDomSelection).toHaveBeenCalledWith(restoredSelection, { revealPanel: false });
 

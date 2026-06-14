@@ -1,8 +1,34 @@
+// fallow-ignore-file code-duplication
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const producerState = vi.hoisted(() => ({
   createdJobs: [] as Array<Record<string, unknown>>,
   resolveConfigCalls: [] as Array<Record<string, unknown>>,
+}));
+
+const preflightState = vi.hoisted(() => ({
+  result: {
+    outcomes: [
+      { name: "FFmpeg", ok: true, level: "ok", detail: "/usr/bin/ffmpeg", path: "/usr/bin/ffmpeg" },
+      {
+        name: "FFprobe",
+        ok: true,
+        level: "ok",
+        detail: "/usr/bin/ffprobe",
+        path: "/usr/bin/ffprobe",
+      },
+      {
+        name: "Chrome",
+        ok: true,
+        level: "ok",
+        detail: "cache: /mock/chrome",
+        path: "/mock/chrome",
+      },
+    ],
+    ffmpegPath: "/usr/bin/ffmpeg",
+    ffprobePath: "/usr/bin/ffprobe",
+    browser: { executablePath: "/mock/chrome", source: "cache" },
+  },
 }));
 
 vi.mock("../utils/producer.js", () => ({
@@ -24,6 +50,15 @@ vi.mock("../telemetry/events.js", () => ({
   trackRenderError: vi.fn(),
 }));
 
+vi.mock("../browser/ffmpeg.js", () => ({
+  findFFmpeg: vi.fn(() => "/usr/bin/ffmpeg"),
+  getFFmpegInstallHint: vi.fn(() => "brew install ffmpeg"),
+}));
+
+vi.mock("../browser/preflight.js", () => ({
+  runEnvironmentChecks: vi.fn(async () => preflightState.result),
+}));
+
 describe("renderLocal browser GPU config", () => {
   const savedEnv = new Map<string, string | undefined>();
   // Pre-resolve once. The first dynamic `import("./render.js")` in this file
@@ -41,7 +76,7 @@ describe("renderLocal browser GPU config", () => {
   });
 
   function setEnv(key: string, value: string) {
-    savedEnv.set(key, process.env[key]);
+    if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
     process.env[key] = value;
   }
 
@@ -49,6 +84,12 @@ describe("renderLocal browser GPU config", () => {
     producerState.createdJobs = [];
     producerState.resolveConfigCalls = [];
     savedEnv.clear();
+    savedEnv.set("HYPERFRAMES_FFMPEG_PATH", process.env.HYPERFRAMES_FFMPEG_PATH);
+    savedEnv.set("HYPERFRAMES_FFPROBE_PATH", process.env.HYPERFRAMES_FFPROBE_PATH);
+    savedEnv.set("PRODUCER_HEADLESS_SHELL_PATH", process.env.PRODUCER_HEADLESS_SHELL_PATH);
+    delete process.env.HYPERFRAMES_FFMPEG_PATH;
+    delete process.env.HYPERFRAMES_FFPROBE_PATH;
+    delete process.env.PRODUCER_HEADLESS_SHELL_PATH;
   });
 
   afterEach(() => {
@@ -120,6 +161,22 @@ describe("renderLocal browser GPU config", () => {
     });
   });
 
+  it("passes preflight-resolved FFmpeg, FFprobe, and browser paths through env", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    expect(process.env.HYPERFRAMES_FFMPEG_PATH).toBe("/usr/bin/ffmpeg");
+    expect(process.env.HYPERFRAMES_FFPROBE_PATH).toBe("/usr/bin/ffprobe");
+    expect(process.env.PRODUCER_HEADLESS_SHELL_PATH).toBe("/mock/chrome");
+  });
+
   it("resolves browser GPU from CLI flags, Docker mode, and env fallback", () => {
     // Default (no flag, no env): auto — engine probes and chooses.
     expect(resolveBrowserGpuForCli(false, undefined, undefined)).toBe("auto");
@@ -164,6 +221,22 @@ describe("renderLocal browser GPU config", () => {
     expect(producerState.createdJobs[0]?.format).toBe("png-sequence");
   });
 
+  it("forwards format: gif and gifLoop through to createRenderJob", async () => {
+    await renderLocal("/tmp/project", "/tmp/demo.gif", {
+      fps: { num: 15, den: 1 },
+      quality: "standard",
+      format: "gif",
+      gifLoop: 3,
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    expect(producerState.createdJobs[0]?.format).toBe("gif");
+    expect(producerState.createdJobs[0]?.gifLoop).toBe(3);
+  });
+
   it("omits variables from createRenderJob when not provided", async () => {
     await renderLocal("/tmp/project", "/tmp/out.mp4", {
       fps: { num: 30, den: 1 },
@@ -205,6 +278,41 @@ describe("renderLocal browser GPU config", () => {
     });
 
     expect(producerState.createdJobs[0]?.entryFile).toBeUndefined();
+  });
+
+  it("forwards --browser-timeout into resolveConfig as pageNavigationTimeout (ms)", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+      pageNavigationTimeoutMs: 180_000,
+    });
+
+    expect(producerState.resolveConfigCalls[0]).toMatchObject({
+      pageNavigationTimeout: 180_000,
+    });
+  });
+
+  it("omits pageNavigationTimeout from resolveConfig when --browser-timeout is not set", async () => {
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    // Issue #1199: when the flag is omitted, the engine's DEFAULT_CONFIG must
+    // own the navigation timeout. Forwarding `undefined` would override
+    // `pageNavigationTimeout: 60_000` to `undefined` and re-introduce the
+    // bug in a different shape.
+    expect(producerState.resolveConfigCalls[0]).not.toHaveProperty("pageNavigationTimeout");
   });
 
   it("forwards outputResolution to createRenderJob when --resolution is set", async () => {

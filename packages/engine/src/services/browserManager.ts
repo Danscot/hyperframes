@@ -6,10 +6,12 @@
  */
 
 import type { Browser, PuppeteerNode } from "puppeteer-core";
+import { execSync } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
+import { getSystemTotalMb, LOW_MEMORY_TOTAL_MB_THRESHOLD } from "./systemMemory.js";
 
 let _puppeteer: PuppeteerNode | undefined;
 
@@ -47,7 +49,14 @@ export function resolveHeadlessShellPath(
     return config.chromePath;
   }
   if (process.env.PRODUCER_HEADLESS_SHELL_PATH) {
-    return process.env.PRODUCER_HEADLESS_SHELL_PATH;
+    const envPath = process.env.PRODUCER_HEADLESS_SHELL_PATH;
+    if (!existsSync(envPath)) {
+      throw new Error(
+        `[BrowserManager] Chrome binary not found at PRODUCER_HEADLESS_SHELL_PATH="${envPath}". ` +
+          "Run `hyperframes browser ensure` to re-download.",
+      );
+    }
+    return envPath;
   }
   const baseDir = join(homedir(), ".cache", "puppeteer", "chrome-headless-shell");
   if (!existsSync(baseDir)) return undefined;
@@ -330,6 +339,7 @@ export async function acquireBrowser(
   return launchPromise;
 }
 
+// fallow-ignore-next-line complexity
 async function launchBrowser(
   chromeArgs: string[],
   config?: Partial<
@@ -366,6 +376,11 @@ async function launchBrowser(
     timeout: browserTimeout,
     protocolTimeout,
   });
+
+  const browserVersion = await browser.version().catch(() => "unknown");
+  console.log(
+    `[BrowserManager] Browser launched (${browserVersion}, ${captureMode}, headlessShell=${!!headlessShell}, platform=${process.platform})`,
+  );
 
   if (captureMode === "beginframe") {
     const supported = await probeBeginFrameSupport(browser).catch(() => true);
@@ -476,6 +491,45 @@ export function _setPuppeteerForTests(mock: PuppeteerNode | undefined): void {
   _puppeteer = mock;
 }
 
+let _cachedVramMb: number | null = null;
+
+function probeNvidiaVramMb(): number | null {
+  if (_cachedVramMb !== null) return _cachedVramMb;
+  try {
+    // Synchronous, runs once per process (cached). ~50ms on typical systems.
+    const out = execSync("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits", {
+      timeout: 3000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    const mb = parseInt(out.split("\n")[0] ?? "", 10);
+    if (Number.isFinite(mb) && mb > 0) {
+      _cachedVramMb = mb;
+      return mb;
+    }
+  } catch {
+    // nvidia-smi not available or no NVIDIA GPU
+  }
+  return null;
+}
+
+function getGpuMemBudgetMb(): number {
+  const vram = probeNvidiaVramMb();
+  if (vram) return Math.min(vram, 16384);
+
+  const total = getSystemTotalMb();
+  if (total < 4096) return 512;
+  if (total <= LOW_MEMORY_TOTAL_MB_THRESHOLD) return 1024;
+  return Math.min(Math.floor(total / 2), 16384);
+}
+
+function getLowMemoryFlags(): string[] {
+  const total = getSystemTotalMb();
+  if (total > LOW_MEMORY_TOTAL_MB_THRESHOLD) return [];
+  const heapMb = total < 4096 ? 256 : 512;
+  return [`--js-flags=--max-old-space-size=${heapMb}`];
+}
+
 export interface BuildChromeArgsOptions {
   width: number;
   height: number;
@@ -530,11 +584,18 @@ export function buildChromeArgs(
     "--disable-print-preview",
     "--no-pings",
     "--no-zygote",
-    // Memory
-    "--force-gpu-mem-available-mb=4096",
+    // Memory — scale GPU budget to available system RAM
+    `--force-gpu-mem-available-mb=${getGpuMemBudgetMb()}`,
     "--disk-cache-size=268435456",
+    ...getLowMemoryFlags(),
     // Disable features that add overhead
     "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Translate,BackForwardCache,IntensiveWakeUpThrottling",
+    // Allow AudioContext to start without a user gesture in headless Chrome.
+    // Without this flag, any code path that constructs an AudioContext
+    // (including GSAP tweening an <audio> element's volume) triggers the
+    // autoplay policy and causes the AudioContext to stay suspended. The
+    // frame-capture loop then blocks waiting for it, deadlocking the render.
+    "--autoplay-policy=no-user-gesture-required",
   ];
 
   if (browserGpuMode !== "software") {

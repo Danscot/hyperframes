@@ -99,6 +99,7 @@ interface HyperframesConfigResponse {
   isHyperframes: boolean;
   projectName: string;
   projectDir: string;
+  serverBuildSignature?: string | null;
   version: string;
 }
 
@@ -114,6 +115,7 @@ export type DetectionResult =
 export function detectHyperframesServer(
   port: number,
   normalizedProjectDir: string,
+  expectedServerBuildSignature: string | null = null,
 ): Promise<DetectionResult> {
   return new Promise<DetectionResult>((resolveResult) => {
     const req = http.get(
@@ -152,6 +154,12 @@ export function detectHyperframesServer(
             const normalize = (p: string) => resolve(p).replace(/\\/g, "/").toLowerCase();
 
             if (normalize(json.projectDir) === normalizedProjectDir) {
+              if (
+                expectedServerBuildSignature !== null &&
+                json.serverBuildSignature !== expectedServerBuildSignature
+              ) {
+                return resolveResult({ type: "mismatch", projectName: json.projectName });
+              }
               return resolveResult({ type: "match" });
             }
 
@@ -180,7 +188,7 @@ export function detectHyperframesServer(
  * Get the PID of the process listening on a port (macOS/Linux only).
  * Returns null on Windows or if detection fails.
  */
-export async function getProcessOnPort(port: number): Promise<string | null> {
+async function getProcessOnPort(port: number): Promise<string | null> {
   if (process.platform === "win32") return null;
   try {
     const { stdout } = await execFileAsync("lsof", [`-ti:${port}`, "-sTCP:LISTEN"], {
@@ -327,8 +335,17 @@ export async function findPortAndServe(
   startPort: number,
   projectDir: string,
   forceNew: boolean,
+  expectedServerBuildSignature: string | null = null,
+  bindHost?: string,
 ): Promise<FindPortResult> {
   const { createAdaptorServer } = await import("@hono/node-server");
+  // SECURITY (F-001): bind to loopback by default. The studio API exposes
+  // unauthenticated project file read/write/delete + render-spawn endpoints;
+  // a bare `listen(port)` binds the unspecified address (`::`/`0.0.0.0`),
+  // handing those endpoints to anyone on the LAN. Operators who genuinely
+  // need LAN exposure opt in explicitly via the HYPERFRAMES_PREVIEW_HOST
+  // env var (e.g. HYPERFRAMES_PREVIEW_HOST=0.0.0.0).
+  const host = bindHost ?? (process.env.HYPERFRAMES_PREVIEW_HOST?.trim() || "127.0.0.1");
   const normalizedDir = resolve(projectDir).replace(/\\/g, "/").toLowerCase();
   const endPort = startPort + MAX_PORT_SCAN - 1;
 
@@ -353,7 +370,7 @@ export async function findPortAndServe(
           };
           server!.once("error", onError);
           server!.once("listening", onListening);
-          server!.listen(port);
+          server!.listen(port, host);
         });
         return { type: "started", server, port };
       } catch (err: unknown) {
@@ -366,7 +383,11 @@ export async function findPortAndServe(
 
     // Port is occupied — probe for existing HyperFrames instance
     if (!forceNew) {
-      const detection = await detectHyperframesServer(port, normalizedDir);
+      const detection = await detectHyperframesServer(
+        port,
+        normalizedDir,
+        expectedServerBuildSignature,
+      );
       if (detection.type === "match") {
         return { type: "already-running", port };
       }

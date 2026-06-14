@@ -4,7 +4,7 @@ import { LeftSidebar, type LeftSidebarHandle } from "./sidebar/LeftSidebar";
 import { MediaPreview } from "./MediaPreview";
 import { isMediaFile } from "../utils/mediaTypes";
 import { usePanelLayoutContext } from "../contexts/PanelLayoutContext";
-import { useStudioContext } from "../contexts/StudioContext";
+import { useStudioShellContext } from "../contexts/StudioContext";
 import { useFileManagerContext } from "../contexts/FileManagerContext";
 import { getPersistedRenderSettings } from "./renders/renderSettings";
 import type { BlockPreviewInfo } from "./sidebar/BlocksTab";
@@ -16,6 +16,8 @@ export interface StudioLeftSidebarProps {
   onPreviewBlock?: (preview: BlockPreviewInfo | null) => void;
   onLint: () => void;
   linting: boolean;
+  lintFindingCount?: number;
+  lintFindingsByFile?: Map<string, { count: number; messages: string[] }>;
 }
 
 // fallow-ignore-next-line complexity
@@ -26,6 +28,8 @@ export function StudioLeftSidebar({
   onPreviewBlock,
   onLint,
   linting,
+  lintFindingCount,
+  lintFindingsByFile,
 }: StudioLeftSidebarProps) {
   const {
     leftCollapsed,
@@ -35,7 +39,7 @@ export function StudioLeftSidebar({
     handlePanelResizeMove,
     handlePanelResizeEnd,
   } = usePanelLayoutContext();
-  const { projectId, renderQueue, waitForPendingDomEditSaves } = useStudioContext();
+  const { projectId, renderQueue, waitForPendingDomEditSaves } = useStudioShellContext();
   const {
     compositions,
     assets,
@@ -129,6 +133,8 @@ export function StudioLeftSidebar({
         isRendering={renderQueue.isRendering}
         onLint={onLint}
         linting={linting}
+        lintFindingCount={lintFindingCount}
+        lintFindingsByFile={lintFindingsByFile}
         onToggleCollapse={toggleLeftSidebar}
         onAddBlock={onAddBlock}
         onPreviewBlock={onPreviewBlock}

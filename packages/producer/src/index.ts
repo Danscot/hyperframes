@@ -18,6 +18,14 @@ export {
   type RenderPerfSummary,
   type ProgressCallback,
 } from "./services/renderOrchestrator.js";
+export {
+  type BrowserDiagnosticSummary,
+  type RenderCaptureObservability,
+  type RenderObservabilitySummary,
+  type RenderObservationData,
+  type RenderObservationEvent,
+  type RenderObservationStatus,
+} from "./services/render/observability.js";
 
 // ── Frame capture (lower-level) ─────────────────────────────────────────────
 export {
@@ -44,7 +52,7 @@ export {
 } from "./services/fileServer.js";
 
 // ── Video frame injection (Hyperframes-specific hook) ───────────────────────
-export { createVideoFrameInjector } from "./services/videoFrameInjector.js";
+export { createVideoFrameInjector } from "@hyperframes/engine";
 
 // ── Configuration ───────────────────────────────────────────────────────────
 export { resolveConfig, DEFAULT_CONFIG, type ProducerConfig } from "./config.js";
@@ -68,6 +76,7 @@ export {
 } from "./server.js";
 
 // ── Utilities ───────────────────────────────────────────────────────────────
+export { normalizeErrorMessage } from "./utils/errorMessage.js";
 export { quantizeTimeToFrame } from "./utils/parityContract.js";
 export { resolveRenderPaths, type RenderPaths } from "./utils/paths.js";
 

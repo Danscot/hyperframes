@@ -10,6 +10,9 @@ import {
   detectShaderTransitionUsage,
   discoverAudioVolumeAutomationFromTimeline,
   inlineExternalScripts,
+  localizeRemoteMediaSources,
+  localizeRemoteImageSources,
+  localizeRemoteFontFaces,
   recompileWithResolutions,
 } from "./htmlCompiler.js";
 
@@ -488,6 +491,35 @@ describe("detectRenderModeHints", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("compileForRender reports empty sub-composition HTML with an actionable error", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-empty-subcomp-"));
+    const compositionsDir = join(projectDir, "compositions");
+    mkdirSync(compositionsDir, { recursive: true });
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html>
+  <head></head>
+  <body>
+    <div data-composition-id="main" data-width="100" data-height="100" data-start="0" data-duration="1">
+      <div data-composition-id="intro" data-composition-src="compositions/intro.html" data-start="0" data-duration="1"></div>
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      window.__timelines.main = { duration: function() { return 1; } };
+    </script>
+  </body>
+</html>`,
+    );
+    writeFileSync(join(compositionsDir, "intro.html"), "");
+
+    await expect(
+      compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+    ).rejects.toThrow(
+      "Composition HTML is empty or could not be parsed: compositions/intro.html. Check that the file referenced by data-composition-src contains valid HTML.",
+    );
+  });
 });
 
 describe("detectShaderTransitionUsage", () => {
@@ -794,6 +826,531 @@ describe("text-rendering rule injection", () => {
     const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
 
     expect(compiled.html.replace(/\s+/g, "")).toContain("text-rendering:geometricPrecision");
+    expect(compiled.html.replace(/\s+/g, "")).toContain('font-family:"Inter",sans-serif');
+  });
+});
+
+// ── crossorigin stripping ───────────────────────────────────────────────────
+//
+// External images/videos with crossorigin="anonymous" force CORS-mode requests
+// against the renderer's localhost file server. S3 and similar origins reject
+// those requests, so the element renders blank. The strip removes the attribute
+// so the browser falls back to no-cors (visual-only) mode.
+
+describe("crossorigin attribute stripping", () => {
+  it("strips crossorigin from <img> elements", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-crossorigin-img-"));
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="640" data-height="360" data-duration="1">
+    <img id="hero" src="https://example.com/photo.jpg" crossorigin="anonymous" alt="" />
+    <img id="plain" src="local.jpg" alt="" />
+  </div>
+</body></html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+
+    expect(compiled.html).not.toContain('crossorigin="anonymous"');
+    expect(compiled.html).toContain('id="hero"');
+    expect(compiled.html).toContain('id="plain"');
+  });
+
+  it("strips crossorigin from <video> elements", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-crossorigin-video-"));
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="640" data-height="360" data-duration="1">
+    <video id="clip" src="https://example.com/clip.mp4" crossorigin="anonymous" data-start="0" data-duration="1"></video>
+  </div>
+</body></html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+
+    expect(compiled.html).not.toContain("crossorigin");
+    expect(compiled.html).toContain('id="clip"');
+  });
+
+  it("strips crossorigin from <audio> elements", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-crossorigin-audio-"));
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html><html><body>
+  <div data-composition-id="root" data-width="640" data-height="360" data-duration="5">
+    <audio id="bgm" src="https://example.com/bgm.mp3" crossorigin="anonymous" data-start="0" data-duration="5" data-volume="0.8"></audio>
+  </div>
+</body></html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+
+    expect(compiled.html).not.toContain("crossorigin");
+    expect(compiled.html).toContain('id="bgm"');
+  });
+});
+
+// ── remote media localization ────────────────────────────────────────────────
+//
+// Tests run on localizeRemoteMediaSources directly (exported for testing) to
+// avoid invoking ffprobe / the full compileForRender pipeline. fetch is patched
+// in-process for success cases; real 404s from example.com cover fallback.
+
+describe("localizeRemoteMediaSources", () => {
+  it("rewrites remote <video> src to _remote_media path when download succeeds", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-dl-ok-"));
+      const html = `<video id="v1" src="https://media-ok.example.com/a/clip.mp4" data-start="0" data-end="10" muted></video>`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteMediaSources(html, dl);
+      expect(result).not.toContain("https://media-ok.example.com/");
+      expect(result).toContain("_remote_media/");
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("preserves original URL on download failure without throwing", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-dl-fail-"));
+    const url = "https://example.com/will-404-localize-test.mp4";
+    const html = `<video id="v1" src="${url}" data-start="0" data-end="10" muted></video>`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteMediaSources(html, dl);
+    expect(result).toContain(url);
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("deduplicates: two tags with the same src URL → one download", async () => {
+    const orig = globalThis.fetch;
+    let fetchCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => {
+      fetchCount++;
+      return new Response(new Uint8Array(100), { status: 200 });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-dl-dedup-"));
+      const html = `<video id="v1" src="https://dedup.example.com/b/shared.mp4" data-start="0" data-end="10" muted></video>
+<video id="v2" src="https://dedup.example.com/b/shared.mp4" data-start="10" data-end="20" muted></video>`;
+      await localizeRemoteMediaSources(html, dl);
+      expect(fetchCount).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("does not rewrite local (non-HTTP) src paths", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-dl-local-"));
+    const html = `<video id="v1" src="assets/local.mp4" data-start="0" data-end="10" muted></video>`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteMediaSources(html, dl);
+    expect(result).toContain("assets/local.mp4");
+    expect(result).not.toContain("_remote_media/");
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("rewrites src in both double-quoted and single-quoted attributes", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-dl-quotes-"));
+      const html = `<video id="v1" src="https://q.example.com/c/dq.mp4" data-start="0" data-end="10" muted></video>
+<audio id="a1" src='https://q.example.com/c/sq.mp3' data-start="0" data-end="10"></audio>`;
+      const { html: result } = await localizeRemoteMediaSources(html, dl);
+      expect(result).not.toContain("https://q.example.com/");
+      expect(result.match(/_remote_media\//g)?.length).toBe(2);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("uses path.basename for OS-portable filename extraction from downloaded path", () => {
+    // Guards against the prior absPath.split('/').at(-1) pattern. On Windows
+    // path.join uses `\` separators; splitting on `/` would return the entire
+    // path as a single element, producing a garbage relPath. path.basename is
+    // OS-aware and extracts the filename correctly on both platforms.
+    const { basename: b } = require("node:path");
+    expect(b("/tmp/_remote_media/download_abc123.mp4")).toBe("download_abc123.mp4");
+  });
+});
+
+// ── localizeRemoteImageSources ───────────────────────────────────────────────
+//
+// Regression coverage for the agent-pipeline `<img>` flicker bug: producer's
+// frame-capture has no `pollImagesReady` analog of `pollVideosReady`, so a
+// composition with raw S3 `<img src="https://...">` URLs (astral / daphne /
+// hyperion multi-v2 outputs) reaches Chrome with a network dependency that
+// races the readiness gate AND can be evicted mid-render. Localising before
+// render is the architectural fix; `pollImagesReady` in frameCapture is the
+// defense-in-depth layer.
+//
+// Mirrors the localizeRemoteMediaSources test shape; fetch is patched in
+// for success cases and a real 404 covers the fallback path.
+
+describe("localizeRemoteImageSources", () => {
+  it("rewrites remote <img> src to _remote_media path when download succeeds", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-img-ok-"));
+      const html = `<img class="hero" src="https://img-ok.example.com/photo.png" />`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteImageSources(html, dl);
+      expect(result).not.toContain("https://img-ok.example.com/");
+      expect(result).toContain("_remote_media/");
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("preserves original URL on download failure without throwing", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-img-fail-"));
+    const url = "https://example.com/will-404-image-localize-test.png";
+    const html = `<img src="${url}" />`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteImageSources(html, dl);
+    expect(result).toContain(url);
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("deduplicates: two <img> tags with the same src URL → one download", async () => {
+    const orig = globalThis.fetch;
+    let fetchCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => {
+      fetchCount++;
+      return new Response(new Uint8Array(100), { status: 200 });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-img-dedup-"));
+      const html = `<img src="https://dedup-img.example.com/hero.jpg" />
+<img src="https://dedup-img.example.com/hero.jpg" />`;
+      await localizeRemoteImageSources(html, dl);
+      expect(fetchCount).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("does not rewrite local (non-HTTP) src paths", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-img-local-"));
+    const html = `<img src="assets/hero.png" />`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteImageSources(html, dl);
+    expect(result).toContain("assets/hero.png");
+    expect(result).not.toContain("_remote_media/");
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("does not rewrite data: URI src", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-img-data-"));
+    const html = `<img src="data:image/svg+xml,%3Csvg/%3E" />`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteImageSources(html, dl);
+    expect(result).toContain("data:image/svg+xml");
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("rewrites both double-quoted and single-quoted src attributes", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-img-quotes-"));
+      const html = `<img src="https://q-img.example.com/dq.png" />
+<img src='https://q-img.example.com/sq.jpg' />`;
+      const { html: result } = await localizeRemoteImageSources(html, dl);
+      expect(result).not.toContain("https://q-img.example.com/");
+      expect(result.match(/_remote_media\//g)?.length).toBe(2);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("does not match data-src (lazy-loader placeholder), only the real src attribute", async () => {
+    // A lazy-loader emits the real asset in `data-src` and a placeholder in
+    // `src`. We must localise what Chrome actually paints (the real `src`),
+    // not the `data-src` URL — matching `data-src` would download an asset the
+    // render never shows and could break the loader's runtime swap.
+    const orig = globalThis.fetch;
+    let fetchCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => {
+      fetchCount++;
+      return new Response(new Uint8Array(100), { status: 200 });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-img-datasrc-"));
+      const html = `<img data-src="https://lazy.example.com/real.png" src="https://cdn.example.com/placeholder.png" />`;
+      const { html: result } = await localizeRemoteImageSources(html, dl);
+      // The real src is localised; the data-src URL is left untouched.
+      expect(result).toContain("https://lazy.example.com/real.png");
+      expect(result).not.toContain("https://cdn.example.com/placeholder.png");
+      expect(fetchCount).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it("handles src attribute not as the first attribute (agent-pipeline shape)", async () => {
+    // The 02_kobe astral-pipeline composition that surfaced this bug emits
+    // <img> tags with `class` before `src`. Regex must not assume src position.
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-img-attr-order-"));
+      const html = `<img class="kobe-cutout" alt="kobe" src="https://astral.example.com/d828bca.png" />`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteImageSources(html, dl);
+      expect(result).not.toContain("https://astral.example.com/");
+      expect(result).toContain("_remote_media/");
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = orig;
+    }
+  });
+});
+
+// ── localizeRemoteFontFaces ──────────────────────────────────────────────────
+
+describe("localizeRemoteFontFaces", () => {
+  const FONT_URL = "https://gen-os-static.s3.us-east-2.amazonaws.com/fonts/komika-axis.ttf";
+
+  it("rewrites @font-face url() inside <style> to _remote_media/ path", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(16), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-"));
+      const html = `<style>
+@font-face {
+  font-family: "Komika Axis";
+  src: url("${FONT_URL}") format("truetype");
+}
+</style>`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      expect(result).not.toContain(FONT_URL);
+      expect(result).toContain("_remote_media/");
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("ignores url() references outside @font-face (e.g. background-image)", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(new Uint8Array(16), { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-bg-"));
+      const BG_URL = "https://cdn.example.com/bg.png";
+      const html = `<style>
+body { background-image: url("${BG_URL}"); }
+@font-face { font-family: "F"; src: url("${FONT_URL}") format("truetype"); }
+</style>`;
+      const { html: result } = await localizeRemoteFontFaces(html, dl);
+      // Font URL rewritten, background URL untouched
+      expect(result).not.toContain(FONT_URL);
+      expect(result).toContain(BG_URL);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("preserves original URL when download fails", async () => {
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(null, { status: 403 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-fail-"));
+      const FAIL_URL = "https://fail-font.example.com/f.ttf";
+      const html = `<style>@font-face { font-family: "F"; src: url("${FAIL_URL}") format("truetype"); }</style>`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      expect(result).toContain(FAIL_URL);
+      expect(remoteMediaAssets.size).toBe(0);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("deduplicates: same font URL in two @font-face blocks → 1 download", async () => {
+    const orig = globalThis.fetch;
+    let fetchCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => {
+      fetchCount++;
+      return new Response(new Uint8Array(16), { status: 200 });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-dedup-"));
+      const DEDUP_URL = "https://dedup-font.example.com/d.ttf";
+      const html = `<style>
+@font-face { font-family: "F1"; src: url("${DEDUP_URL}") format("truetype"); font-weight: 400; }
+@font-face { font-family: "F2"; src: url("${DEDUP_URL}") format("truetype"); font-weight: 700; }
+</style>`;
+      const { remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      expect(fetchCount).toBe(1);
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("no-ops when no @font-face blocks are present", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-ff-noop-"));
+    const html = `<style>body { color: red; }</style>`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+    expect(result).toBe(html);
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("ignores local (non-HTTP) @font-face src URLs", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-ff-local-"));
+    const html = `<style>@font-face { font-family: "F"; src: url("assets/fonts/f.ttf") format("truetype"); }</style>`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+    expect(result).toBe(html);
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  // ── External <link rel="stylesheet"> inlining ──
+
+  it("leaves Google Fonts <link> tags untouched", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-ff-gf-"));
+    const html = `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700">
+<link rel="stylesheet" href="https://fonts.gstatic.com/s/inter/inter.css">
+<style>body { color: red; }</style>`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+    // Google Fonts links should remain as-is — the deterministic font injector handles them
+    expect(result).toContain("fonts.googleapis.com");
+    expect(result).toContain("fonts.gstatic.com");
+    expect(result).toBe(html);
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("does not process non-stylesheet <link> tags (rel=icon, rel=preconnect)", async () => {
+    const dl = mkdtempSync(join(tmpdir(), "hf-ff-nonss-"));
+    const html = `<link rel="icon" href="https://cdn.example.com/favicon.ico">
+<link rel="preconnect" href="https://cdn.example.com">
+<link rel="dns-prefetch" href="https://cdn.example.com">`;
+    const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+    expect(result).toBe(html);
+    expect(remoteMediaAssets.size).toBe(0);
+  });
+
+  it("inlines @font-face rules from external non-Google stylesheet and downloads font files", async () => {
+    const EXTERNAL_FONT_URL = "https://cdn.example.com/fonts/custom.woff2";
+    const STYLESHEET_URL = "https://cdn.example.com/fonts/style.css";
+    const fakeCss = `
+/* Reset styles */
+body { margin: 0; }
+@font-face {
+  font-family: "CustomFont";
+  src: url("${EXTERNAL_FONT_URL}") format("woff2");
+  font-weight: 400;
+}
+h1 { font-size: 2rem; }`;
+
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async (url: string) => {
+      if (url === STYLESHEET_URL) {
+        return new Response(fakeCss, { status: 200 });
+      }
+      // Font file download
+      return new Response(new Uint8Array(16), { status: 200 });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-ext-"));
+      const html = `<link rel="stylesheet" href="${STYLESHEET_URL}">
+<style>body { color: red; }</style>`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      // The <link> tag should be replaced with an inline <style> containing the @font-face
+      expect(result).not.toContain(`href="${STYLESHEET_URL}"`);
+      expect(result).not.toContain("<link");
+      expect(result).toContain("@font-face");
+      expect(result).toContain("CustomFont");
+      // The remote font URL should be rewritten to a local path
+      expect(result).not.toContain(EXTERNAL_FONT_URL);
+      expect(result).toContain("_remote_media/");
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("keeps <link> tag when external stylesheet fetch fails (graceful degradation)", async () => {
+    const STYLESHEET_URL = "https://down.example.com/fonts.css";
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => new Response(null, { status: 503 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-extfail-"));
+      const html = `<link rel="stylesheet" href="${STYLESHEET_URL}">`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      // Original link tag preserved on failure
+      expect(result).toContain(STYLESHEET_URL);
+      expect(result).toContain("<link");
+      expect(remoteMediaAssets.size).toBe(0);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("keeps <link> tag when external stylesheet has no @font-face rules", async () => {
+    const STYLESHEET_URL = "https://cdn.example.com/reset.css";
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () =>
+      new Response("body { margin: 0; } h1 { color: blue; }", { status: 200 });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-noff-"));
+      const html = `<link rel="stylesheet" href="${STYLESHEET_URL}">`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      // No @font-face → keep the original link tag (non-font CSS may be needed)
+      expect(result).toContain(STYLESHEET_URL);
+      expect(result).toContain("<link");
+      expect(remoteMediaAssets.size).toBe(0);
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
+  it("handles multiple external stylesheets, mixing Google and non-Google", async () => {
+    const FONT_CDN_URL = "https://use.typekit.net/abc123.css";
+    const FONT_FILE_URL = "https://use.typekit.net/af/font.woff2";
+    const fontCss = `@font-face { font-family: "AdobeFont"; src: url("${FONT_FILE_URL}") format("woff2"); }`;
+
+    const orig = globalThis.fetch;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async (url: string) => {
+      if (url === FONT_CDN_URL) return new Response(fontCss, { status: 200 });
+      return new Response(new Uint8Array(16), { status: 200 });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-multi-"));
+      const html = `<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto">
+<link rel="stylesheet" href="${FONT_CDN_URL}">`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+      // Google link untouched
+      expect(result).toContain("fonts.googleapis.com");
+      // Typekit link inlined — the <link> tag is replaced; the URL only appears in a CSS comment
+      expect(result).not.toContain(`href="${FONT_CDN_URL}"`);
+      expect(result).toContain("AdobeFont");
+      expect(result).toContain("_remote_media/");
+      expect(remoteMediaAssets.size).toBe(1);
+    } finally {
+      globalThis.fetch = orig;
+    }
   });
 });
 

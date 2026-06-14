@@ -1,9 +1,17 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { defaultLogger } from "../logger.js";
 
+import { FONT_ALIAS_MAP } from "@hyperframes/core/fonts/aliases";
+import {
+  locateSystemFontVariants,
+  SYSTEM_FONT_SIZE_LIMIT,
+} from "@hyperframes/core/fonts/system-locator";
 import { parseHTML } from "linkedom";
 import { EMBEDDED_FONT_DATA } from "./fontData.generated.js";
+import { fontToDataUri } from "./fontCompression.js";
 
 type FontFaceSpec = {
   weight: string;
@@ -152,39 +160,11 @@ const CANONICAL_FONTS: Record<string, CanonicalFontSpec> = {
   },
 };
 
-const FONT_ALIASES: Record<string, keyof typeof CANONICAL_FONTS> = {
-  inter: "inter",
-  "helvetica neue": "inter",
-  helvetica: "inter",
-  arial: "inter",
-  "helvetica bold": "inter",
-  montserrat: "montserrat",
-  futura: "montserrat",
-  "din alternate": "montserrat",
-  "arial black": "montserrat",
-  outfit: "outfit",
-  nunito: "nunito",
-  oswald: "oswald",
-  "bebas neue": "league-gothic",
-  "league gothic": "league-gothic",
-  "archivo black": "archivo-black",
-  "space mono": "space-mono",
-  "ibm plex mono": "ibm-plex-mono",
-  "jetbrains mono": "jetbrains-mono",
-  "courier new": "jetbrains-mono",
-  courier: "jetbrains-mono",
-  "eb garamond": "eb-garamond",
-  garamond: "eb-garamond",
-  "playfair display": "playfair-display",
-  "source code pro": "source-code-pro",
-  "noto sans jp": "noto-sans-jp",
-  "noto sans japanese": "noto-sans-jp",
-  roboto: "roboto",
-  "open sans": "open-sans",
-  lato: "lato",
-  poppins: "poppins",
-  "segoe ui": "roboto",
-};
+// FONT_ALIASES derives from the shared alias map in @hyperframes/core.
+// The cast is safe: every value in FONT_ALIAS_MAP is a valid CANONICAL_FONTS key.
+export const FONT_ALIASES = FONT_ALIAS_MAP as Record<string, keyof typeof CANONICAL_FONTS>;
+
+export { FONT_ALIAS_KEYS } from "@hyperframes/core/fonts/aliases";
 
 function normalizeFamilyName(family: string): string {
   return family
@@ -234,7 +214,13 @@ function extractRequestedFontFamilies(html: string): Map<string, string> {
   return requested;
 }
 
-function buildFontFaceRule(familyName: string, src: string, weight: string, style: string): string {
+function buildFontFaceRule(
+  familyName: string,
+  src: string,
+  weight: string,
+  style: string,
+  unicodeRange?: string,
+): string {
   return [
     "@font-face {",
     `  font-family: "${familyName}";`,
@@ -242,6 +228,9 @@ function buildFontFaceRule(familyName: string, src: string, weight: string, styl
     `  font-style: ${style};`,
     `  font-weight: ${weight};`,
     "  font-display: block;",
+    // Preserve the subset's unicode-range so the browser selects the right
+    // per-codepoint subset (matching Google Fonts' own CSS semantics).
+    ...(unicodeRange ? [`  unicode-range: ${unicodeRange};`] : []),
     "}",
   ].join("\n");
 }
@@ -278,11 +267,19 @@ async function buildFontFaceCss(
       // if the bundle only ships 400/700/900.
       const googleFaces = await fetchGoogleFont(originalCaseFamily, options);
       for (const face of googleFaces) {
-        const key = `${face.weight}:${face.style}`;
-        if (!coveredWeights.has(key)) {
-          rules.push(buildFontFaceRule(originalCaseFamily, face.dataUri, face.weight, face.style));
-          coveredWeights.add(key);
-        }
+        // A weight covered by the embedded bundle is already full-coverage —
+        // skip it. For weights the bundle lacks, add EVERY subset face (a
+        // weight has one face per unicode-range subset), not just the first.
+        if (coveredWeights.has(`${face.weight}:${face.style}`)) continue;
+        rules.push(
+          buildFontFaceRule(
+            originalCaseFamily,
+            face.dataUri,
+            face.weight,
+            face.style,
+            face.unicodeRange,
+          ),
+        );
       }
       continue;
     }
@@ -291,12 +288,43 @@ async function buildFontFaceCss(
     const googleFaces = await fetchGoogleFont(originalCaseFamily, options);
     if (googleFaces.length > 0) {
       for (const face of googleFaces) {
-        rules.push(buildFontFaceRule(originalCaseFamily, face.dataUri, face.weight, face.style));
+        rules.push(
+          buildFontFaceRule(
+            originalCaseFamily,
+            face.dataUri,
+            face.weight,
+            face.style,
+            face.unicodeRange,
+          ),
+        );
       }
       continue;
     }
 
-    // Neither path resolved
+    // Path 3: locate font on the local filesystem, compress, and embed.
+    if (options.allowSystemFontCapture) {
+      const variants = locateSystemFontVariants(originalCaseFamily);
+      if (variants.length > 0) {
+        let totalBytes = 0;
+        for (const variant of variants) {
+          const fontBuffer = readFileSync(variant.path);
+          totalBytes += fontBuffer.length;
+          const dataUri = await fontToDataUri(fontBuffer, variant.format);
+          rules.push(buildFontFaceRule(originalCaseFamily, dataUri, variant.weight, variant.style));
+        }
+        if (totalBytes > SYSTEM_FONT_SIZE_LIMIT) {
+          defaultLogger.warn(
+            `[Compiler] System font "${originalCaseFamily}" is large (${(totalBytes / 1024 / 1024).toFixed(1)} MB total across ${variants.length} variant(s)) — embedding anyway. Consider font subsetting for production.`,
+          );
+        }
+        defaultLogger.info(
+          `[Compiler] Embedded system font "${originalCaseFamily}" — ${variants.length} variant(s), ${(totalBytes / 1024).toFixed(0)} KB total`,
+        );
+        continue;
+      }
+    }
+
+    // No path resolved
     unresolved.push(originalCaseFamily);
   }
 
@@ -314,14 +342,14 @@ function warnUnresolvedFonts(unresolved: string[]): void {
       return acc;
     }, [])
     .sort();
-  console.warn(
+  defaultLogger.warn(
     `[Compiler] No deterministic font mapping for: ${unresolved.join(", ")}\n` +
       `  Mapped fonts: ${mapped.join(", ")}\n` +
       `  To fix, pick one:\n` +
       `    1. Use a mapped font name instead (see list above)\n` +
       `    2. Add a @font-face block in your HTML with a local or hosted font file\n` +
       `    3. Install the font locally on the render machine (Docker: add to Dockerfile)\n` +
-      `    4. Add an alias to FONT_ALIASES in deterministicFonts.ts (for contributors)\n` +
+      `    4. Add an alias to FONT_ALIAS_MAP in packages/core/src/fonts/aliases.ts (for contributors)\n` +
       `  Docs: https://hyperframes.heygen.com/docs/fonts`,
   );
 }
@@ -363,14 +391,26 @@ function fontCacheDir(slug: string): string {
   return dir;
 }
 
-function cachedWoff2Path(slug: string, weight: string, style: string): string {
-  return join(fontCacheDir(slug), `${weight}-${style}.woff2`);
+// A short, stable discriminator for a single subset's woff2. Google Fonts'
+// css2 API returns one @font-face per (weight × unicode-range subset) — e.g.
+// `vietnamese`, `latin-ext`, and `latin` faces for the SAME weight, each with
+// a distinct woff2 URL and glyph set. Keying the cache by weight+style alone
+// collides every subset onto one filename, so only the first subset in the
+// CSS gets downloaded and the rest read it back. Derive the cache key from the
+// (subset-unique, version-stable) woff2 URL so each subset is cached on its own.
+function subsetToken(woff2Url: string): string {
+  return createHash("sha1").update(woff2Url).digest("hex").slice(0, 12);
+}
+
+function cachedWoff2Path(slug: string, weight: string, style: string, subset: string): string {
+  return join(fontCacheDir(slug), `${weight}-${style}-${subset}.woff2`);
 }
 
 type GoogleFontFace = {
   weight: string;
   style: string;
   dataUri: string;
+  unicodeRange?: string;
 };
 
 /**
@@ -404,6 +444,7 @@ export class FontFetchError extends Error {
 interface InternalFontFetchOptions {
   failClosedFontFetch: boolean;
   fetchImpl: typeof fetch;
+  allowSystemFontCapture: boolean;
 }
 
 /**
@@ -426,6 +467,51 @@ function fontFetchError(
     `Distributed renders require deterministic fonts; system-font fallback would produce ` +
     `non-byte-identical output.`;
   return new FontFetchError(familyName, url, message, "error" in cause ? cause.error : undefined);
+}
+
+/**
+ * Ensure one subset's woff2 is cached on disk (downloading if absent) and
+ * return it as a `data:` URI. Returns `null` when the woff2 isn't served
+ * (4xx) so the caller skips that face. Throws {@link FontFetchError} on
+ * transient (5xx / network) failures when `failClosedFontFetch` is set.
+ */
+async function ensureWoff2DataUri(
+  cachePath: string,
+  woff2Url: string,
+  familyName: string,
+  weight: string,
+  style: string,
+  options: InternalFontFetchOptions,
+): Promise<string | null> {
+  try {
+    return `data:font/woff2;base64,${readFileSync(cachePath).toString("base64")}`;
+  } catch {
+    // Not cached yet — fall through to fetch.
+  }
+
+  const woff2What = `Google Fonts woff2 (${weight}/${style})` as const;
+  try {
+    const fontRes = await options.fetchImpl(woff2Url);
+    if (!fontRes.ok) {
+      if (fontRes.status >= 500 && options.failClosedFontFetch) {
+        throw fontFetchError(familyName, woff2Url, woff2What, { status: fontRes.status });
+      }
+      return null;
+    }
+    // wx = O_CREAT|O_EXCL: atomic create, rejects symlinks, fails with
+    // EEXIST if a concurrent call cached it between our read and write.
+    writeFileSync(cachePath, Buffer.from(await fontRes.arrayBuffer()), { flag: "wx", mode: 0o644 });
+  } catch (err) {
+    if (err instanceof FontFetchError) throw err;
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      // Concurrent call wrote it — read their result below.
+    } else if (options.failClosedFontFetch) {
+      throw fontFetchError(familyName, woff2Url, woff2What, { error: err });
+    } else {
+      return null;
+    }
+  }
+  return `data:font/woff2;base64,${readFileSync(cachePath).toString("base64")}`;
 }
 
 async function fetchGoogleFont(
@@ -467,9 +553,12 @@ async function fetchGoogleFont(
     return [];
   }
 
-  // Parse @font-face blocks from the CSS response
+  // Parse @font-face blocks from the CSS response. The optional trailing
+  // capture grabs each face's `unicode-range` (Google emits it after `src`)
+  // so the injected face only claims the codepoints the subset actually
+  // covers — without it the face would advertise full coverage it lacks.
   const faceRegex =
-    /@font-face\s*\{[^}]*font-style:\s*(normal|italic)[^}]*font-weight:\s*(\d+)[^}]*src:\s*url\(([^)]+)\)\s*format\(['"]woff2['"]\)[^}]*\}/gi;
+    /@font-face\s*\{[^}]*font-style:\s*(normal|italic)[^}]*font-weight:\s*(\d+)[^}]*src:\s*url\(([^)]+)\)\s*format\(['"]woff2['"]\)(?:[^}]*?unicode-range:\s*([^;}]+))?[^}]*\}/gi;
 
   const faces: GoogleFontFace[] = [];
 
@@ -477,43 +566,24 @@ async function fetchGoogleFont(
     const style = match[1] || "normal";
     const weight = match[2] || "400";
     const woff2Url = match[3] || "";
+    const unicodeRange = match[4]?.trim() || undefined;
 
     if (!woff2Url) continue;
 
-    const cachePath = cachedWoff2Path(slug, weight, style);
-
-    // Check cache first
-    if (!existsSync(cachePath)) {
-      const woff2What = `Google Fonts woff2 (${weight}/${style})` as const;
-      try {
-        const fontRes = await options.fetchImpl(woff2Url);
-        if (!fontRes.ok) {
-          // Same 4xx vs 5xx split as the CSS fetch above: 4xx = the
-          // font's woff2 isn't served, skip silently; 5xx = transient
-          // upstream failure, may fail closed.
-          if (fontRes.status >= 500 && options.failClosedFontFetch) {
-            throw fontFetchError(familyName, woff2Url, woff2What, { status: fontRes.status });
-          }
-          continue;
-        }
-        const buffer = Buffer.from(await fontRes.arrayBuffer());
-        writeFileSync(cachePath, buffer);
-      } catch (err) {
-        if (err instanceof FontFetchError) throw err;
-        if (options.failClosedFontFetch) {
-          throw fontFetchError(familyName, woff2Url, woff2What, { error: err });
-        }
-        continue;
-      }
-    }
-
-    const fontBytes = readFileSync(cachePath);
-    const dataUri = `data:font/woff2;base64,${fontBytes.toString("base64")}`;
-    faces.push({ weight, style, dataUri });
+    const cachePath = cachedWoff2Path(slug, weight, style, subsetToken(woff2Url));
+    const dataUri = await ensureWoff2DataUri(
+      cachePath,
+      woff2Url,
+      familyName,
+      weight,
+      style,
+      options,
+    );
+    if (dataUri) faces.push({ weight, style, dataUri, unicodeRange });
   }
 
   if (faces.length > 0) {
-    console.log(
+    defaultLogger.info(
       `[Compiler] Fetched ${faces.length} font face(s) for "${familyName}" from Google Fonts (cached to ${fontCacheDir(slug)})`,
     );
   }
@@ -546,6 +616,14 @@ export interface InjectDeterministicFontFacesOptions {
    * network.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * When `true` (default for local renders), fonts that aren't resolved by
+   * the bundled alias map or Google Fonts are located on the local filesystem,
+   * compressed to woff2, and embedded as data URIs. Set to `false` for
+   * distributed/Lambda renders where the host filesystem is not guaranteed
+   * to contain the same fonts as the authoring machine.
+   */
+  allowSystemFontCapture?: boolean;
 }
 
 export async function injectDeterministicFontFaces(
@@ -554,7 +632,12 @@ export async function injectDeterministicFontFaces(
 ): Promise<string> {
   const failClosedFontFetch = options.failClosedFontFetch === true;
   const fetchImpl = options.fetchImpl ?? fetch;
-  const fetchOptions: InternalFontFetchOptions = { failClosedFontFetch, fetchImpl };
+  const allowSystemFontCapture = options.allowSystemFontCapture !== false;
+  const fetchOptions: InternalFontFetchOptions = {
+    failClosedFontFetch,
+    fetchImpl,
+    allowSystemFontCapture,
+  };
 
   const existingFaces = extractExistingFontFaces(html);
   const requestedFamilies = extractRequestedFontFamilies(html);
@@ -571,6 +654,14 @@ export async function injectDeterministicFontFaces(
   }
 
   const { css, unresolved } = await buildFontFaceCss(pendingFamilies, fetchOptions);
+  if (unresolved.length > 0 && options.failClosedFontFetch) {
+    throw new FontFetchError(
+      unresolved.join(", "),
+      "",
+      `[Compiler] Unresolved fonts in fail-closed mode: ${unresolved.join(", ")}. ` +
+        `Distributed renders require all fonts to be resolvable.`,
+    );
+  }
   if (!css) {
     if (unresolved.length > 0) {
       warnUnresolvedFonts(unresolved);
@@ -589,7 +680,7 @@ export async function injectDeterministicFontFaces(
   styleEl.textContent = css;
   head.insertBefore(styleEl, head.firstChild);
 
-  console.log(
+  defaultLogger.info(
     `[Compiler] Injected deterministic @font-face rules for ${pendingFamilies.size - unresolved.length} requested font families`,
   );
   if (unresolved.length > 0) {

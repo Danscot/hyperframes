@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, existsSync, mkdirSync } from "fs";
-import { join, dirname, resolve } from "path";
+import { join, dirname, resolve, basename } from "path";
 import { parseHTML } from "linkedom";
 import {
   compileTimingAttrs,
@@ -18,6 +18,8 @@ import {
   extractResolvedMedia,
   clampDurations,
   shouldClampMediaDuration,
+  CSS_URL_RE,
+  isNonRelativeUrl,
   type ResolvedDuration,
   type UnresolvedElement,
 } from "@hyperframes/core";
@@ -34,10 +36,12 @@ import {
   type AudioVolumeKeyframe,
   analyzeKeyframeIntervals,
 } from "@hyperframes/engine";
-import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
+import { assertPublicHttpsUrl, downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
 import type { Page } from "puppeteer-core";
 import { injectDeterministicFontFaces } from "./deterministicFonts.js";
+import { prepareAnimatedGifInputs } from "./animatedGifPrep.js";
 import { createStudioPositionSeekReapplyScript } from "@hyperframes/core/studio-api/manual-edits-render-script";
+import { defaultLogger } from "../logger.js";
 
 export interface CompiledComposition {
   html: string;
@@ -259,6 +263,21 @@ async function compileHtmlFile(
   // Without this, videos with crossorigin="anonymous" targeting CORS-restricted
   // origins (e.g. S3 without CORS headers) keep readyState=0, blocking page setup.
   compiledHtml = compiledHtml.replace(/(<video\b[^>]*)\s+crossorigin(?:=["'][^"']*["'])?/gi, "$1");
+
+  // Strip crossorigin from img elements. The renderer captures DOM frames visually —
+  // no canvas readback — so CORS compliance is unnecessary. External images from
+  // CORS-restricted origins (e.g. S3) render blank when crossorigin forces a failed
+  // CORS request against the renderer's localhost file server.
+  compiledHtml = compiledHtml.replace(/(<img\b[^>]*)\s+crossorigin(?:=["'][^"']*["'])?/gi, "$1");
+
+  // Strip crossorigin from audio elements. Audio is processed out-of-band via
+  // FFmpeg; the browser's CORS policy for audio elements is irrelevant to
+  // rendering. Leaving crossorigin="anonymous" causes the browser to issue a
+  // CORS-mode preflight from localhost, which S3 buckets without explicit CORS
+  // headers reject — leaving audio elements in a failed network state. The
+  // FFmpeg audio path reads the src URL directly and is unaffected by browser
+  // CORS, so stripping the attribute has no side effects.
+  compiledHtml = compiledHtml.replace(/(<audio\b[^>]*)\s+crossorigin(?:=["'][^"']*["'])?/gi, "$1");
 
   return { html: compiledHtml, unresolvedCompositions };
 }
@@ -690,7 +709,7 @@ function ensureFullDocument(html: string): string {
   // Wrap fragment with a proper document including margin/padding reset.
   // Without this, Chrome applies default body { margin: 8px } which creates
   // visible white lines at the edges of rendered video.
-  return `<!DOCTYPE html>\n<html>\n<head>\n  <meta charset="UTF-8">\n  <style>*{margin:0;padding:0;box-sizing:border-box;text-rendering:geometricPrecision}body{overflow:hidden;background:#000}</style>\n</head>\n<body style="margin:0;overflow:hidden">\n${html}\n</body>\n</html>`;
+  return `<!DOCTYPE html>\n<html>\n<head>\n  <meta charset="UTF-8">\n  <style>*{margin:0;padding:0;box-sizing:border-box;text-rendering:geometricPrecision}body{overflow:hidden;background:#000;font-family:"Inter",sans-serif}</style>\n</head>\n<body style="margin:0;overflow:hidden">\n${html}\n</body>\n</html>`;
 }
 
 /**
@@ -763,9 +782,9 @@ export async function inlineExternalScripts(html: string): Promise<string> {
       }
       inlineScript.textContent = `/* inlined: ${src} */\n${safeText}\n`;
       el.replaceWith(inlineScript);
-      console.log(`[Compiler] Inlined CDN script: ${src}`);
+      defaultLogger.info(`[Compiler] Inlined CDN script: ${src}`);
     } else {
-      console.warn(
+      defaultLogger.warn(
         `[Compiler] WARNING: Failed to download CDN script: ${src} — ${download.reason}. ` +
           `The render may fail if this script is required (e.g. GSAP). ` +
           `Consider bundling it locally in your project.`,
@@ -789,21 +808,10 @@ export function collectExternalAssets(
 ): { html: string; externalAssets: Map<string, string> } {
   const absProjectDir = resolve(projectDir);
   const externalAssets = new Map<string, string>();
-  const CSS_URL_RE = /\burl\(\s*(["']?)([^)"']+)\1\s*\)/g;
 
   function processPath(rawPath: string): string | null {
     const trimmed = rawPath.trim();
-    if (
-      !trimmed ||
-      trimmed.startsWith("/") ||
-      trimmed.startsWith("http://") ||
-      trimmed.startsWith("https://") ||
-      trimmed.startsWith("//") ||
-      trimmed.startsWith("data:") ||
-      trimmed.startsWith("#")
-    ) {
-      return null;
-    }
+    if (isNonRelativeUrl(trimmed)) return null;
     const absPath = resolve(absProjectDir, trimmed);
     if (isPathInside(absPath, absProjectDir)) {
       return null; // inside projectDir, file server handles this
@@ -854,7 +862,7 @@ export function collectExternalAssets(
   }
 
   if (externalAssets.size > 0) {
-    console.log(
+    defaultLogger.info(
       `[Compiler] Found ${externalAssets.size} asset(s) outside project directory — will copy to render output`,
     );
   }
@@ -863,6 +871,420 @@ export function collectExternalAssets(
     html: externalAssets.size > 0 ? document.toString() : html,
     externalAssets,
   };
+}
+
+const REMOTE_MEDIA_SUBDIR = "_remote_media";
+// Match opening tags of <video> or <audio> elements that carry an HTTP(S) src.
+// Uses [^>]* to span attributes — safe for composition elements that won't
+// have `>` inside quoted attribute values (data-title etc.).
+const REMOTE_MEDIA_TAG_RE =
+  /<(?:video|audio)\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
+// Match <img> tags (including agent-pipeline-emitted variants where `src` is
+// not the first attribute). Producer-side localisation is the primary fix for
+// the remote-<img> flicker; frameCapture's `pollImagesReady`/`decodeAllImages`
+// are the defense-in-depth layer for any remote URL that bypasses this step.
+// The `(?<![\w-])` lookbehind pins the match to a real `src` attribute so we
+// don't rewrite `data-src` / `data-*-src` (lazy-loader placeholders whose URL
+// is not what Chrome actually paints). `srcset` is excluded by the `\s*=`.
+const REMOTE_IMG_TAG_RE = /<img\b[^>]*?(?<![\w-])src\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
+
+/**
+ * Download a set of remote URLs in parallel into `remoteDir`, build the
+ * `{ relPath → absPath }` asset map, and rewrite every occurrence of each
+ * URL inside `html` with its relative local path.
+ *
+ * The `warnLabel` appears in console.warn messages for download failures.
+ * The `logLabel` appears in the success console.log line.
+ * `extraRewrite`, if provided, is called per URL pair after the standard
+ * double/single-quote rewrite — used for url(...) CSS rewriting.
+ */
+async function downloadAndRewriteUrls(
+  urlSet: Set<string>,
+  html: string,
+  remoteDir: string,
+  warnLabel: string,
+  logLabel: string,
+  extraRewrite?: (html: string, url: string, relPath: string) => string,
+): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
+  if (urlSet.size === 0) return { html, remoteMediaAssets: new Map() };
+  if (!existsSync(remoteDir)) mkdirSync(remoteDir, { recursive: true });
+
+  const urlToLocal = new Map<string, string>();
+  await Promise.all(
+    [...urlSet].map(async (url) => {
+      try {
+        const localPath = await downloadToTemp(url, remoteDir);
+        urlToLocal.set(url, localPath);
+      } catch (err) {
+        defaultLogger.warn(
+          `[Compiler] ${warnLabel} ${url} — using original URL as fallback. ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }),
+  );
+
+  if (urlToLocal.size === 0) return { html, remoteMediaAssets: new Map() };
+
+  const remoteMediaAssets = new Map<string, string>();
+  const urlToRelPath = new Map<string, string>();
+  for (const [url, absPath] of urlToLocal) {
+    const relPath = `${REMOTE_MEDIA_SUBDIR}/${basename(absPath)}`;
+    remoteMediaAssets.set(relPath, absPath);
+    urlToRelPath.set(url, relPath);
+  }
+
+  let result = html;
+  for (const [url, relPath] of urlToRelPath) {
+    result = result.replaceAll(`"${url}"`, `"${relPath}"`).replaceAll(`'${url}'`, `'${relPath}'`);
+    if (extraRewrite) result = extraRewrite(result, url, relPath);
+  }
+
+  defaultLogger.info(`[Compiler] ${logLabel} ${urlToLocal.size} to ${REMOTE_MEDIA_SUBDIR}/`);
+  return { html: result, remoteMediaAssets };
+}
+
+/**
+ * Download any remote `src` URLs on `<video>` and `<audio>` elements into a
+ * local subdirectory of `downloadDir`, rewrite the HTML src attributes to
+ * relative paths, and return the updated HTML along with a map of
+ * `{ relativePath → absoluteLocalPath }` for callers to add to `externalAssets`.
+ *
+ * Skips URLs that fail to download (warns and preserves the original URL so
+ * the browser can still attempt the remote fetch as a fallback).
+ *
+ * Why: remote S3 sources require Chrome to buffer every video file over the
+ * network before `readyState >= 2` (HAVE_CURRENT_DATA). With 10+ large clips
+ * this reliably exhausts `pageReadyTimeout`, producing blank black frames for
+ * every clip. Localising the sources before the file server starts eliminates
+ * the race entirely and keeps the render hermetic.
+ */
+/** @internal exported for unit testing only */
+export async function localizeRemoteMediaSources(
+  html: string,
+  downloadDir: string,
+): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
+  // Collect unique HTTP URLs from <video>/<audio> src attributes.
+  const urlSet = new Set<string>();
+  const re = new RegExp(REMOTE_MEDIA_TAG_RE.source, REMOTE_MEDIA_TAG_RE.flags);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (m[1]) urlSet.add(m[1]);
+  }
+  return downloadAndRewriteUrls(
+    urlSet,
+    html,
+    join(downloadDir, REMOTE_MEDIA_SUBDIR),
+    "Remote media download failed for",
+    "Localized remote media source(s)",
+  );
+}
+
+/**
+ * Download any remote `src` URLs on `<img>` elements into a local subdirectory
+ * of `downloadDir`, rewrite the HTML src attributes to relative paths, and
+ * return a `{ relativePath → absoluteLocalPath }` map for the orchestrator.
+ *
+ * Why: a composition with remote S3 `<img src>` URLs reaches Chrome unchanged;
+ * the readiness check can pass before the image is fully decoded, *and* Chrome
+ * may evict decoded pixels mid-render under memory pressure and re-fetch from
+ * the remote origin. Either path produces blank-frame flicker. Localising the
+ * sources before render eliminates both races — once the file is local,
+ * Chrome's image cache is bounded by fast disk reads, not S3 latency, so a
+ * mid-render re-fetch lands within a frame instead of flickering. This is the
+ * primary fix; frameCapture's `pollImagesReady` is the defense-in-depth layer.
+ *
+ * Scope: only `<img src>` is localised here. Remote `srcset`,
+ * `<picture><source>`, SVG `<image href>`, and CSS `background-image: url()`
+ * outside `@font-face` are NOT covered — agent-pipeline compositions emit
+ * plain `<img src>`, but those are open follow-ups if other shapes appear.
+ *
+ * This bites agent-pipeline-generated compositions (astral / daphne /
+ * hyperion `multi-v2` outputs) which render directly without going through
+ * `hyperframes publish`'s archive-time localize step.
+ */
+/** @internal exported for unit testing only */
+export async function localizeRemoteImageSources(
+  html: string,
+  downloadDir: string,
+): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
+  const urlSet = new Set<string>();
+  const re = new RegExp(REMOTE_IMG_TAG_RE.source, REMOTE_IMG_TAG_RE.flags);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (m[1]) urlSet.add(m[1]);
+  }
+  return downloadAndRewriteUrls(
+    urlSet,
+    html,
+    join(downloadDir, REMOTE_MEDIA_SUBDIR),
+    "Remote image download failed for",
+    "Localized remote image source(s)",
+  );
+}
+
+// Match url("https://...") or url('https://...') inside @font-face blocks.
+// We scan the full HTML (which includes <style> blocks) — matching against
+// @font-face context precisely would require a CSS parser; instead we match
+// any url(https?://...) that appears inside a @font-face rule by looking for
+// the surrounding context. Simple pattern: capture all HTTP url() references
+// that follow a @font-face opener (before the closing brace). The regex is
+// applied to the CSS text extracted from <style> blocks so it can't
+// accidentally match JavaScript string literals.
+const REMOTE_FONTFACE_URL_RE = /url\(["']?(https?:\/\/[^"')]+)["']?\)/gi;
+
+/**
+ * Download any remote font URLs from `@font-face` src declarations, rewrite
+ * the CSS `url(...)` references to local paths, and return a map of assets.
+ *
+ * Why: `@font-face { src: url("https://s3.../font.ttf") }` fails in the
+ * renderer because Chrome makes a CORS-mode fetch from the local file server
+ * origin (http://localhost:PORT) and S3 does not echo that origin back in
+ * Access-Control-Allow-Origin. The font load is rejected, Chrome falls back
+ * to the next font in the stack (e.g. Arial). Downloading the font file
+ * before render and rewriting to a local path eliminates the CORS race.
+ */
+/** Returns true for URLs belonging to Google Fonts (handled by the deterministic font injector). */
+function isGoogleFontsUrl(href: string): boolean {
+  try {
+    const host = new URL(href).hostname.toLowerCase();
+    return host === "fonts.googleapis.com" || host === "fonts.gstatic.com";
+  } catch {
+    return /fonts\.googleapis\.com|fonts\.gstatic\.com/i.test(href);
+  }
+}
+
+const MAX_STYLESHEET_BYTES = 2 * 1024 * 1024;
+
+async function fetchExternalStylesheetCss(href: string): Promise<string | null> {
+  try {
+    assertPublicHttpsUrl(href);
+  } catch {
+    return null;
+  }
+  try {
+    const response = await fetch(href, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      defaultLogger.warn(
+        `[Compiler] External stylesheet fetch failed for ${href} — HTTP ${response.status}`,
+      );
+      return null;
+    }
+    const contentLength = response.headers.get("content-length");
+    if (contentLength && parseInt(contentLength, 10) > MAX_STYLESHEET_BYTES) {
+      defaultLogger.warn(
+        `[Compiler] External stylesheet too large (${contentLength} bytes): ${href}`,
+      );
+      return null;
+    }
+    const text = await response.text();
+    if (text.length > MAX_STYLESHEET_BYTES) {
+      defaultLogger.warn(
+        `[Compiler] External stylesheet too large (${text.length} bytes): ${href}`,
+      );
+      return null;
+    }
+    return text;
+  } catch (err) {
+    defaultLogger.warn(
+      `[Compiler] External stylesheet fetch failed for ${href} — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Extract all `@font-face { ... }` blocks from a CSS string, preserving the
+ * full rule text (including the `@font-face` keyword and braces).
+ *
+ * Uses a depth-tracking scan instead of `[^}]*` so blocks with nested
+ * descriptor values that happen to contain `}` (rare but valid in
+ * `format(...)` hints with custom idents) are captured correctly.
+ */
+function extractFontFaceBlocks(css: string): string[] {
+  const blocks: string[] = [];
+  const atRule = /@font-face\s*/gi;
+  let m: RegExpExecArray | null;
+  while ((m = atRule.exec(css)) !== null) {
+    const openIdx = css.indexOf("{", m.index + m[0].length);
+    if (openIdx === -1) break;
+    let depth = 1;
+    let i = openIdx + 1;
+    for (; i < css.length && depth > 0; i++) {
+      if (css[i] === "{") depth++;
+      else if (css[i] === "}") depth--;
+    }
+    if (depth === 0) {
+      blocks.push(css.slice(m.index, i));
+      atRule.lastIndex = i;
+    }
+  }
+  return blocks;
+}
+
+/**
+ * Find all external `<link rel="stylesheet">` tags pointing to non-Google
+ * CDNs, fetch their CSS, and replace the `<link>` with an inline `<style>`
+ * containing only the `@font-face` rules. This allows Phase 2 (the existing
+ * inline scan) to pick up and localise the font file URLs.
+ *
+ * Google Fonts links are excluded because the deterministic font injector
+ * handles those. If a fetch fails or the CSS has no `@font-face` blocks,
+ * the original `<link>` tag is preserved (graceful degradation).
+ */
+// fallow-ignore-next-line complexity
+async function inlineExternalFontStylesheets(html: string): Promise<string> {
+  const linkRe = /<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi;
+  const hrefRe = /\bhref=["']([^"']+)["']/i;
+
+  const linkMatches: { fullMatch: string; href: string }[] = [];
+  let linkMatch: RegExpExecArray | null;
+  while ((linkMatch = linkRe.exec(html)) !== null) {
+    const tag = linkMatch[0];
+    const hrefMatch = hrefRe.exec(tag);
+    if (!hrefMatch?.[1]) continue;
+    const href = hrefMatch[1];
+    if (!/^https?:\/\//i.test(href)) continue;
+    if (isGoogleFontsUrl(href)) continue;
+    linkMatches.push({ fullMatch: tag, href });
+  }
+
+  if (linkMatches.length === 0) return html;
+
+  const MAX_CONCURRENT_STYLESHEET_FETCHES = 4;
+  const fetches: { fullMatch: string; href: string; css: string | null }[] = [];
+  for (let i = 0; i < linkMatches.length; i += MAX_CONCURRENT_STYLESHEET_FETCHES) {
+    const batch = linkMatches.slice(i, i + MAX_CONCURRENT_STYLESHEET_FETCHES);
+    const results = await Promise.all(
+      batch.map(async ({ fullMatch, href }) => {
+        const css = await fetchExternalStylesheetCss(href);
+        return { fullMatch, href, css };
+      }),
+    );
+    fetches.push(...results);
+  }
+
+  let result = html;
+  for (const { fullMatch, href, css } of fetches) {
+    if (css === null) continue;
+    const fontFaceBlocks = extractFontFaceBlocks(css);
+    if (fontFaceBlocks.length === 0) continue;
+    const inlineStyle = `<style>/* Inlined from ${href} */\n${fontFaceBlocks.join("\n")}\n</style>`;
+    result = result.replace(fullMatch, inlineStyle);
+    defaultLogger.info(
+      `[Compiler] Inlined ${fontFaceBlocks.length} @font-face rule(s) from external stylesheet: ${href}`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Collect all remote `url(https://...)` references inside `@font-face` blocks
+ * found in `<style>` tags.
+ */
+// fallow-ignore-next-line complexity
+function collectFontFaceUrls(html: string): Set<string> {
+  const styleBlockRe = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+  const urlSet = new Set<string>();
+
+  let styleMatch: RegExpExecArray | null;
+  while ((styleMatch = styleBlockRe.exec(html)) !== null) {
+    const cssText = styleMatch[1] ?? "";
+    // Depth-tracking scanner to correctly handle @font-face blocks that
+    // contain nested braces (e.g. unicode-range fallback rules).
+    let i = 0;
+    while (i < cssText.length) {
+      const atIdx = cssText.indexOf("@font-face", i);
+      if (atIdx === -1) break;
+      const braceStart = cssText.indexOf("{", atIdx);
+      if (braceStart === -1) break;
+      let depth = 1;
+      let j = braceStart + 1;
+      while (j < cssText.length && depth > 0) {
+        if (cssText[j] === "{") depth++;
+        else if (cssText[j] === "}") depth--;
+        j++;
+      }
+      const block = cssText.slice(braceStart + 1, j - 1);
+      const urlRe = new RegExp(REMOTE_FONTFACE_URL_RE.source, REMOTE_FONTFACE_URL_RE.flags);
+      let urlMatch: RegExpExecArray | null;
+      while ((urlMatch = urlRe.exec(block)) !== null) {
+        if (urlMatch[1]) urlSet.add(urlMatch[1]);
+      }
+      i = j;
+    }
+  }
+  return urlSet;
+}
+
+/** @internal exported for unit testing only */
+export async function localizeRemoteFontFaces(
+  html: string,
+  downloadDir: string,
+): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
+  // Phase 1: Inline @font-face rules from external <link rel="stylesheet"> tags.
+  const processed = await inlineExternalFontStylesheets(html);
+
+  // Phase 2: Download font file URLs from all @font-face blocks (both
+  // pre-existing inline blocks and the ones just inlined from external sheets).
+  const urlSet = collectFontFaceUrls(processed);
+
+  return downloadAndRewriteUrls(
+    urlSet,
+    processed,
+    join(downloadDir, REMOTE_MEDIA_SUBDIR),
+    "Remote font download failed for",
+    "Localized remote font face(s)",
+    (h, url, relPath) => h.replaceAll(`url(${url})`, `url("${relPath}")`),
+  );
+}
+
+const LOCAL_FONTFACE_URL_RE = /url\(["']?(?!data:|https?:\/\/)([^"')]+)["']?\)/gi;
+
+// fallow-ignore-next-line complexity
+async function embedLocalFontFaces(html: string, projectDir: string): Promise<string> {
+  const { fontToDataUri: toDataUri } = await import("./fontCompression.js");
+  const styleBlockRe = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+  const fontFaceRe = /@font-face\s*\{([^}]*)\}/gi;
+  let result = html;
+  const embedded = new Set<string>();
+
+  let styleMatch: RegExpExecArray | null;
+  while ((styleMatch = styleBlockRe.exec(html)) !== null) {
+    const cssText = styleMatch[1] ?? "";
+    const ffRe = new RegExp(fontFaceRe.source, fontFaceRe.flags);
+    let ffMatch: RegExpExecArray | null;
+    while ((ffMatch = ffRe.exec(cssText)) !== null) {
+      const block = ffMatch[1] ?? "";
+      const urlRe = new RegExp(LOCAL_FONTFACE_URL_RE.source, LOCAL_FONTFACE_URL_RE.flags);
+      let urlMatch: RegExpExecArray | null;
+      while ((urlMatch = urlRe.exec(block)) !== null) {
+        const localPath = urlMatch[1];
+        if (!localPath || embedded.has(localPath)) continue;
+        const absPath = localPath.startsWith("/") ? localPath : resolve(projectDir, localPath);
+        if (!isPathInside(absPath, projectDir)) continue;
+        if (!existsSync(absPath)) continue;
+        const ext = absPath.match(/\.(woff2?|ttf|otf|ttc)$/i)?.[1]?.toLowerCase() ?? "ttf";
+        try {
+          const buffer = readFileSync(absPath);
+          const dataUri = await toDataUri(buffer, ext);
+          result = result.replaceAll(localPath, dataUri);
+          embedded.add(localPath);
+          defaultLogger.info(
+            `[Compiler] Embedded local font file: ${localPath} (${(buffer.length / 1024).toFixed(0)} KB → data URI)`,
+          );
+        } catch {
+          // File read or compression failed — keep the original path
+        }
+      }
+    }
+  }
+  return result;
 }
 
 /**
@@ -879,6 +1301,20 @@ export interface CompileForRenderOptions {
    * `false` preserves the in-process behavior.
    */
   failClosedFontFetch?: boolean;
+  /**
+   * When `true`, fonts not resolved by the bundled alias map or Google Fonts
+   * are located on the local filesystem, compressed to woff2, and embedded.
+   * Default `true` for local renders. Distributed callers pass `false` to
+   * prevent host-specific font capture from leaking into the planDir.
+   */
+  allowSystemFontCapture?: boolean;
+  /**
+   * Optional persistent cache directory for prep-time animated GIF → WebM
+   * transcodes. When omitted, the render's downloadDir is used.
+   */
+  animatedGifCacheDir?: string;
+  /** FFmpeg timeout for animated GIF transcodes. */
+  ffmpegProcessTimeout?: number;
 }
 
 const GSAP_CDN_BASE = "https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/";
@@ -890,7 +1326,7 @@ function rewriteUnresolvableGsapToCdn(html: string, projectDir: string): string 
       if (/^https?:\/\//i.test(src)) return full;
       const absPath = resolve(projectDir, src);
       if (existsSync(absPath)) return full;
-      console.log(
+      defaultLogger.info(
         `[Compiler] Rewriting missing gsap script to CDN: ${src} → ${GSAP_CDN_BASE}${file}`,
       );
       return `${prefix}${GSAP_CDN_BASE}${file}${suffix}`;
@@ -902,6 +1338,7 @@ function rewriteUnresolvableGsapToCdn(html: string, projectDir: string): string 
  * Compile an HTML composition project into a single self-contained HTML string
  * with all media metadata resolved.
  */
+// fallow-ignore-next-line complexity
 export async function compileForRender(
   projectDir: string,
   htmlPath: string,
@@ -949,7 +1386,10 @@ export async function compileForRender(
     injectTextRenderingRule(
       coalesceHeadStylesAndBodyScripts(promoteCssImportsToLinkTags(sanitizedHtml)),
     ),
-    { failClosedFontFetch: options.failClosedFontFetch === true },
+    {
+      failClosedFontFetch: options.failClosedFontFetch === true,
+      allowSystemFontCapture: options.allowSystemFontCapture,
+    },
   );
 
   // Download CDN scripts and inline them AFTER coalescing. This order matters:
@@ -958,11 +1398,6 @@ export async function compileForRender(
   // become an inline script that gets moved after local <script src="script.js">
   // tags that depend on it, causing "gsap is not defined" errors.
   const assembledHtml = await inlineExternalScripts(coalescedHtml);
-
-  // Collect assets that resolve outside projectDir (e.g. ../shared-assets/hero.png).
-  // These can't be served by the file server, so we map them to paths the
-  // orchestrator will copy into the compiled output directory.
-  const { html: htmlWithAssets, externalAssets } = collectExternalAssets(assembledHtml, projectDir);
 
   // Inject studio position seek re-apply script when positions are baked into HTML.
   // GSAP overwrites the `translate` CSS property on every frame seek; this script
@@ -974,13 +1409,73 @@ export async function compileForRender(
     'data-hf-studio-rotation="true"',
     'data-hf-studio-motion="',
   ];
-  const hasPositionEdits = HF_POSITION_ATTRS.some((attr) => htmlWithAssets.includes(attr));
-  const html = hasPositionEdits
-    ? htmlWithAssets.replace(
+  const hasPositionEdits = HF_POSITION_ATTRS.some((attr) => assembledHtml.includes(attr));
+  const htmlWithPositionScript = hasPositionEdits
+    ? assembledHtml.replace(
         /<\/body>/i,
         `<script>${createStudioPositionSeekReapplyScript()}</script></body>`,
       )
-    : htmlWithAssets;
+    : assembledHtml;
+
+  // Download remote <video> and <audio> sources to compiledDir and rewrite the
+  // src attributes so the renderer reads from localhost. Remote S3 URLs cause
+  // Chrome to spend the entire pageReadyTimeout buffering 10+ large video files
+  // over the network; any that don't reach readyState >= 2 in time render as
+  // blank black frames. Localising them eliminates the race.
+  const { html: htmlWithLocalMedia, remoteMediaAssets } = await localizeRemoteMediaSources(
+    htmlWithPositionScript,
+    downloadDir,
+  );
+
+  // Download remote <img> sources. Same race shape as video/audio: the
+  // readiness gate can pass before Chrome decodes the pixels, and Chrome can
+  // evict decoded pixels mid-render and re-fetch, producing intermittent
+  // blank-frame flicker. Localising to disk removes both races.
+  const { html: htmlWithLocalImages, remoteMediaAssets: remoteImageAssets } =
+    await localizeRemoteImageSources(htmlWithLocalMedia, downloadDir);
+
+  // Download remote @font-face src URLs and rewrite to local paths.
+  // Remote font URLs fail with a CORS rejection at render time (S3 does not
+  // allow http://localhost:PORT as origin), causing Chrome to silently fall
+  // back to the next font in the stack.
+  const { html: htmlWithLocalizedFonts, remoteMediaAssets: remoteFontAssets } =
+    await localizeRemoteFontFaces(htmlWithLocalImages, downloadDir);
+
+  const gifSourceAssets = new Map<string, string>(remoteImageAssets);
+  const {
+    html: htmlWithPreparedGifs,
+    preparedAssets: preparedGifAssets,
+    preparedGifs,
+  } = await prepareAnimatedGifInputs(htmlWithLocalizedFonts, {
+    projectDir,
+    downloadDir,
+    cacheDir: options.animatedGifCacheDir,
+    sourceAssets: gifSourceAssets,
+    timeoutMs: options.ffmpegProcessTimeout,
+  });
+  if (preparedGifs.length > 0) {
+    defaultLogger.info(`[Compiler] Prepared ${preparedGifs.length} animated GIF input(s) as WebM`);
+  }
+
+  const embeddedHtml = await embedLocalFontFaces(htmlWithPreparedGifs, projectDir);
+
+  // Collect assets that resolve outside projectDir (e.g. ../shared-assets/hero.png).
+  // These can't be served by the file server, so we map them to paths the
+  // orchestrator will copy into the compiled output directory.
+  const { html, externalAssets } = collectExternalAssets(embeddedHtml, projectDir);
+
+  for (const [relPath, absPath] of remoteMediaAssets) {
+    externalAssets.set(relPath, absPath);
+  }
+  for (const [relPath, absPath] of remoteImageAssets) {
+    externalAssets.set(relPath, absPath);
+  }
+  for (const [relPath, absPath] of remoteFontAssets) {
+    externalAssets.set(relPath, absPath);
+  }
+  for (const [relPath, absPath] of preparedGifAssets) {
+    externalAssets.set(relPath, absPath);
+  }
 
   // Parse main HTML elements
   const mainVideos = parseVideoElements(html);
@@ -1003,7 +1498,7 @@ export async function compileForRender(
     Promise.all([analyzeKeyframeIntervals(videoPath), extractMediaMetadata(videoPath)])
       .then(([analysis, metadata]) => {
         if (analysis.isProblematic) {
-          console.warn(
+          defaultLogger.warn(
             `[Compiler] WARNING: Video "${video.id}" has sparse keyframes (max interval: ${analysis.maxIntervalSeconds}s). ` +
               `This causes seek failures and frame freezing. Re-encode with: ${reencode}`,
           );

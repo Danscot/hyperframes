@@ -1,39 +1,44 @@
-import { useCallback } from "react";
-import { usePlayerStore } from "../player";
+import { useCallback, useRef } from "react";
+import { findUnsafeDomPatchValues } from "@hyperframes/core/studio-api/finite-mutation";
 import { FONT_EXT } from "../utils/mediaTypes";
-import type { PatchOperation } from "../utils/sourcePatcher";
+
 import { trackStudioEvent } from "../utils/studioTelemetry";
-import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
 import { primaryFontFamilyValue } from "../utils/studioFontHelpers";
-import { getDomEditTargetKey, type DomEditSelection } from "../components/editor/domEditing";
-import {
-  applyStudioPathOffset,
-  applyStudioBoxSize,
-  applyStudioRotation,
-  clearStudioPathOffset,
-  clearStudioBoxSize,
-  clearStudioRotation,
-} from "../components/editor/manualEdits";
-import {
-  buildPathOffsetPatches,
-  buildBoxSizePatches,
-  buildRotationPatches,
-  buildClearPathOffsetPatches,
-  buildClearBoxSizePatches,
-  buildClearRotationPatches,
-  buildMotionPatches,
-  buildClearMotionPatches,
-} from "../components/editor/manualEditsDom";
-import {
-  writeStudioMotionToElement,
-  clearStudioMotionFromElement,
-  applyStudioMotionFromDom,
-  type StudioGsapMotion,
-} from "../components/editor/studioMotion";
+import { createStudioSaveHttpError } from "../utils/studioSaveDiagnostics";
+import { buildDomEditPatchTarget, type DomEditSelection } from "../components/editor/domEditing";
 import { fontFamilyFromAssetPath, type ImportedFontAsset } from "../components/editor/fontAssets";
-import type { DomEditGroupPathOffsetCommit } from "../components/editor/DomEditOverlay";
 import type { EditHistoryKind } from "../utils/editHistory";
+import type { PersistDomEditOperations } from "./domEditCommitTypes";
+import { useDomEditPositionPatchCommit } from "./useDomEditPositionPatchCommit";
 import { useDomEditTextCommits } from "./useDomEditTextCommits";
+import { useDomGeometryCommits } from "./useDomGeometryCommits";
+import { useElementLifecycleOps } from "./useElementLifecycleOps";
+
+// Re-export so existing consumers keep their import path
+export { GSAP_CSS_FALLBACK_BLOCKED_MESSAGE } from "./useDomGeometryCommits";
+
+// ── Helpers ──
+
+function formatUnsafeFieldList(fields: Array<{ path: string }>): string {
+  return fields.map((field) => field.path).join(", ");
+}
+
+async function readErrorResponseBody(
+  response: Response,
+): Promise<{ error?: string; fields?: string[] } | null> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) return null;
+  return (await response.json().catch(() => null)) as { error?: string; fields?: string[] } | null;
+}
+
+function formatPatchRejectionMessage(body: { error?: string; fields?: string[] } | null): string {
+  if (!body?.error) return "Couldn't save edit";
+  const fields = Array.isArray(body.fields)
+    ? body.fields.filter((field): field is string => typeof field === "string")
+    : [];
+  const suffix = fields.length > 0 ? ` (${fields.join(", ")})` : "";
+  return `Couldn't save edit: ${body.error}${suffix}`;
+}
 
 // ── Types ──
 
@@ -44,17 +49,7 @@ interface RecordEditInput {
   files: Record<string, { before: string; after: string }>;
 }
 
-export type PersistDomEditOperations = (
-  selection: DomEditSelection,
-  operations: PatchOperation[],
-  options?: {
-    label?: string;
-    coalesceKey?: string;
-    skipRefresh?: boolean;
-    prepareContent?: (html: string, sourceFile: string) => string;
-    shouldSave?: () => boolean;
-  },
-) => Promise<void>;
+export type { PersistDomEditOperations } from "./domEditCommitTypes";
 
 export interface UseDomEditCommitsParams {
   activeCompPath: string | null;
@@ -81,7 +76,7 @@ export interface UseDomEditCommitsParams {
   buildDomSelectionFromTarget: (
     target: HTMLElement,
     options?: { preferClipAncestor?: boolean },
-  ) => DomEditSelection | null;
+  ) => Promise<DomEditSelection | null>;
 }
 
 // ── Hook ──
@@ -128,7 +123,11 @@ export function useDomEditCommits({
     [fileTree, projectId, importedFontAssetsRef],
   );
 
+  const reportedUnresolvableRef = useRef(new Set<string>());
+
+  // fallow-ignore-next-line complexity
   const persistDomEditOperations: PersistDomEditOperations = useCallback(
+    // fallow-ignore-next-line complexity
     async (selection, operations, options) => {
       const pid = projectIdRef.current;
       if (!pid) throw new Error("No active project");
@@ -139,7 +138,9 @@ export function useDomEditCommits({
       const readResponse = await fetch(
         `/api/projects/${pid}/files/${encodeURIComponent(targetPath)}`,
       );
-      if (!readResponse.ok) throw new Error(`Failed to read ${targetPath}`);
+      if (!readResponse.ok) {
+        throw await createStudioSaveHttpError(readResponse, `Failed to read ${targetPath}`);
+      }
       const readData = (await readResponse.json()) as { content?: string };
       const originalContent = readData.content;
       if (typeof originalContent !== "string") {
@@ -148,30 +149,58 @@ export function useDomEditCommits({
 
       if (options?.shouldSave && !options.shouldSave()) return;
 
-      const patchTarget: { id?: string | null; selector?: string; selectorIndex?: number } = {
-        id: selection.id,
-        selector: selection.selector,
-        selectorIndex: selection.selectorIndex,
-      };
+      const patchTarget = buildDomEditPatchTarget(selection);
+      const patchBody = { target: patchTarget, operations };
+      const unsafeFields = findUnsafeDomPatchValues(patchBody);
+      if (unsafeFields.length > 0) {
+        const fields = formatUnsafeFieldList(unsafeFields);
+        showToast("Couldn't save edit because it contains invalid layout values", "error");
+        throw new Error(`DOM patch contains unsafe values: ${fields}`);
+      }
+
+      // Mark the save timestamp before the file write so the SSE file-change
+      // handler suppresses the reload even if the event arrives before the
+      // response (the server writes the file and emits SSE during the fetch).
+      domEditSaveTimestampRef.current = Date.now();
 
       const patchResponse = await fetch(
         `/api/projects/${pid}/file-mutations/patch-element/${encodeURIComponent(targetPath)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ target: patchTarget, operations }),
+          body: JSON.stringify(patchBody),
         },
       );
-      if (!patchResponse.ok) throw new Error(`Failed to patch ${targetPath}`);
+      if (!patchResponse.ok) {
+        showToast(formatPatchRejectionMessage(await readErrorResponseBody(patchResponse)), "error");
+        throw await createStudioSaveHttpError(patchResponse, `Failed to patch ${targetPath}`);
+      }
 
       const patchData = (await patchResponse.json()) as {
         ok?: boolean;
         changed?: boolean;
+        matched?: boolean;
         content?: string;
       };
 
       if (!patchData.changed) {
-        throw new Error(`Unable to patch ${selection.selector ?? selection.id ?? "selection"}`);
+        if (patchData.matched === false) {
+          const targetKey = selection.selector ?? selection.id ?? "selection";
+          if (!reportedUnresolvableRef.current.has(targetKey)) {
+            reportedUnresolvableRef.current.add(targetKey);
+            trackStudioEvent("save_skipped_unresolvable", {
+              target_id: selection.id ?? undefined,
+              target_selector: selection.selector ?? undefined,
+              target_source_file: selection.sourceFile ?? undefined,
+              composition: activeCompPath ?? undefined,
+            });
+            console.warn(
+              `[studio] Element not found in source: ${targetKey}. ` +
+                "This element may be generated at runtime and cannot be persisted.",
+            );
+          }
+        }
+        return;
       }
 
       const patchedContent =
@@ -192,9 +221,7 @@ export function useDomEditCommits({
         files: { [targetPath]: { before: originalContent, after: finalContent } },
       });
 
-      if (options?.skipRefresh) {
-        domEditSaveTimestampRef.current = Date.now();
-      } else {
+      if (!options?.skipRefresh) {
         reloadPreview();
       }
     },
@@ -205,6 +232,7 @@ export function useDomEditCommits({
       projectIdRef,
       domEditSaveTimestampRef,
       reloadPreview,
+      showToast,
     ],
   );
 
@@ -230,239 +258,42 @@ export function useDomEditCommits({
     resolveImportedFontAsset,
   });
 
-  // ── Position patch helper ──
+  // ── Position patch helper (shared by geometry + lifecycle hooks) ──
 
-  const commitPositionPatchToHtml = useCallback(
-    (
-      selection: DomEditSelection,
-      patches: PatchOperation[],
-      options: { label: string; coalesceKey: string; skipRefresh?: boolean },
-    ) => {
-      void queueDomEditSave(async () => {
-        await persistDomEditOperations(selection, patches, {
-          label: options.label,
-          coalesceKey: options.coalesceKey,
-          skipRefresh: options.skipRefresh ?? true,
-        });
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : "Failed to save position";
-        showToast(message);
-        trackStudioEvent("save_failure", {
-          source: "dom_edit",
-          label: options.label,
-          error_message: message,
-        });
-      });
-    },
-    [persistDomEditOperations, queueDomEditSave, showToast],
-  );
+  const commitPositionPatchToHtml = useDomEditPositionPatchCommit({
+    activeCompPath,
+    persistDomEditOperations,
+    queueDomEditSave,
+    showToast,
+  });
 
-  // ── Position commits ──
+  // ── Geometry commits (path offset, box size, rotation) ──
 
-  const handleDomPathOffsetCommit = useCallback(
-    (selection: DomEditSelection, next: { x: number; y: number }) => {
-      applyStudioPathOffset(selection.element, next);
-      commitPositionPatchToHtml(selection, buildPathOffsetPatches(selection.element), {
-        label: "Move layer",
-        coalesceKey: `path-offset:${getDomEditTargetKey(selection)}`,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
+  const {
+    handleDomPathOffsetCommit,
+    handleDomGroupPathOffsetCommit,
+    handleDomBoxSizeCommit,
+    handleDomRotationCommit,
+    handleDomManualEditsReset,
+  } = useDomGeometryCommits({
+    previewIframeRef,
+    showToast,
+    commitPositionPatchToHtml,
+  });
 
-  const handleDomGroupPathOffsetCommit = useCallback(
-    (updates: DomEditGroupPathOffsetCommit[]) => {
-      if (updates.length === 0) return;
-      const coalesceKey = updates
-        .map((u) => getDomEditTargetKey(u.selection))
-        .sort()
-        .join(":");
-      for (const { selection, next } of updates) {
-        applyStudioPathOffset(selection.element, next);
-        commitPositionPatchToHtml(selection, buildPathOffsetPatches(selection.element), {
-          label: `Move ${updates.length} layers`,
-          coalesceKey: `group-path-offset:${coalesceKey}`,
-        });
-      }
-    },
-    [commitPositionPatchToHtml],
-  );
+  // ── Element lifecycle (delete, z-index reorder) ──
 
-  const handleDomBoxSizeCommit = useCallback(
-    (selection: DomEditSelection, next: { width: number; height: number }) => {
-      applyStudioBoxSize(selection.element, next);
-      commitPositionPatchToHtml(selection, buildBoxSizePatches(selection.element), {
-        label: "Resize layer box",
-        coalesceKey: `box-size:${getDomEditTargetKey(selection)}`,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
-
-  const handleDomRotationCommit = useCallback(
-    (selection: DomEditSelection, next: { angle: number }) => {
-      applyStudioRotation(selection.element, next);
-      commitPositionPatchToHtml(selection, buildRotationPatches(selection.element), {
-        label: "Rotate layer",
-        coalesceKey: `rotation:${getDomEditTargetKey(selection)}`,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
-
-  const handleDomManualEditsReset = useCallback(
-    (selection: DomEditSelection) => {
-      const element = selection.element;
-      const clearPatches = [
-        ...buildClearPathOffsetPatches(element),
-        ...buildClearBoxSizePatches(element),
-        ...buildClearRotationPatches(element),
-      ];
-      clearStudioPathOffset(element);
-      clearStudioBoxSize(element);
-      clearStudioRotation(element);
-      // skipRefresh:false triggers reloadPreview() which re-syncs selection on load
-      commitPositionPatchToHtml(selection, clearPatches, {
-        label: "Reset layer edits",
-        coalesceKey: `manual-reset:${getDomEditTargetKey(selection)}`,
-        skipRefresh: false,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
-
-  // ── Motion commits (HTML-attribute–backed) ──
-
-  const handleDomMotionCommit = useCallback(
-    (
-      selection: DomEditSelection,
-      motion: Omit<StudioGsapMotion, "kind" | "target" | "updatedAt">,
-    ) => {
-      // 1. Write motion data as JSON attribute on the element
-      writeStudioMotionToElement(selection.element, motion);
-      // 2. Apply the GSAP timeline from DOM attributes
-      let doc: Document | null = null;
-      try {
-        doc = previewIframeRef.current?.contentDocument ?? null;
-      } catch {
-        // cross-origin guard
-      }
-      if (doc) applyStudioMotionFromDom(doc);
-      // 3. Build patches and persist to HTML
-      const patches = buildMotionPatches(selection.element);
-      commitPositionPatchToHtml(selection, patches, {
-        label: "Set GSAP motion",
-        coalesceKey: `motion:${getDomEditTargetKey(selection)}`,
-      });
-      refreshDomEditSelectionFromPreview(selection);
-    },
-    [commitPositionPatchToHtml, previewIframeRef, refreshDomEditSelectionFromPreview],
-  );
-
-  const handleDomMotionClear = useCallback(
-    (selection: DomEditSelection) => {
-      const clearPatches = buildClearMotionPatches(selection.element);
-      // Get gsap from the preview window for proper cleanup
-      let gsap: { set?: (target: HTMLElement, vars: Record<string, unknown>) => void } | undefined;
-      try {
-        gsap = (previewIframeRef.current?.contentWindow as { gsap?: typeof gsap })?.gsap;
-      } catch {
-        // cross-origin guard
-      }
-      clearStudioMotionFromElement(selection.element, gsap);
-      let doc: Document | null = null;
-      try {
-        doc = previewIframeRef.current?.contentDocument ?? null;
-      } catch {
-        // cross-origin guard
-      }
-      if (doc) applyStudioMotionFromDom(doc);
-      commitPositionPatchToHtml(selection, clearPatches, {
-        label: "Clear GSAP motion",
-        coalesceKey: `motion:${getDomEditTargetKey(selection)}`,
-        skipRefresh: false,
-      });
-      refreshDomEditSelectionFromPreview(selection);
-    },
-    [commitPositionPatchToHtml, previewIframeRef, refreshDomEditSelectionFromPreview],
-  );
-
-  const handleDomEditElementDelete = useCallback(
-    async (selection: DomEditSelection) => {
-      const pid = projectIdRef.current;
-      if (!pid) return;
-      const label = selection.label || selection.id || selection.selector || selection.tagName;
-
-      const targetPath = selection.sourceFile || activeCompPath || "index.html";
-      try {
-        const response = await fetch(
-          `/api/projects/${pid}/files/${encodeURIComponent(targetPath)}`,
-        );
-        if (!response.ok) throw new Error(`Failed to read ${targetPath}`);
-
-        const data = (await response.json()) as { content?: string };
-        const originalContent = data.content;
-        if (typeof originalContent !== "string")
-          throw new Error(`Missing file contents for ${targetPath}`);
-
-        const patchTarget: { id?: string; selector?: string; selectorIndex?: number } = selection.id
-          ? {
-              id: selection.id,
-              selector: selection.selector,
-              selectorIndex: selection.selectorIndex,
-            }
-          : selection.selector
-            ? { selector: selection.selector, selectorIndex: selection.selectorIndex }
-            : ({} as never);
-        if (!patchTarget.id && !patchTarget.selector) {
-          throw new Error("Selected element has no patchable target");
-        }
-
-        const removeResponse = await fetch(
-          `/api/projects/${pid}/file-mutations/remove-element/${encodeURIComponent(targetPath)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ target: patchTarget }),
-          },
-        );
-        if (!removeResponse.ok) throw new Error(`Failed to delete element from ${targetPath}`);
-
-        const removeData = (await removeResponse.json()) as { changed?: boolean; content?: string };
-        const patchedContent =
-          typeof removeData.content === "string" ? removeData.content : originalContent;
-
-        domEditSaveTimestampRef.current = Date.now();
-        await saveProjectFilesWithHistory({
-          projectId: pid,
-          label: "Delete element",
-          kind: "timeline",
-          files: { [targetPath]: patchedContent },
-          readFile: async () => originalContent,
-          writeFile: writeProjectFile,
-          recordEdit: editHistory.recordEdit,
-        });
-
-        clearDomSelection();
-        usePlayerStore.getState().setSelectedElementId(null);
-        reloadPreview();
-        showToast(`Deleted ${label}. Use Undo to restore it.`, "info");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to delete element";
-        showToast(message);
-      }
-    },
-    [
-      activeCompPath,
-      clearDomSelection,
-      domEditSaveTimestampRef,
-      editHistory.recordEdit,
-      projectIdRef,
-      reloadPreview,
-      showToast,
-      writeProjectFile,
-    ],
-  );
+  const { handleDomEditElementDelete, handleDomZIndexReorderCommit } = useElementLifecycleOps({
+    activeCompPath,
+    showToast,
+    writeProjectFile,
+    domEditSaveTimestampRef,
+    editHistory,
+    projectIdRef,
+    reloadPreview,
+    clearDomSelection,
+    commitPositionPatchToHtml,
+  });
 
   return {
     resolveImportedFontAsset,
@@ -479,8 +310,7 @@ export function useDomEditCommits({
     handleDomBoxSizeCommit,
     handleDomRotationCommit,
     handleDomManualEditsReset,
-    handleDomMotionCommit,
-    handleDomMotionClear,
     handleDomEditElementDelete,
+    handleDomZIndexReorderCommit,
   };
 }

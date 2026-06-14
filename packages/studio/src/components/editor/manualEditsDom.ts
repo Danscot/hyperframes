@@ -32,6 +32,7 @@ import {
 } from "./manualEditsTypes";
 import { roundRotationAngle } from "./manualEditsParsing";
 import { applyStudioMotionFromDom } from "./studioMotion";
+import { gsapAnimatesProperty } from "./gsapAnimatesProperty";
 
 /* ── Gesture tracking ─────────────────────────────────────────────── */
 let studioManualEditGestureId = 0;
@@ -48,7 +49,7 @@ export function endStudioManualEditGesture(element: HTMLElement, token?: string)
   element.removeAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR);
 }
 
-export function isStudioManualEditGestureActive(element: HTMLElement): boolean {
+function isStudioManualEditGestureActive(element: HTMLElement): boolean {
   return element.hasAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR);
 }
 
@@ -213,13 +214,17 @@ function writeStudioPathOffsetVars(
 
 // GSAP 3.x reads the resolved CSS `translate` individual property at initialization and bakes it
 // into element.style.transform (as a matrix) on every seek. When the studio's reapply hook also
-// writes `translate`, both properties compose additively, doubling the visual offset. This helper
-// zeroes out only the translate component (m41/m42) so the `translate` prop isn't double-counted.
+// writes `translate`, both properties compose additively, doubling the visual offset.
+//
+// This helper subtracts only the baked studio offset from m41/m42, preserving any GSAP animation
+// contribution (e.g. a tween animating y: -20). The studio offset is read from the CSS custom
+// properties which tell us exactly how much was baked from the CSS translate.
 function isIdentityAfterTranslateStrip(m: DOMMatrix): boolean {
   return m.is2D && m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1;
 }
 
 function stripGsapTranslateFromTransform(element: HTMLElement): void {
+  if (element.hasAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR)) return;
   const transform = element.style.getPropertyValue("transform");
   if (!transform || transform === "none") return;
   const DOMMatrixCtor = (element.ownerDocument.defaultView as (Window & typeof globalThis) | null)
@@ -228,9 +233,14 @@ function stripGsapTranslateFromTransform(element: HTMLElement): void {
   try {
     const m = new DOMMatrixCtor(transform);
     if (m.m41 === 0 && m.m42 === 0) return;
-    m.m41 = 0;
-    m.m42 = 0;
-    if (isIdentityAfterTranslateStrip(m)) {
+    const offsetX = readPxCustomProperty(element, STUDIO_OFFSET_X_PROP);
+    const offsetY = readPxCustomProperty(element, STUDIO_OFFSET_Y_PROP);
+    const angle = Math.atan2(m.b, m.a);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    m.m41 -= offsetX * cos - offsetY * sin;
+    m.m42 -= offsetX * sin + offsetY * cos;
+    if (Math.abs(m.m41) < 0.01 && Math.abs(m.m42) < 0.01 && isIdentityAfterTranslateStrip(m)) {
       element.style.removeProperty("transform");
     } else {
       element.style.setProperty("transform", m.toString());
@@ -264,11 +274,45 @@ export function applyStudioPathOffsetDraft(
 ): void {
   promoteInlineForTransform(element);
   writeStudioPathOffsetVars(element, offset, { updateBase: false });
-  element.style.setProperty(
-    "translate",
-    composeTranslateValue(element, `${Math.round(offset.x)}px`, `${Math.round(offset.y)}px`),
-  );
-  stripGsapTranslateFromTransform(element);
+
+  const isGsapAnimated = gsapAnimatesProperty(element, "x", "y");
+  if (isGsapAnimated) {
+    element.style.setProperty("translate", "none");
+    const win = element.ownerDocument.defaultView as
+      | (Window & {
+          gsap?: {
+            set: (el: Element, vars: Record<string, unknown>) => void;
+            getProperty: (el: Element, prop: string) => number;
+          };
+        })
+      | null;
+    if (win?.gsap) {
+      const baseX = Number.parseFloat(element.getAttribute("data-hf-drag-gsap-base-x") ?? "");
+      const baseY = Number.parseFloat(element.getAttribute("data-hf-drag-gsap-base-y") ?? "");
+      const origX = Number.parseFloat(element.getAttribute("data-hf-drag-initial-offset-x") ?? "");
+      const origY = Number.parseFloat(element.getAttribute("data-hf-drag-initial-offset-y") ?? "");
+      const gsapBaseX = Number.isFinite(baseX)
+        ? baseX
+        : (win.gsap.getProperty(element, "x") as number);
+      const gsapBaseY = Number.isFinite(baseY)
+        ? baseY
+        : (win.gsap.getProperty(element, "y") as number);
+      if (!Number.isFinite(baseX))
+        element.setAttribute("data-hf-drag-gsap-base-x", String(gsapBaseX));
+      if (!Number.isFinite(baseY))
+        element.setAttribute("data-hf-drag-gsap-base-y", String(gsapBaseY));
+      const deltaX = offset.x - (Number.isFinite(origX) ? origX : 0);
+      const deltaY = offset.y - (Number.isFinite(origY) ? origY : 0);
+      win.gsap.set(element, { x: gsapBaseX + deltaX, y: gsapBaseY + deltaY });
+    }
+  } else {
+    // Non-GSAP elements: use CSS translate as before.
+    element.style.setProperty(
+      "translate",
+      composeTranslateValue(element, `${Math.round(offset.x)}px`, `${Math.round(offset.y)}px`),
+    );
+    stripGsapTranslateFromTransform(element);
+  }
 }
 
 /* ── Box size apply ───────────────────────────────────────────────── */
@@ -462,43 +506,48 @@ export function applyStudioRotationDraft(element: HTMLElement, rotation: { angle
   );
 }
 
-/* ── HTML patch builders (re-exported from manualEditsDomPatches) ── */
-export {
-  buildPathOffsetPatches,
-  buildClearPathOffsetPatches,
-  buildBoxSizePatches,
-  buildClearBoxSizePatches,
-  buildRotationPatches,
-  buildClearRotationPatches,
-  buildMotionPatches,
-  buildClearMotionPatches,
-} from "./manualEditsDomPatches";
-
 /* ── Seek reapply (position + motion) ────────────────────────────── */
 
 function queryStudioElements(doc: Document, attr: string): HTMLElement[] {
   const ctor = doc.defaultView?.HTMLElement;
   if (!ctor) return [];
-  return Array.from(doc.querySelectorAll(`[${attr}="true"]`)).filter(
+  const elements = Array.from(doc.querySelectorAll(`[${attr}="true"]`)).filter(
     (el): el is HTMLElement => el instanceof ctor,
   );
+  // Handle legacy HTML files where attributes were persisted with a double data- prefix
+  const legacyAttr = `data-${attr}`;
+  for (const el of doc.querySelectorAll(`[${legacyAttr}="true"]`)) {
+    if (el instanceof ctor && !el.hasAttribute(attr)) {
+      el.setAttribute(attr, "true");
+      el.removeAttribute(legacyAttr);
+      elements.push(el);
+    }
+  }
+  return elements;
 }
 
 function reapplyPathOffsets(doc: Document): void {
   for (const el of queryStudioElements(doc, STUDIO_PATH_OFFSET_ATTR)) {
+    const gsapSkip = gsapAnimatesProperty(el, "x", "y");
     const x = el.style.getPropertyValue(STUDIO_OFFSET_X_PROP);
     const y = el.style.getPropertyValue(STUDIO_OFFSET_Y_PROP);
+    if (gsapSkip) continue;
     if (x || y) {
-      applyStudioPathOffset(el, {
-        x: Number.parseFloat(x) || 0,
-        y: Number.parseFloat(y) || 0,
-      });
+      applyStudioPathOffset(
+        el,
+        {
+          x: Number.parseFloat(x) || 0,
+          y: Number.parseFloat(y) || 0,
+        },
+        { updateBase: false },
+      );
     }
   }
 }
 
 function reapplyBoxSizes(doc: Document): void {
   for (const el of queryStudioElements(doc, STUDIO_BOX_SIZE_ATTR)) {
+    if (gsapAnimatesProperty(el, "width", "height")) continue;
     const w = Number.parseFloat(el.style.getPropertyValue(STUDIO_WIDTH_PROP));
     const h = Number.parseFloat(el.style.getPropertyValue(STUDIO_HEIGHT_PROP));
     if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {

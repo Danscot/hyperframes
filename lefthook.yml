@@ -19,7 +19,17 @@ pre-commit:
     # fails on issues introduced by the branch, not inherited findings.
     fallow:
       glob: "packages/**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"
-      run: bunx fallow audit --base origin/main --fail-on-issues
+      # Unset git worktree env vars: fallow creates a temp worktree internally and
+      # GIT_DIR/GIT_INDEX_FILE (set by git in worktree hook context) break that.
+      # env -u is safe in non-worktree contexts (no-op when var is unset).
+      run: env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE bunx fallow audit --base origin/main --fail-on-issues
+    largefiles:
+      # Reject large binaries committed straight into the git pack instead of
+      # LFS. The script reads the staged set itself (via `git diff --cached`)
+      # rather than taking lefthook's `{staged_files}` expansion, which would
+      # split paths containing spaces. It skips files under the limit, anything
+      # routed through LFS, and registry/ assets. Tune via HF_MAX_NONLFS_KB.
+      run: ./scripts/check-large-files.sh
     filesize:
       # Scoped to packages/studio — the 600 LOC limit is a studio architecture
       # standard enforced as part of the App.tsx decomposition work. Player and
@@ -28,6 +38,8 @@ pre-commit:
       exclude: "(\\.test\\.(ts|tsx)$|\\.generated\\.)"
       run: |
         for f in {staged_files}; do
+          # Skip test and generated files (exclude pattern backup in case lefthook doesn't filter)
+          case "$f" in *.test.ts|*.test.tsx|*.generated.*) continue ;; esac
           lines=$(wc -l < "$f")
           if [ "$lines" -gt 600 ]; then
             echo "ERROR: $f has $lines lines (max 600)"

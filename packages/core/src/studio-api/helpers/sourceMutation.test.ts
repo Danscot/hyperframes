@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { removeElementFromHtml, patchElementInHtml } from "./sourceMutation.js";
+import {
+  removeElementFromHtml,
+  patchElementInHtml,
+  splitElementInHtml,
+  probeElementInSource,
+} from "./sourceMutation.js";
 
 describe("removeElementFromHtml", () => {
   it("removes a self-closing element by id", () => {
@@ -42,16 +47,17 @@ describe("patchElementInHtml", () => {
 </body></html>`;
 
   it("patches inline style by id", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result, matched } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "inline-style", property: "color", value: "red" },
     ]);
 
+    expect(matched).toBe(true);
     expect(result).toMatch(/color:\s*red/);
     expect(result).toContain('id="hero"');
   });
 
   it("patches inline style by class selector", () => {
-    const result = patchElementInHtml(FIXTURE, { selector: ".hero-heading" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { selector: ".hero-heading" }, [
       { type: "inline-style", property: "font-size", value: "72px" },
     ]);
 
@@ -59,15 +65,53 @@ describe("patchElementInHtml", () => {
   });
 
   it("patches data attribute", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "attribute", property: "hf-studio-path-offset", value: "true" },
     ]);
 
     expect(result).toContain('data-hf-studio-path-offset="true"');
   });
 
+  it("does not double data- prefix when property already has it", () => {
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
+      { type: "attribute", property: "data-hf-studio-path-offset", value: "true" },
+    ]);
+
+    expect(result).toContain('data-hf-studio-path-offset="true"');
+    expect(result).not.toContain("data-data-hf-studio-path-offset");
+  });
+
+  it("does not double data- prefix for any studio attribute", () => {
+    const attrs = [
+      "data-hf-studio-path-offset",
+      "data-hf-studio-original-translate",
+      "data-hf-studio-original-inline-translate",
+      "data-hf-studio-box-size",
+      "data-hf-studio-rotation",
+    ];
+    for (const attr of attrs) {
+      const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
+        { type: "attribute", property: attr, value: "true" },
+      ]);
+      expect(result).toContain(`${attr}="true"`);
+      expect(result).not.toContain(`data-${attr}`);
+    }
+  });
+
+  it("removes attribute with data- prefix already present", () => {
+    const { html: withAttr } = patchElementInHtml(FIXTURE, { id: "hero" }, [
+      { type: "attribute", property: "data-hf-studio-path-offset", value: "true" },
+    ]);
+    expect(withAttr).toContain('data-hf-studio-path-offset="true"');
+
+    const { html: removed } = patchElementInHtml(withAttr, { id: "hero" }, [
+      { type: "attribute", property: "data-hf-studio-path-offset", value: null },
+    ]);
+    expect(removed).not.toContain("hf-studio-path-offset");
+  });
+
   it("patches html attribute", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "title", value: "greeting" },
     ]);
 
@@ -75,7 +119,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("patches text content", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "text-content", property: "", value: "New Title" },
     ]);
 
@@ -84,7 +128,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("applies multiple operations in one call", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "inline-style", property: "color", value: "blue" },
       { type: "inline-style", property: "font-size", value: "96px" },
       { type: "attribute", property: "hf-studio-path-offset", value: "true" },
@@ -96,16 +140,18 @@ describe("patchElementInHtml", () => {
   });
 
   it("finds element by composition-id selector", () => {
-    const result = patchElementInHtml(FIXTURE, { selector: '[data-composition-id="overlay"]' }, [
-      { type: "inline-style", property: "opacity", value: "0.5" },
-    ]);
+    const { html: result } = patchElementInHtml(
+      FIXTURE,
+      { selector: '[data-composition-id="overlay"]' },
+      [{ type: "inline-style", property: "opacity", value: "0.5" }],
+    );
 
     expect(result).toMatch(/opacity:\s*0\.5/);
   });
 
   it("finds element by class with selectorIndex", () => {
     const html = `<div class="item">A</div><div class="item">B</div>`;
-    const result = patchElementInHtml(html, { selector: ".item", selectorIndex: 1 }, [
+    const { html: result } = patchElementInHtml(html, { selector: ".item", selectorIndex: 1 }, [
       { type: "text-content", property: "", value: "Changed" },
     ]);
 
@@ -114,16 +160,17 @@ describe("patchElementInHtml", () => {
     expect(result).not.toContain(">B<");
   });
 
-  it("returns unchanged html when target not found", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "nonexistent" }, [
+  it("returns unchanged html and matched:false when target not found", () => {
+    const { html: result, matched } = patchElementInHtml(FIXTURE, { id: "nonexistent" }, [
       { type: "inline-style", property: "color", value: "red" },
     ]);
 
+    expect(matched).toBe(false);
     expect(result).toBe(FIXTURE);
   });
 
   it("removes inline style when value is null", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "inline-style", property: "font-size", value: null },
     ]);
 
@@ -131,16 +178,18 @@ describe("patchElementInHtml", () => {
   });
 
   it("removes attribute when value is null", () => {
-    const result = patchElementInHtml(FIXTURE, { selector: '[data-composition-id="overlay"]' }, [
-      { type: "html-attribute", property: "data-composition-src", value: null },
-    ]);
+    const { html: result } = patchElementInHtml(
+      FIXTURE,
+      { selector: '[data-composition-id="overlay"]' },
+      [{ type: "html-attribute", property: "data-composition-src", value: null }],
+    );
 
     expect(result).not.toContain("data-composition-src");
   });
 
   it("patches fragment html without doctype", () => {
     const fragment = `<div id="card" style="padding: 8px"><span>Title</span></div>`;
-    const result = patchElementInHtml(fragment, { id: "card" }, [
+    const { html: result } = patchElementInHtml(fragment, { id: "card" }, [
       { type: "inline-style", property: "padding", value: "16px" },
     ]);
 
@@ -148,7 +197,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects event handler attributes", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "onload", value: "fetch('/evil')" },
     ]);
 
@@ -157,7 +206,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects javascript: URLs in src", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "src", value: "javascript:alert(1)" },
     ]);
 
@@ -165,7 +214,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("allows aria-* and data-* attributes", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "aria-label", value: "greeting" },
       { type: "html-attribute", property: "data-custom", value: "test" },
     ]);
@@ -175,7 +224,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects srcdoc and formaction attributes", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "srcdoc", value: "<script>alert(1)</script>" },
       { type: "html-attribute", property: "formaction", value: "javascript:void(0)" },
     ]);
@@ -185,7 +234,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects on* event handlers regardless of casing", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "onClick", value: "alert(1)" },
       { type: "html-attribute", property: "ONERROR", value: "alert(2)" },
       { type: "html-attribute", property: "onmouseover", value: "alert(3)" },
@@ -195,7 +244,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects data:text/html URIs in src", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       {
         type: "html-attribute",
         property: "src",
@@ -207,7 +256,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("allows safe href values", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "href", value: "https://example.com" },
     ]);
 
@@ -215,7 +264,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects javascript: in href", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "href", value: "javascript:alert(1)" },
     ]);
 
@@ -223,7 +272,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("allows legitimate form and media attributes", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "placeholder", value: "Enter text" },
       { type: "html-attribute", property: "target", value: "_blank" },
       { type: "html-attribute", property: "rel", value: "noopener" },
@@ -237,7 +286,7 @@ describe("patchElementInHtml", () => {
   });
 
   it("rejects unknown/dangerous attributes", () => {
-    const result = patchElementInHtml(FIXTURE, { id: "hero" }, [
+    const { html: result } = patchElementInHtml(FIXTURE, { id: "hero" }, [
       { type: "html-attribute", property: "xmlns", value: "http://evil.com" },
       { type: "html-attribute", property: "background", value: "http://evil.com/bg.js" },
       { type: "html-attribute", property: "dynsrc", value: "http://evil.com/vid.avi" },
@@ -246,5 +295,225 @@ describe("patchElementInHtml", () => {
     expect(result).not.toContain("xmlns");
     expect(result).not.toContain("background=");
     expect(result).not.toContain("dynsrc");
+  });
+});
+
+describe("probeElementInSource", () => {
+  const FIXTURE = `<!doctype html><html><head></head><body>
+<div id="root" data-composition-id="main">
+  <div class="layer" data-composition-id="overlay" data-composition-src="compositions/overlay.html">
+    <div class="chrome">
+      <span class="brand">HyperFrames</span>
+    </div>
+  </div>
+  <div id="hero" class="hero-heading" style="font-size: 48px">Hello World</div>
+</div>
+</body></html>`;
+
+  it("returns true for an element found by id", () => {
+    expect(probeElementInSource(FIXTURE, { id: "hero" })).toBe(true);
+  });
+
+  it("returns true for an element found by class selector", () => {
+    expect(probeElementInSource(FIXTURE, { selector: ".hero-heading" })).toBe(true);
+  });
+
+  it("returns true for an element found by data-composition-id selector", () => {
+    expect(probeElementInSource(FIXTURE, { selector: '[data-composition-id="overlay"]' })).toBe(
+      true,
+    );
+  });
+
+  it("returns false for an id that does not exist in source", () => {
+    expect(probeElementInSource(FIXTURE, { id: "arrows-svg" })).toBe(false);
+  });
+
+  it("returns false for a class selector that does not exist", () => {
+    expect(probeElementInSource(FIXTURE, { selector: ".phone-frame" })).toBe(false);
+  });
+
+  it("returns false when target has neither id nor selector", () => {
+    expect(probeElementInSource(FIXTURE, {})).toBe(false);
+  });
+
+  it("returns true for class selector with valid selectorIndex", () => {
+    const html = `<div class="item">A</div><div class="item">B</div>`;
+    expect(probeElementInSource(html, { selector: ".item", selectorIndex: 1 })).toBe(true);
+  });
+
+  it("returns false for class selector with out-of-bounds selectorIndex", () => {
+    const html = `<div class="item">A</div><div class="item">B</div>`;
+    expect(probeElementInSource(html, { selector: ".item", selectorIndex: 5 })).toBe(false);
+  });
+
+  it("returns false for an element that would only exist after JS execution", () => {
+    const sourceHtml = `<!doctype html><html><head></head><body>
+<div id="root" data-composition-id="main">
+  <div id="canvas"></div>
+  <script>
+    const svg = document.createElement("div");
+    svg.id = "arrows-svg";
+    document.getElementById("canvas").appendChild(svg);
+  </script>
+</div>
+</body></html>`;
+
+    expect(probeElementInSource(sourceHtml, { id: "arrows-svg" })).toBe(false);
+    expect(probeElementInSource(sourceHtml, { id: "canvas" })).toBe(true);
+  });
+});
+
+// T7 — data-hf-id targeting (spec for R1).
+// R1 adds `hfId?: string` to SourceMutationTarget and a `[data-hf-id="…"]` branch
+// in findTargetElement (sourceMutation.ts:34). Convert from it.todo in the R1 PR.
+// Covers the same surface as T3 (Studio sourcePatcher) — Core sourceMutation supports
+// all patch types (inline-style, attribute, text-content) via patchElementInHtml.
+describe("T7 — data-hf-id targeting (spec for R1)", () => {
+  it("updates inline style by data-hf-id when no HTML id attribute is present", () => {
+    const source = `<h1 data-hf-id="hf-x7k2" style="color: red">Hello</h1>`;
+    const { html, matched } = patchElementInHtml(source, { hfId: "hf-x7k2" }, [
+      { type: "inline-style", property: "color", value: "blue" },
+    ]);
+    expect(matched).toBe(true);
+    expect(html).toMatch(/color:\s*blue/);
+    expect(html).toContain('data-hf-id="hf-x7k2"');
+  });
+
+  it("updates text content by data-hf-id", () => {
+    const source = `<p data-hf-id="hf-a1b2">Old text</p>`;
+    const { html, matched } = patchElementInHtml(source, { hfId: "hf-a1b2" }, [
+      { type: "text-content", property: "", value: "New text" },
+    ]);
+    expect(matched).toBe(true);
+    expect(html).toContain("New text");
+  });
+
+  it("updates attribute by data-hf-id", () => {
+    const source = `<div data-hf-id="hf-c3d4" data-start="0"></div>`;
+    const { html, matched } = patchElementInHtml(source, { hfId: "hf-c3d4" }, [
+      { type: "attribute", property: "start", value: "2.5" },
+    ]);
+    expect(matched).toBe(true);
+    expect(html).toContain('data-start="2.5"');
+  });
+
+  it("data-hf-id attribute survives the patch (can be targeted again)", () => {
+    const source = `<h1 data-hf-id="hf-x7k2" style="color: red">Hello</h1>`;
+    const { html } = patchElementInHtml(source, { hfId: "hf-x7k2" }, [
+      { type: "inline-style", property: "color", value: "blue" },
+    ]);
+    expect(html).toContain('data-hf-id="hf-x7k2"');
+  });
+
+  it("hfId lookup falls through to selector when hfId is not found in the document", () => {
+    const source = `<h1 class="headline" style="color: red">Hello</h1>`;
+    const { html, matched } = patchElementInHtml(
+      source,
+      { hfId: "hf-missing", selector: ".headline" },
+      [{ type: "inline-style", property: "color", value: "blue" }],
+    );
+    expect(matched).toBe(true);
+    expect(html).toMatch(/color:\s*blue/);
+  });
+
+  it("does not break out of the selector on a crafted hfId (CSS injection guard)", () => {
+    // A value with a quote/bracket must be escaped, not injected — it should
+    // simply match nothing and leave the source untouched, never throw.
+    const source = `<h1 class="safe">A</h1><h1 class="victim">B</h1>`;
+    const evil = `x"] , [class="victim`;
+    const run = () =>
+      patchElementInHtml(source, { hfId: evil }, [
+        { type: "text-content", property: "textContent", value: "HACKED" },
+      ]);
+    expect(run).not.toThrow();
+    const { html, matched } = run();
+    expect(matched).toBe(false);
+    expect(html).toBe(source);
+    expect(html).not.toContain("HACKED");
+  });
+
+  // The Studio edit path targets by id/selector (it never sends hfId). Once a
+  // persisted data-hf-id exists in source, those edits must NOT strip it — else
+  // the stable handle is destroyed by the next edit. This is the preservation
+  // guarantee the write-back design depends on.
+  it("preserves an existing data-hf-id when the element is patched by id", () => {
+    const source = `<h1 id="hero" data-hf-id="hf-x7k2" style="color: red">Hello</h1>`;
+    const { html, matched } = patchElementInHtml(source, { id: "hero" }, [
+      { type: "inline-style", property: "color", value: "blue" },
+    ]);
+    expect(matched).toBe(true);
+    expect(html).toMatch(/color:\s*blue/);
+    expect(html).toContain('data-hf-id="hf-x7k2"');
+  });
+
+  it("preserves an existing data-hf-id when the element is patched by selector", () => {
+    const source = `<p class="body" data-hf-id="hf-a1b2">Old</p>`;
+    const { html, matched } = patchElementInHtml(source, { selector: ".body" }, [
+      { type: "text-content", property: "textContent", value: "New" },
+    ]);
+    expect(matched).toBe(true);
+    expect(html).toContain("New");
+    expect(html).toContain('data-hf-id="hf-a1b2"');
+  });
+});
+
+describe("splitElementInHtml — hfId clone isolation", () => {
+  it("does not copy data-hf-id to the cloned second half", () => {
+    const source = `<html><body><div data-composition-id="root"><div id="clip1" class="clip" data-start="0" data-duration="10" data-hf-id="hf-abc123"></div></div></body></html>`;
+    const { html, matched } = splitElementInHtml(source, { id: "clip1" }, 5, "clip2");
+
+    expect(matched).toBe(true);
+    const occurrences = (html.match(/data-hf-id="hf-abc123"/g) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+});
+
+describe("splitElementInHtml", () => {
+  const source = `<!DOCTYPE html><html><head><style>#box { position: absolute; top: 100px; background: red; }</style></head><body><div data-composition-id="root"><div id="box" class="clip" data-start="1" data-duration="6">Hello</div></div></body></html>`;
+
+  it("splits element at the given time", () => {
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split");
+    expect(result.matched).toBe(true);
+    expect(result.html).toContain('data-duration="2"');
+    expect(result.html).toContain('id="box-split"');
+    expect(result.html).toContain('data-start="3"');
+    expect(result.html).toContain('data-duration="4"');
+  });
+
+  it("duplicates CSS rules for the new element ID", () => {
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split");
+    expect(result.html).toContain("#box-split");
+    expect(result.html).toContain("background: red");
+    const cssMatches = result.html.match(/#box-split\s*\{/g);
+    expect(cssMatches?.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("deduplicates IDs when the requested newId already exists", () => {
+    const withExisting = source.replace(
+      "</div></div>",
+      '</div><div id="box-split" data-start="5" data-duration="1">Existing</div></div>',
+    );
+    const result = splitElementInHtml(withExisting, { id: "box" }, 3, "box-split");
+    expect(result.matched).toBe(true);
+    expect(result.html).toContain('id="box-split-2"');
+  });
+
+  it("keeps clip class on the cloned element", () => {
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split");
+    expect(result.html).toMatch(/id="box-split"[^>]*class="clip"/);
+  });
+
+  it("returns matched false for out-of-range split time", () => {
+    expect(splitElementInHtml(source, { id: "box" }, 0.5, "box-split").matched).toBe(false);
+    expect(splitElementInHtml(source, { id: "box" }, 7.5, "box-split").matched).toBe(false);
+  });
+
+  it("adjusts media playback-start for the second half", () => {
+    const mediaSource = source.replace(
+      'id="box" class="clip" data-start="1" data-duration="6"',
+      'id="box" class="clip" data-start="1" data-duration="6" data-playback-start="0"',
+    );
+    const result = splitElementInHtml(mediaSource, { id: "box" }, 3, "box-split");
+    expect(result.html).toMatch(/id="box-split"[^>]*data-playback-start="2"/);
   });
 });

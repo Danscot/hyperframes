@@ -92,9 +92,16 @@ export function toOverlayRect(
   const root =
     doc?.querySelector<HTMLElement>("[data-composition-id]") ?? doc?.documentElement ?? null;
   const rootRect = root?.getBoundingClientRect();
-  const rootWidth = rootRect?.width;
-  const rootHeight = rootRect?.height;
-  if (!rootWidth || !rootHeight) return null;
+  // Use the composition's declared dimensions (data-width/data-height) for scale
+  // calculation instead of rootRect.width/height. When GSAP applies transforms
+  // (scale, translate) to the root element, rootRect dimensions change but the
+  // composition's canonical size stays the same. Using rootRect causes overlay
+  // misalignment during animated playback.
+  const declaredWidth = readPositiveDimension(root?.getAttribute("data-width") ?? null);
+  const declaredHeight = readPositiveDimension(root?.getAttribute("data-height") ?? null);
+  const rootWidth = declaredWidth ?? rootRect?.width;
+  const rootHeight = declaredHeight ?? rootRect?.height;
+  if (!rootWidth || !rootHeight || !rootRect) return null;
 
   const elementRect = element.getBoundingClientRect();
   const rootScaleX = iframeRect.width / rootWidth;
@@ -111,8 +118,8 @@ export function toOverlayRect(
   });
 
   return {
-    left: iframeRect.left - overlayRect.left + (elementRect.left - rootRect.left) * rootScaleX,
-    top: iframeRect.top - overlayRect.top + (elementRect.top - rootRect.top) * rootScaleY,
+    left: iframeRect.left - overlayRect.left + elementRect.left * rootScaleX,
+    top: iframeRect.top - overlayRect.top + elementRect.top * rootScaleY,
     width: elementRect.width * rootScaleX,
     height: elementRect.height * rootScaleY,
     editScaleX: editScale.scaleX,
@@ -183,10 +190,11 @@ export function filterNestedDomEditGroupItems<T extends { element: HTMLElement }
 }
 
 export function selectionCacheKey(
-  selection: Pick<DomEditSelection, "id" | "selector" | "selectorIndex" | "sourceFile">,
+  selection: Pick<DomEditSelection, "id" | "hfId" | "selector" | "selectorIndex" | "sourceFile">,
 ): string {
   return [
     selection.sourceFile ?? "",
+    selection.hfId ?? "",
     selection.id ?? "",
     selection.selector ?? "",
     selection.selectorIndex ?? "",

@@ -616,13 +616,15 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     | `--hdr` | — | off | Force HDR output even if no HDR sources are detected. MP4 only. See [HDR Rendering](/guides/hdr) |
     | `--sdr` | — | off | Force SDR output even if HDR sources are detected |
     | `--workers` | 1-8 | 4 | Parallel render workers |
-    | `--gpu` | — | off | GPU encoding (NVENC, VideoToolbox, VAAPI, QSV) |
+    | `--low-memory-mode` / `--no-low-memory-mode` | — | auto (≤ 8 GB RAM) | Force the low-memory safe render profile on or off. Safe mode pins to 1 worker, uses screenshot capture, and skips auto-worker calibration so the pipeline doesn't launch multiple concurrent Chrome instances on constrained machines. Auto-detection reads **host** RAM (`os.totalmem()`), not cgroup/container limits — containerised or serverless callers (incl. `--docker`) should set `PRODUCER_LOW_MEMORY_MODE` explicitly. Env fallback `PRODUCER_LOW_MEMORY_MODE`. |
+    | `--gpu` | — | off | GPU encoding (NVENC, VideoToolbox, AMF, VAAPI, QSV) |
     | `--browser-gpu` / `--no-browser-gpu` | — | on locally, off in Docker | Use or opt out of host GPU acceleration for local Chrome/WebGL capture |
     | `--docker` | — | off | Use Docker for [deterministic rendering](/concepts/determinism) |
     | `--quiet` | — | off | Suppress verbose output |
     | `--variables` | JSON object | — | Variable overrides merged over `data-composition-variables` defaults. Read via `window.__hyperframes.getVariables()` |
     | `--variables-file` | path | — | Path to a JSON file with variable overrides (alternative to `--variables`) |
     | `--strict-variables` | — | off | Fail render if any `--variables` key is undeclared or has a wrong type vs the composition's `data-composition-variables`. Without this flag, mismatches print as warnings and the render continues. |
+    | `--browser-timeout` | seconds (0.001–86400) | 60 | Puppeteer page-navigation timeout for the entry HTML. Increase when heavy compositions (many videos, fonts, or asset requests) cannot reach `domcontentloaded` within the default 60 s. The flag takes **seconds**; the env fallback `PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS` takes **milliseconds**. This controls `page.goto` only — very heavy compositions may also need `PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS` and/or `PRODUCER_PLAYER_READY_TIMEOUT_MS` bumped (post-navigation `window.__hf` readiness has its own 45 s budget). |
 
     CRF and target bitrate default to the `--quality` preset. Use `--crf` or `--video-bitrate` for fine-grained overrides; `RenderConfig.crf` and `RenderConfig.videoBitrate` accept the same overrides programmatically.
 
@@ -803,6 +805,27 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
 
     Available topics: `data-attributes`, `examples`, `rendering`, `gsap`, `troubleshooting`, `compositions`. Run without a topic to see the full list.
 
+    ### `feedback`
+
+    Submit anonymous satisfaction feedback about your experience:
+
+    ```bash
+    # Quick rating (1 = poor, 5 = great)
+    npx hyperframes feedback --rating 5
+
+    # Rating with optional details
+    npx hyperframes feedback --rating 3 --comment "render succeeded but GSAP timeline didn't animate"
+    ```
+
+    | Flag | Description |
+    |------|-------------|
+    | `--rating` | Satisfaction score, 1–5 (required) |
+    | `--comment` | Optional free-text details |
+
+    This command is also available to AI agents after a render — see [Feedback Collection](/guides/feedback#agent-runtimes) for how agent detection and the automatic post-render hint work.
+
+    No-op when telemetry is disabled — prints `Telemetry is disabled. Feedback not sent.` and exits cleanly.
+
     ### `telemetry`
 
     Manage anonymous usage telemetry:
@@ -813,7 +836,9 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     npx hyperframes telemetry status
     ```
 
-    Telemetry collects command names, render performance, example choices, and system info — including a coarse environment fingerprint (OS, kernel string, CPU/memory shape, sandbox runtime such as gVisor or Docker, and the *name* of a coding agent driving the CLI when one is detected, e.g. `claude_code` / `codex` / `cursor`). The agent name is derived from the existence of well-known environment variables; their values are never read. Telemetry does **not** collect file paths, project names, video content, environment variable values, or personally identifiable information. Disable with `HYPERFRAMES_NO_TELEMETRY=1` or the command above.
+    Telemetry collects command names, render performance, render checkpoint/error names, aggregate browser diagnostic counts, browser initialization duration and tween count, aggregate video extraction workload counts (such as extracted frame count and VFR preflight count), example choices, and system info — including a coarse environment fingerprint (OS, kernel string, CPU/memory shape, sandbox runtime such as gVisor or Docker, and the *name* of a coding agent driving the CLI when one is detected, e.g. `claude_code` / `codex` / `cursor`). The agent name is derived from the existence of well-known environment variables; their values are never read. Telemetry redacts local paths and URL query strings from render error/checkpoint messages and does **not** collect project names, video content, environment variable values, or personally identifiable information. Disable with `HYPERFRAMES_NO_TELEMETRY=1` or the command above.
+
+    See [Feedback Collection](/guides/feedback) for how the periodic post-render prompt and Studio feedback bar work, what data they collect, and how to opt out.
 
     ### `skills`
 
@@ -859,6 +884,179 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
     This is tracked in [GH #316](https://github.com/heygen-com/hyperframes/issues/316). An upstream fix in the `skills` CLI itself is the right long-term answer; until that lands, the env var is the correct workaround.
   </Tab>
 </Tabs>
+
+## hyperframes auth
+
+Sign in to HeyGen and manage credentials. Credentials are stored in
+`~/.heygen/credentials` (mode `0600`) and are **shared with the
+`heygen` CLI** — sign in with one and the other picks up the session.
+
+Resolution order (first match wins):
+
+1. `HEYGEN_API_KEY` environment variable
+2. `HYPERFRAMES_API_KEY` environment variable (hyperframes alias)
+3. `~/.heygen/credentials`
+
+### Subcommands
+
+#### `auth login --api-key`
+
+Save a HeyGen API key. The key is verified against `GET /v3/users/me`
+before the command reports success; a rejected key is not left on disk.
+
+```bash
+# Interactive hidden-input prompt
+hyperframes auth login --api-key
+
+# Pipe a key from stdin (CI-friendly)
+echo "$HEYGEN_API_KEY" | hyperframes auth login --api-key
+```
+
+#### `auth status`
+
+Show the active credential's source, type, and verified identity
+(account + billing snapshot). Exits non-zero when nothing is configured
+or the API rejects the credential, so scripts can check sign-in state.
+
+```bash
+hyperframes auth status
+hyperframes auth status --json   # machine-readable
+```
+
+#### `auth logout`
+
+Remove the stored credential. Prompts for confirmation on a TTY.
+
+```bash
+hyperframes auth logout
+hyperframes auth logout --keep-api-key   # clear only an OAuth session
+hyperframes auth logout --yes            # skip the confirmation prompt
+```
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `HEYGEN_API_KEY` | Override the stored credential. |
+| `HYPERFRAMES_API_KEY` | Alias for `HEYGEN_API_KEY`. |
+| `HEYGEN_API_URL` | API base URL (default `https://api.heygen.com`). |
+| `HEYGEN_CONFIG_DIR` | Credentials directory (default `~/.heygen`). |
+
+## hyperframes cloud
+
+Render a HyperFrames composition on HeyGen's hosted cloud — no local Chrome, no local ffmpeg, no AWS to manage. Sign in once with `hyperframes auth login` and the same credential drives every `cloud` subcommand.
+
+```bash
+hyperframes auth login                          # one-time
+hyperframes cloud render ./my-video             # zip + upload + poll + download
+hyperframes cloud render ./my-video --no-wait   # submit and exit with the render_id
+hyperframes cloud list                          # browse recent renders
+```
+
+### Subcommands
+
+#### `cloud render [<projectDir>]`
+
+End-to-end render: zips the project (excluding `.git`, `node_modules`, `dist`, `.next`, `coverage`, dotfiles), uploads it via `POST /v3/assets`, submits `POST /v3/hyperframes/renders`, polls `GET /v3/hyperframes/renders/{id}` until the render completes or fails, and streams the resulting video to disk.
+
+Render parameters mirror the local `hyperframes render` UX where they overlap:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--fps` | `30` | Integer 1-240. |
+| `--quality` | `standard` | `draft`, `standard`, or `high`. |
+| `--format` | `mp4` | `mp4`, `webm`, or `mov`. |
+| `--resolution` | composition default | `landscape`, `portrait`, `landscape-4k`, `portrait-4k`, `square`, `square-4k`. |
+| `--composition` / `-c` | `index.html` | Entry HTML file inside the zip. |
+| `--variables` | — | Inline JSON object overriding `data-composition-variables`. |
+| `--variables-file` | — | Path to a JSON file (alternative to `--variables`). |
+| `--strict-variables` | off | Fail when variables are undeclared or have the wrong type. |
+| `--title` | — | Free-text label echoed back in detail responses. |
+| `--output` / `-o` | `renders/<render_id>.<ext>` | Local destination for the downloaded video. |
+
+Lifecycle / control flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `--no-wait` | Submit and exit immediately; print the `render_id` to stdout. |
+| `--callback-url` | HTTPS webhook fired when the render terminates (compose with `--no-wait`). |
+| `--callback-id` | Opaque tracking ID echoed in webhook payloads. |
+| `--asset-id` | Skip zip+upload; submit an already-uploaded composition. Mutually exclusive with the project dir and `--url`. |
+| `--url` | Submit a public HTTPS zip URL. Same mutual-exclusion as `--asset-id`. |
+| `--poll-interval` | Poll cadence in seconds (default `10`). |
+| `--max-wait` | Max poll duration in minutes (default `60`). |
+| `--idempotency-key` | Optional `Idempotency-Key` for safe retries (1-255 chars from `[A-Za-z0-9_:.-]`). |
+| `--json` | Emit machine-readable JSON instead of human-friendly progress. |
+
+```bash
+# Default flow — render the current directory.
+hyperframes cloud render
+
+# Pick a composition + output path.
+hyperframes cloud render . \
+  --composition compositions/intro.html \
+  --output ./renders/intro.mp4
+
+# Higher quality at 60fps.
+hyperframes cloud render --quality high --fps 60
+
+# Fire-and-forget with a webhook (no local polling).
+hyperframes cloud render --callback-url https://example.com/hf-hook --no-wait
+
+# Re-render an already-uploaded composition (skips zip + upload).
+hyperframes cloud render --asset-id asst_abc123
+
+# Render from a public URL (no upload).
+hyperframes cloud render --url https://cdn.example.com/site.zip
+```
+
+##### Safe retries via `--idempotency-key`
+
+The CLI transparently retries on a `401 Unauthorized` by force-refreshing the OAuth token and replaying the failed request. For most reads that's harmless, but `POST /v3/assets` (the zip upload) is *not* idempotent on its own — a retry without an `Idempotency-Key` would create a duplicate asset and bill the workspace twice.
+
+Pass `--idempotency-key <key>` whenever you want safe retries on `cloud render`. The key is forwarded to both the upload and submit calls; the server scopes idempotency per-endpoint, so reusing the same value across the two steps is safe and prevents duplicates on either step. Use a UUID per logical render, or any opaque string in `[A-Za-z0-9_:.-]` (1-255 chars).
+
+```bash
+hyperframes cloud render . --idempotency-key "$(uuidgen)"
+```
+
+#### `cloud list`
+
+Pages through recent renders. Cursor-based: `--limit` caps a single page (1-100), `--token` resumes from a previous `next_token`, `--all` walks the full list until exhausted.
+
+```bash
+hyperframes cloud list
+hyperframes cloud list --limit 50 --json
+hyperframes cloud list --all
+```
+
+#### `cloud get <render_id>`
+
+Fetches the full detail record for one render, including the short-lived signed `video_url` and `thumbnail_url` (presigned S3 URLs — re-fetch on demand rather than cache).
+
+```bash
+hyperframes cloud get hfr_abc123
+hyperframes cloud get hfr_abc123 --json
+```
+
+#### `cloud delete <render_id>`
+
+Soft-deletes a render. Subsequent `GET` calls return 404 and the signed video URL stops working shortly after. Prompts for confirmation interactively; pass `--no-confirm` to bypass for scripts.
+
+```bash
+hyperframes cloud delete hfr_abc123
+hyperframes cloud delete hfr_abc123 --no-confirm --json
+```
+
+### When to pick `cloud` vs `lambda` vs local render
+
+- `hyperframes render` (local): fastest iteration loop. Use during composition authoring.
+- `hyperframes lambda render`: bring-your-own-AWS distributed rendering. Use when you've already invested in AWS and want chunked parallelism on your own account.
+- `hyperframes cloud render`: zero-infra option. HeyGen runs the render; you pay per credit. Use when you don't want to manage Chrome/ffmpeg/AWS locally.
+
+### Auth + base URL
+
+`cloud` reuses the credential resolved by `hyperframes auth status`. Override the API base for staging tests with `HEYGEN_API_URL` (default `https://api.heygen.com`).
 
 ## hyperframes lambda
 
@@ -1008,6 +1206,55 @@ The actions list is deliberately broad (`Resource: "*"`) because CloudFormation 
 ### State files
 
 `hyperframes lambda` keeps per-stack metadata under `<cwd>/.hyperframes/lambda-stack-<name>.json` so the verbs don't need to call `describe-stacks` every time. Commit the file to a repo or `.gitignore` it depending on your workflow — it contains the bucket name, state-machine ARN, and region, none of which are secrets but all of which are AWS-account-identifying.
+
+## hyperframes cloudrun
+
+The Google Cloud counterpart to `hyperframes lambda`. Deploys HyperFrames distributed rendering to Cloud Run + Cloud Workflows and drives renders from your laptop or CI. Wraps the `@hyperframes/gcp-cloud-run` SDK plus `terraform` (the module shipped with the package) and `gcloud` / Cloud Build for the image.
+
+```bash
+hyperframes cloudrun deploy --project my-gcp-project
+hyperframes cloudrun render ./my-project --width 1920 --height 1080 --wait
+hyperframes cloudrun destroy --project my-gcp-project   # when you're done
+```
+
+#### `cloudrun deploy`
+
+Enables the required APIs, builds + pushes the render image via Cloud Build (unless you pass `--image`), then `terraform apply`s the module that provisions the GCS bucket, Cloud Run service, Cloud Workflows definition, two service accounts, and a runaway-request alert. Caches the resulting bucket / service URL / workflow id so later verbs don't need them re-passed.
+
+```bash
+hyperframes cloudrun deploy --project my-gcp-project --region us-central1
+hyperframes cloudrun deploy --project my-gcp-project --image us-central1-docker.pkg.dev/my-gcp-project/hyperframes/hyperframes-render:v1
+```
+
+Flags: `--project` (required), `--region` (default `us-central1`), `--image` (skip the build), `--repo` (Artifact Registry repo, default `hyperframes`). Machine sizing / scaling: `--cpu` (1/2/4/8, default 4), `--memory` (e.g. `32Gi`, default `16Gi`), `--max-instances` (render fan-out ceiling, default 100), `--timeout` (per-request seconds, max 3600). Omitted sizing flags keep the module defaults; for anything finer, apply the Terraform module directly.
+
+#### `cloudrun sites create <projectDir>`
+
+Tar + upload a project to GCS once and reuse it across renders. `--site-id` overrides the content hash. Prints the `gs://` URI.
+
+#### `cloudrun render <projectDir>`
+
+Start a distributed render. `--width` / `--height` are required; `--fps` (24/30/60), `--format`, `--codec`, `--quality`, `--chunk-size`, `--max-parallel-chunks`, `--target-chunk-frames`, and `--output-resolution` (deviceScaleFactor supersampling, e.g. `4k`) mirror the local render flags. `--target-chunk-frames` caps the frames per chunk so a single chunk can't run past a per-chunk timeout on a long video: the planner uses the fewest chunks that keep each at or below the bound, up to `--max-parallel-chunks`, and short videos still collapse to fewer chunks. It's a ceiling, not a fixed size, and is ignored when `--chunk-size` is set. Pass composition variables with `--variables '{"title":"Hi"}'` or `--variables-file alice.json`; add `--strict-variables` to fail on a key that's undeclared or mistyped vs the composition's `data-composition-variables`. `--wait` polls until the render finishes and prints the output URI + cost; without it the command returns an execution name.
+
+#### `cloudrun render-batch <projectDir>`
+
+Fan out N personalised renders from a JSONL batch file (`--batch users.jsonl`, one `{"outputKey":"...","variables":{...}}` per line). Deploys the site once and starts an execution per entry, capped at `--max-concurrent` (default 50). `--dry-run` prints the resolved manifest without starting anything. Shares the render flags above.
+
+#### `cloudrun progress <executionName>`
+
+Print progress + cost for an in-flight or finished render. Coarse `running` progress; exact frame counts + cost on success.
+
+#### `cloudrun destroy`
+
+`terraform destroy` the stack (force-destroys the render bucket). Reads the cached project/region, or pass `--project` / `--region`.
+
+### When to pick `cloudrun` vs `lambda`
+
+Same trade-off as `lambda`, on Google Cloud instead of AWS. Pick `cloudrun` when your backend + storage already live on GCP. The render primitives are identical; only the storage (GCS), compute (Cloud Run), and orchestration (Cloud Workflows) adapters differ.
+
+### State file
+
+`hyperframes cloudrun` caches the deployed stack's coordinates under `~/.hyperframes/cloudrun-state.json` (project id, region, bucket, service URL, workflow id) so `render` / `progress` / `destroy` don't need them re-passed. None are secrets, but all are GCP-project-identifying.
 
 ## hyperframes.json
 

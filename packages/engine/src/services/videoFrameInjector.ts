@@ -197,12 +197,33 @@ export function createVideoFrameInjector(
 
     await syncVideoFrameVisibility(page, Array.from(activeIds));
     if (updates.length > 0) {
-      await injectVideoFramesBatch(
-        page,
-        updates.map((u) => ({ videoId: u.videoId, dataUri: u.dataUri })),
+      // Only record cache entries for videos the page actually painted.
+      // injectVideoFramesBatch skips any video whose visual ancestor is
+      // hidden (sub-comp host out-of-window) and returns the subset of ids
+      // it really wrote — recording the rest would short-circuit the next
+      // call at the same frameIndex and leave the host's first visible
+      // frame blank.
+      const injectedIds = new Set(
+        await injectVideoFramesBatch(
+          page,
+          updates.map((u) => ({ videoId: u.videoId, dataUri: u.dataUri })),
+        ),
       );
       for (const update of updates) {
-        lastInjectedFrameByVideo.set(update.videoId, update.frameIndex);
+        if (injectedIds.has(update.videoId)) {
+          lastInjectedFrameByVideo.set(update.videoId, update.frameIndex);
+        }
+      }
+      if (injectedIds.size > 0) {
+        // GPU compositions (WebGL / WebGPU) that sample these videos as
+        // textures already rendered once on the pre-injection seek, reading a
+        // stale/black frame. Now that the decoded `__render_frame__` images are
+        // in the DOM, re-render the GPU adapters at the same time so they
+        // re-upload their video textures from the correct frame. No-op in
+        // compositions without a GPU adapter.
+        await page.evaluate((t: number) => {
+          (window as unknown as { __hfReseekGpu?: (n: number) => void }).__hfReseekGpu?.(t);
+        }, time);
       }
     }
   };

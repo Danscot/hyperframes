@@ -1,3 +1,4 @@
+// fallow-ignore-file complexity
 import { spawn } from "node:child_process";
 import { defineCommand } from "citty";
 import { existsSync, mkdtempSync, readFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -7,6 +8,7 @@ import { resolveProject } from "../utils/project.js";
 import { resolveCompositionViewportFromHtml } from "../utils/compositionViewport.js";
 import { serveStaticProjectHtml } from "../utils/staticProjectServer.js";
 import { c } from "../ui/colors.js";
+import { findFFmpeg } from "../browser/ffmpeg.js";
 import type { Example } from "./_examples.js";
 
 /** Maximum time a single-frame FFmpeg extract is allowed to run. Mirrors the
@@ -28,6 +30,8 @@ async function extractVideoFrameToBuffer(
   const tmp = mkdtempSync(join(tmpdir(), "hf-snapshot-frame-"));
   const outPath = join(tmp, "frame.png");
   try {
+    const ffmpegPath = findFFmpeg();
+    if (!ffmpegPath) return null;
     const result = await new Promise<{ code: number | null; stderr: string; timedOut: boolean }>(
       (resolvePromise) => {
         // `-ss` before `-i` performs a fast keyframe seek; adequate for snapshot accuracy
@@ -48,7 +52,7 @@ async function extractVideoFrameToBuffer(
           "-y",
           outPath,
         );
-        const ff = spawn("ffmpeg", args);
+        const ff = spawn(ffmpegPath, args);
         let stderr = "";
         let timedOut = false;
         const timer = setTimeout(() => {
@@ -232,10 +236,16 @@ async function captureSnapshots(
 
       // Chrome-headless ignores programmatic <video>.currentTime writes, so
       // we extract frames via FFmpeg and overlay them as <img> elements.
+      //
+      // The engine's injectVideoFramesBatch returns the subset of videoIds it
+      // actually painted (skipped ancestor-hidden videos are excluded).
+      // Snapshot doesn't use the return value, but the local type must match
+      // the real export — a `Promise<void>` shape rejects the `as` cast on
+      // the dynamic import.
       type InjectFn = (
         page: unknown,
         updates: Array<{ videoId: string; dataUri: string }>,
-      ) => Promise<void>;
+      ) => Promise<string[]>;
       type SyncVisibilityFn = (page: unknown, activeVideoIds: string[]) => Promise<void>;
       type ExtractMediaMetadataFn = (
         filePath: string,

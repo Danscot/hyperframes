@@ -1,30 +1,21 @@
 import { Tooltip } from "./ui";
 import { PropertyPanel } from "./editor/PropertyPanel";
-import { MotionPanel } from "./editor/MotionPanel";
 import { LayersPanel } from "./editor/LayersPanel";
 import { CaptionPropertyPanel } from "../captions/components/CaptionPropertyPanel";
 import { BlockParamsPanel } from "./editor/BlockParamsPanel";
 import { RenderQueue } from "./renders/RenderQueue";
 import type { RenderJob } from "./renders/useRenderQueue";
-import type { StudioGsapMotion } from "./editor/studioMotion";
 import type { BlockParam } from "@hyperframes/core/registry";
-import {
-  STUDIO_INSPECTOR_PANELS_ENABLED,
-  STUDIO_MOTION_PANEL_ENABLED,
-} from "./editor/manualEditingAvailability";
+import { STUDIO_INSPECTOR_PANELS_ENABLED } from "./editor/manualEditingAvailability";
 
-/** Motion data without targeting metadata. */
-type StudioMotionData = Omit<StudioGsapMotion, "kind" | "target" | "updatedAt">;
-
-import { useStudioContext } from "../contexts/StudioContext";
+import { useStudioPlaybackContext, useStudioShellContext } from "../contexts/StudioContext";
 import { usePanelLayoutContext } from "../contexts/PanelLayoutContext";
 import { useFileManagerContext } from "../contexts/FileManagerContext";
 import { useDomEditContext } from "../contexts/DomEditContext";
+import { usePlayerStore } from "../player";
 
 export interface StudioRightPanelProps {
-  selectedStudioMotion: StudioMotionData | null;
   designPanelActive: boolean;
-  motionPanelActive: boolean;
   activeBlockParams?: {
     blockName: string;
     blockTitle: string;
@@ -32,14 +23,19 @@ export interface StudioRightPanelProps {
     compositionPath: string;
   } | null;
   onCloseBlockParams?: () => void;
+  recordingState?: "idle" | "recording" | "preview";
+  recordingDuration?: number;
+  onToggleRecording?: () => void;
 }
 
+// fallow-ignore-next-line complexity
 export function StudioRightPanel({
-  selectedStudioMotion,
   designPanelActive,
-  motionPanelActive,
   activeBlockParams,
   onCloseBlockParams,
+  recordingState,
+  recordingDuration,
+  onToggleRecording,
 }: StudioRightPanelProps) {
   const {
     rightWidth,
@@ -51,14 +47,14 @@ export function StudioRightPanel({
   } = usePanelLayoutContext();
 
   const {
-    captionEditMode,
     previewIframeRef,
     projectId,
     activeCompPath,
     compositionDimensions,
     waitForPendingDomEditSaves,
     renderQueue,
-  } = useStudioContext();
+  } = useStudioShellContext();
+  const { captionEditMode } = useStudioPlaybackContext();
 
   const {
     domEditSelection,
@@ -76,8 +72,24 @@ export function StudioRightPanel({
     handleDomAddTextField,
     handleDomRemoveTextField,
     handleAskAgent,
-    handleDomMotionCommit,
-    handleDomMotionClear,
+    selectedGsapAnimations,
+    gsapMultipleTimelines,
+    gsapUnsupportedTimelinePattern,
+    handleGsapUpdateProperty,
+    handleGsapUpdateMeta,
+    handleGsapDeleteAnimation,
+    handleGsapAddAnimation,
+    handleGsapAddProperty,
+    handleGsapRemoveProperty,
+    handleGsapUpdateFromProperty,
+    handleGsapAddFromProperty,
+    handleGsapRemoveFromProperty,
+    commitAnimatedProperty,
+    handleSetArcPath,
+    handleUpdateArcSegment,
+    handleGsapAddKeyframe,
+    handleGsapRemoveKeyframe,
+    handleGsapConvertToKeyframes,
   } = useDomEditContext();
 
   const { assets, fontAssets, projectDir, handleImportFiles, handleImportFonts } =
@@ -133,21 +145,6 @@ export function StudioRightPanel({
                       Layers
                     </button>
                   </Tooltip>
-                  {STUDIO_MOTION_PANEL_ENABLED && (
-                    <Tooltip label="Animation and motion" side="bottom">
-                      <button
-                        type="button"
-                        onClick={() => setRightPanelTab("motion")}
-                        className={`h-8 rounded-xl px-3 text-[11px] font-medium transition-colors ${
-                          rightPanelTab === "motion"
-                            ? "bg-neutral-800 text-white"
-                            : "text-neutral-500 hover:bg-neutral-800/70 hover:text-neutral-200"
-                        }`}
-                      >
-                        Motion
-                      </button>
-                    </Tooltip>
-                  )}
                 </>
               )}
               <Tooltip label="Render queue and exports" side="bottom">
@@ -198,14 +195,29 @@ export function StudioRightPanel({
                   onImportAssets={handleImportFiles}
                   fontAssets={fontAssets}
                   onImportFonts={handleImportFonts}
-                />
-              ) : motionPanelActive ? (
-                <MotionPanel
-                  element={domEditGroupSelections.length > 1 ? null : domEditSelection}
-                  motion={selectedStudioMotion}
-                  onClearSelection={clearDomSelection}
-                  onSetMotion={handleDomMotionCommit}
-                  onClearMotion={handleDomMotionClear}
+                  previewIframeRef={previewIframeRef}
+                  gsapAnimations={selectedGsapAnimations}
+                  gsapMultipleTimelines={gsapMultipleTimelines}
+                  gsapUnsupportedTimelinePattern={gsapUnsupportedTimelinePattern}
+                  onUpdateGsapProperty={handleGsapUpdateProperty}
+                  onUpdateGsapMeta={handleGsapUpdateMeta}
+                  onDeleteGsapAnimation={handleGsapDeleteAnimation}
+                  onAddGsapProperty={handleGsapAddProperty}
+                  onRemoveGsapProperty={handleGsapRemoveProperty}
+                  onUpdateGsapFromProperty={handleGsapUpdateFromProperty}
+                  onAddGsapFromProperty={handleGsapAddFromProperty}
+                  onRemoveGsapFromProperty={handleGsapRemoveFromProperty}
+                  onAddGsapAnimation={handleGsapAddAnimation}
+                  onCommitAnimatedProperty={commitAnimatedProperty}
+                  onAddKeyframe={handleGsapAddKeyframe}
+                  onRemoveKeyframe={handleGsapRemoveKeyframe}
+                  onConvertToKeyframes={handleGsapConvertToKeyframes}
+                  onSeekToTime={(t) => usePlayerStore.getState().requestSeek(t)}
+                  onSetArcPath={handleSetArcPath}
+                  onUpdateArcSegment={handleUpdateArcSegment}
+                  recordingState={recordingState}
+                  recordingDuration={recordingDuration}
+                  onToggleRecording={onToggleRecording}
                 />
               ) : (
                 <RenderQueue

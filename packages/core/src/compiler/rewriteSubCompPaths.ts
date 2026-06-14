@@ -18,21 +18,9 @@
 import { posix } from "path";
 const { join, resolve, dirname } = posix;
 
-/** Attributes that may contain relative asset paths. */
-const PATH_ATTRS = ["src", "href"] as const;
-const CSS_URL_RE = /\burl\(\s*(["']?)([^)"']+)\1\s*\)/g;
+import { CSS_URL_RE, PATH_ATTRS, isNonRelativeUrl } from "./assetPaths.js";
 
-/** Protocols and prefixes that should never be rewritten. */
-function isAbsoluteOrSpecial(val: string): boolean {
-  return (
-    !val ||
-    val.startsWith("http://") ||
-    val.startsWith("https://") ||
-    val.startsWith("//") ||
-    val.startsWith("data:") ||
-    val.startsWith("#")
-  );
-}
+const isAbsoluteOrSpecial = isNonRelativeUrl;
 
 /**
  * Returns true only for paths that traverse up with `../`.
@@ -79,18 +67,12 @@ export function rewriteAssetPaths<T>(
   getAttr: (el: T, attr: string) => string | null | undefined,
   setAttr: (el: T, attr: string, value: string) => void,
 ): void {
-  const compDir = dirname(compSrcPath);
-  if (!compDir || compDir === ".") return;
-
   for (const el of elements) {
     for (const attr of PATH_ATTRS) {
       const val = (getAttr(el, attr) || "").trim();
-      if (isAbsoluteOrSpecial(val)) continue;
-      if (!needsRewrite(val)) continue;
-      const rewritten = join(compDir, val);
-      const normalized = resolve("/", rewritten).slice(1);
-      if (normalized !== val) {
-        setAttr(el, attr, normalized);
+      const rewritten = rewriteAssetPath(compSrcPath, val);
+      if (rewritten !== val) {
+        setAttr(el, attr, rewritten);
       }
     }
   }

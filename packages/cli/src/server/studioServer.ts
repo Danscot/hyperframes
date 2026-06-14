@@ -10,7 +10,11 @@ import { streamSSE } from "hono/streaming";
 import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { resolve, join, basename } from "node:path";
 import { createProjectWatcher, type ProjectWatcher } from "./fileWatcher.js";
-import { loadRuntimeSource } from "./runtimeSource.js";
+import {
+  hashSignatureParts,
+  loadRuntimeSource,
+  loadRuntimeSourceSignature,
+} from "./runtimeSource.js";
 import { VERSION as version } from "../version.js";
 import { emitStudioRenderComplete, emitStudioRenderError } from "./studioRenderTelemetry.js";
 import {
@@ -24,8 +28,11 @@ import {
 } from "@hyperframes/core/studio-api";
 import { getElementScreenshotClip } from "@hyperframes/core/studio-api/screenshot-clip";
 import type { ScreenshotClip } from "@hyperframes/core/studio-api/screenshot-clip";
+import type { RenderJob } from "@hyperframes/producer";
 
 const STUDIO_MANUAL_EDITS_PATH = ".hyperframes/studio-manual-edits.json";
+const REMOTE_GIF_IMG_SRC_RE =
+  /<img\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+\.gif(?:[?#][^"']*)?)["'][^>]*>/gi;
 
 // ── Path resolution ─────────────────────────────────────────────────────────
 
@@ -114,6 +121,37 @@ async function reapplyStudioManualEditsToThumbnailPage(
   });
 }
 
+function collectRemoteGifImageSources(html: string): string[] {
+  const urls = new Set<string>();
+  const re = new RegExp(REMOTE_GIF_IMG_SRC_RE.source, REMOTE_GIF_IMG_SRC_RE.flags);
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    if (match[1]) urls.add(match[1]);
+  }
+  return [...urls];
+}
+
+async function downloadRemoteGifImageSources(
+  html: string,
+  downloadDir: string,
+  downloadToTemp: (url: string, destDir: string) => Promise<string>,
+): Promise<Map<string, string>> {
+  const sourceAssets = new Map<string, string>();
+  await Promise.all(
+    collectRemoteGifImageSources(html).map(async (url) => {
+      try {
+        sourceAssets.set(url, await downloadToTemp(url, downloadDir));
+      } catch (err) {
+        console.warn(
+          "[Studio] Remote animated GIF prep skipped:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }),
+  );
+  return sourceAssets;
+}
+
 // ── Shared thumbnail browser (pool-backed) ──────────────────────────────────
 // Uses the engine's browser pool so the thumbnail browser and render workers
 // share a single Chrome process instead of running two independent ones.
@@ -184,6 +222,58 @@ export interface StudioServer {
   watcher: ProjectWatcher;
 }
 
+export async function loadPreviewServerBuildSignature(): Promise<string> {
+  const runtimeSignature = await loadRuntimeSourceSignature();
+  const studioBundle = resolveStudioBundle();
+  const studioIndex =
+    studioBundle.available && existsSync(studioBundle.indexPath)
+      ? readFileSync(studioBundle.indexPath, "utf-8")
+      : "";
+  return hashSignatureParts([
+    version,
+    runtimeSignature,
+    studioIndex,
+    createStudioServer.toString(),
+    createStudioApi.toString(),
+    createProjectSignature.toString(),
+    getMimeType.toString(),
+    getElementScreenshotClip.toString(),
+  ]);
+}
+
+// Rewrite the viewport meta + inline width/height in every written .html to the
+// host composition's dimensions, so an installed fragment matches the host
+// canvas. Applies to ALL written files — including any .html a dependency ships,
+// not just the requested block's — which is intentional. No-op when the host
+// index.html is absent or carries no dimensions.
+function rewriteWrittenToHostViewport(projectDir: string, written: string[]): void {
+  const indexPath = join(projectDir, "index.html");
+  if (!existsSync(indexPath)) return;
+  const indexHtml = readFileSync(indexPath, "utf-8");
+  const hostW = indexHtml.match(/data-width="(\d+)"/)?.[1];
+  const hostH = indexHtml.match(/data-height="(\d+)"/)?.[1];
+  if (!hostW || !hostH) return;
+
+  for (const absPath of written) {
+    if (!absPath.endsWith(".html")) continue;
+    let content = readFileSync(absPath, "utf-8");
+    content = content.replace(
+      /(<meta\s+name="viewport"\s+content="width=)\d+(,\s*height=)\d+/i,
+      `$1${hostW}$2${hostH}`,
+    );
+    content = content.replace(
+      /(\bwidth:\s*)\d+(px;\s*\n?\s*height:\s*)\d+(px;)/g,
+      (match, pre, mid, post) => {
+        if (match.includes("1920") || match.includes("1080")) {
+          return `${pre}${hostW}${mid}${hostH}${post}`;
+        }
+        return match;
+      },
+    );
+    writeFileSync(absPath, content, "utf-8");
+  }
+}
+
 export function createStudioServer(options: StudioServerOptions): StudioServer {
   const { projectDir, projectName } = options;
   const projectId = projectName || basename(projectDir);
@@ -223,10 +313,23 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       }
     },
 
-    async transformPreviewHtml({ html }) {
+    async transformPreviewHtml({ html, project }) {
       const { injectDeterministicFontFaces } =
         await import("../../../producer/src/services/deterministicFonts.js");
-      return injectDeterministicFontFaces(html);
+      const { prepareAnimatedGifInputs } =
+        await import("../../../producer/src/services/animatedGifPrep.js");
+      const { downloadToTemp } = await import("../../../producer/src/utils/urlDownloader.js");
+      const gifOutputDir = join(project.dir, ".hyperframes", "prepared-assets", "gif");
+      const gifDownloadDir = join(project.dir, ".hyperframes", "prepared-assets", "downloads");
+      const prepared = await prepareAnimatedGifInputs(html, {
+        projectDir: project.dir,
+        downloadDir: gifDownloadDir,
+        outputDir: gifOutputDir,
+        outputSrcPrefix: ".hyperframes/prepared-assets/gif",
+        cacheDir: gifOutputDir,
+        sourceAssets: await downloadRemoteGifImageSources(html, gifDownloadDir, downloadToTemp),
+      });
+      return injectDeterministicFontFaces(prepared.html);
     },
 
     getProjectSignature(dir: string): string {
@@ -237,7 +340,7 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
 
     async lint(html: string, opts?: { filePath?: string }) {
       const { lintHyperframeHtml } = await import("@hyperframes/core/lint");
-      return lintHyperframeHtml(html, opts);
+      return await lintHyperframeHtml(html, opts);
     },
 
     runtimeUrl: "/api/runtime.js",
@@ -255,6 +358,7 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       // Run render asynchronously, mutating the state object
       const startTime = Date.now();
       (async () => {
+        let renderJob: RenderJob | undefined;
         try {
           const { createRenderJob, executeRenderJob } = await import("@hyperframes/producer");
           const { ensureBrowser } = await import("../browser/manager.js");
@@ -280,6 +384,7 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
             ...(manualEditsRenderScript ? { renderBodyScripts: [manualEditsRenderScript] } : {}),
             ...(opts.composition ? { entryFile: opts.composition } : {}),
           });
+          renderJob = job;
           const onProgress = (j: { progress: number; currentStage?: string }) => {
             state.progress = j.progress;
             if (j.currentStage) state.stage = j.currentStage;
@@ -296,7 +401,8 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
         } catch (err) {
           state.status = "failed";
           state.error = err instanceof Error ? err.message : String(err);
-          emitStudioRenderError(opts, Date.now() - startTime, state.stage, err);
+          // fallow-ignore-next-line code-duplication
+          emitStudioRenderError(opts, Date.now() - startTime, state.stage, err, renderJob);
           try {
             const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov)$/, ".meta.json");
             writeFileSync(metaPath, JSON.stringify({ status: "failed" }));
@@ -395,39 +501,26 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
     },
 
     async installRegistryBlock(opts) {
-      const { resolveItem } = await import("../registry/resolver.js");
+      const { resolveItemWithDependencies } = await import("../registry/resolver.js");
       const { installItem } = await import("../registry/installer.js");
-      const { readFileSync, writeFileSync, existsSync } = await import("node:fs");
-      const { join } = await import("node:path");
-      const item = await resolveItem(opts.blockName);
-      const { written } = await installItem(item, { destDir: opts.project.dir });
-
-      const indexPath = join(opts.project.dir, "index.html");
-      if (existsSync(indexPath)) {
-        const indexHtml = readFileSync(indexPath, "utf-8");
-        const hostW = indexHtml.match(/data-width="(\d+)"/)?.[1];
-        const hostH = indexHtml.match(/data-height="(\d+)"/)?.[1];
-        if (hostW && hostH) {
-          for (const absPath of written) {
-            if (!absPath.endsWith(".html")) continue;
-            let content = readFileSync(absPath, "utf-8");
-            content = content.replace(
-              /(<meta\s+name="viewport"\s+content="width=)\d+(,\s*height=)\d+/i,
-              `$1${hostW}$2${hostH}`,
-            );
-            content = content.replace(
-              /(\bwidth:\s*)\d+(px;\s*\n?\s*height:\s*)\d+(px;)/g,
-              (match, pre, mid, post) => {
-                if (match.includes("1920") || match.includes("1080")) {
-                  return `${pre}${hostW}${mid}${hostH}${post}`;
-                }
-                return match;
-              },
-            );
-            writeFileSync(absPath, content, "utf-8");
-          }
-        }
+      const { gateRegistryItemsCompatibility } = await import("../registry/compatibility.js");
+      // Resolve transitive registryDependencies and install them first so a
+      // block that depends on other registry items installs completely.
+      const items = await resolveItemWithDependencies(opts.blockName);
+      // Compatibility-gate the whole set before writing anything (same gate as
+      // `hyperframes add`), so an incompatible block or dep aborts cleanly.
+      const warnings = gateRegistryItemsCompatibility(items);
+      for (const warning of warnings) {
+        process.stderr.write(`hyperframes:registry ${warning}\n`);
       }
+      const written: string[] = [];
+      for (const dep of items) {
+        const result = await installItem(dep, { destDir: opts.project.dir });
+        written.push(...result.written);
+      }
+      const item = items[items.length - 1]!;
+
+      rewriteWrittenToHostViewport(opts.project.dir, written);
 
       const relativePaths = written.map((abs) => {
         const rel = abs.startsWith(opts.project.dir) ? abs.slice(opts.project.dir.length + 1) : abs;
@@ -445,12 +538,17 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
   // HyperFrames instances and reuse them instead of spawning duplicates.
   // See portUtils.ts detectHyperframesServer() for the consumer.
   app.get("/__hyperframes_config", (c) => {
-    return c.json({
-      isHyperframes: true,
-      projectName: projectId,
-      projectDir: projectDir,
-      version,
-    });
+    const serve = async () => {
+      const serverBuildSignature = await loadPreviewServerBuildSignature();
+      return c.json({
+        isHyperframes: true,
+        projectName: projectId,
+        projectDir: projectDir,
+        serverBuildSignature,
+        version,
+      });
+    };
+    return serve();
   });
 
   // CLI-specific routes (before shared API)
@@ -478,6 +576,22 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
         await stream.sleep(30000);
       }
     });
+  });
+
+  // ── Pre-flight checks for render ────────────────────────────────────────
+  // Intercept render requests before they reach the shared API so we can
+  // fail fast with an actionable hint instead of burning through the entire
+  // capture pipeline before hitting "spawn ffmpeg ENOENT" at encode.
+  let cachedFFmpegPath: string | undefined;
+  app.post("/api/projects/:id/render", async (c, next) => {
+    const { findFFmpeg, getFFmpegInstallHint } = await import("../browser/ffmpeg.js");
+    if (!cachedFFmpegPath) {
+      cachedFFmpegPath = findFFmpeg();
+    }
+    if (!cachedFFmpegPath) {
+      return c.json({ error: "FFmpeg not found", hint: getFFmpegInstallHint() }, 503);
+    }
+    return next();
   });
 
   // Mount the shared studio API at /api.

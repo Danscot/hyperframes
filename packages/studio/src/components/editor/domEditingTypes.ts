@@ -1,4 +1,5 @@
 import type { PatchTarget } from "../../utils/sourcePatcher";
+import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 
 export const CURATED_STYLE_PROPERTIES = [
   "position",
@@ -86,6 +87,7 @@ export interface DomEditSelection extends PatchTarget {
   computedStyles: Record<string, string>;
   textFields: DomEditTextField[];
   capabilities: DomEditCapabilities;
+  gsapAnimations?: GsapAnimation[];
 }
 
 export interface DomEditLayerItem {
@@ -96,6 +98,7 @@ export interface DomEditLayerItem {
   depth: number;
   childCount: number;
   id?: string;
+  hfId?: string;
   selector?: string;
   selectorIndex?: number;
   sourceFile: string;

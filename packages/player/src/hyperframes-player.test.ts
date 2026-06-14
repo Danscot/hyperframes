@@ -1467,6 +1467,19 @@ describe("HyperframesPlayer volume and mute", () => {
     expect(slider.getAttribute("tabindex")).toBe("0");
   });
 
+  it("removes and recreates one controls bar when the controls attribute toggles", () => {
+    document.body.appendChild(player);
+
+    player.setAttribute("controls", "");
+    expect(player.shadowRoot!.querySelectorAll(".hfp-controls")).toHaveLength(1);
+
+    player.removeAttribute("controls");
+    expect(player.shadowRoot!.querySelectorAll(".hfp-controls")).toHaveLength(0);
+
+    player.setAttribute("controls", "");
+    expect(player.shadowRoot!.querySelectorAll(".hfp-controls")).toHaveLength(1);
+  });
+
   it("dispatches volumechange when muted toggles (HTML5 spec)", () => {
     document.body.appendChild(player);
 
@@ -1494,5 +1507,442 @@ describe("HyperframesPlayer volume and mute", () => {
     const mutedHtml = muteBtn.innerHTML;
 
     expect(zeroVolumeHtml).not.toBe(mutedHtml);
+  });
+});
+
+// ── Audio lock ──
+
+describe("HyperframesPlayer audio lock", () => {
+  let player: HTMLElement & { muted: boolean; audioLocked: boolean };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as typeof player;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  });
+
+  it("audioLocked property toggles the audio-locked attribute", () => {
+    document.body.appendChild(player);
+
+    player.audioLocked = true;
+    expect(player.hasAttribute("audio-locked")).toBe(true);
+
+    player.audioLocked = false;
+    expect(player.hasAttribute("audio-locked")).toBe(false);
+  });
+
+  it("forces muted when audio-locked is set", () => {
+    document.body.appendChild(player);
+    expect(player.hasAttribute("muted")).toBe(false);
+
+    player.setAttribute("audio-locked", "");
+    expect(player.muted).toBe(true);
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("re-asserts mute when something tries to unmute while locked", () => {
+    document.body.appendChild(player);
+    player.setAttribute("audio-locked", "");
+
+    // Direct property unmute
+    player.muted = false;
+    expect(player.hasAttribute("muted")).toBe(true);
+
+    // Raw attribute removal
+    player.removeAttribute("muted");
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("allows unmute again once unlocked", () => {
+    document.body.appendChild(player);
+    player.setAttribute("audio-locked", "");
+    expect(player.muted).toBe(true);
+
+    // Unlock does NOT auto-unmute — it only lifts the restriction.
+    player.removeAttribute("audio-locked");
+    expect(player.muted).toBe(true);
+
+    // Now the viewer/host can unmute.
+    player.muted = false;
+    expect(player.hasAttribute("muted")).toBe(false);
+  });
+
+  it("hides the volume controls when locked after controls exist", () => {
+    player.setAttribute("controls", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).not.toBe("none");
+
+    player.setAttribute("audio-locked", "");
+    expect(volumeWrap.style.display).toBe("none");
+  });
+
+  it("hides the volume controls when controls are created while already locked", () => {
+    player.setAttribute("audio-locked", "");
+    player.setAttribute("controls", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).toBe("none");
+  });
+
+  it("restores the volume controls when unlocked", () => {
+    player.setAttribute("controls", "");
+    player.setAttribute("audio-locked", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).toBe("none");
+
+    player.removeAttribute("audio-locked");
+    expect(volumeWrap.style.display).not.toBe("none");
+  });
+});
+
+describe("HyperframesPlayer runtime ready handshake", () => {
+  // When the iframe runtime announces `{type: "ready"}` the player replays
+  // current bridge state (muted, volume, playback rate) so any control message
+  // that arrived before the iframe runtime registered its listener isn't lost.
+  // This fixes a deterministic race on warm-cache reloads of claude.ai and
+  // inside the Claude desktop Electron client where the iframe finishes
+  // loading after the player has already set audio-locked.
+  interface PlayerInternal extends HTMLElement {
+    muted: boolean;
+    volume: number;
+    audioLocked: boolean;
+    playbackRate: number;
+    iframe: HTMLIFrameElement;
+    _onMessage: (event: MessageEvent) => void;
+  }
+
+  let player: PlayerInternal;
+  let frameWindow: Window;
+  let postSpy: ReturnType<typeof vi.spyOn>;
+
+  function readyMessage() {
+    return new MessageEvent("message", {
+      source: frameWindow,
+      data: { source: "hf-preview", type: "ready" },
+    });
+  }
+
+  function findControlCalls(action: string) {
+    return postSpy.mock.calls.filter((call) => {
+      const data = call[0] as { type?: string; action?: string };
+      return data?.type === "control" && data?.action === action;
+    });
+  }
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as PlayerInternal;
+    frameWindow = window;
+    postSpy = vi.spyOn(frameWindow, "postMessage").mockImplementation(() => undefined);
+    Object.defineProperty(player.iframe, "contentWindow", {
+      configurable: true,
+      get: () => frameWindow,
+    });
+    document.body.appendChild(player);
+  });
+
+  afterEach(() => {
+    player.remove();
+    vi.restoreAllMocks();
+  });
+
+  it("replays current muted state when runtime emits ready", () => {
+    player.muted = true;
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    const muteCalls = findControlCalls("set-muted");
+    expect(muteCalls).toHaveLength(1);
+    expect(muteCalls[0]?.[0]).toMatchObject({
+      source: "hf-parent",
+      type: "control",
+      action: "set-muted",
+      muted: true,
+    });
+  });
+
+  it("replays volume and playback-rate alongside muted", () => {
+    player.volume = 0.5;
+    player.playbackRate = 1.25;
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    expect(findControlCalls("set-muted")).toHaveLength(1);
+    expect(findControlCalls("set-volume")[0]?.[0]).toMatchObject({
+      action: "set-volume",
+      volume: 0.5,
+    });
+    expect(findControlCalls("set-playback-rate")[0]?.[0]).toMatchObject({
+      action: "set-playback-rate",
+      playbackRate: 1.25,
+    });
+  });
+
+  it("replays the muted state forced by audio-locked", () => {
+    // The audio-locked attribute is the original motivating case for this
+    // handshake — its `muted = true` side effect must survive an iframe race.
+    player.setAttribute("audio-locked", "");
+    expect(player.muted).toBe(true);
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    const muteCalls = findControlCalls("set-muted");
+    expect(muteCalls).toHaveLength(1);
+    expect(muteCalls[0]?.[0]).toMatchObject({ action: "set-muted", muted: true });
+  });
+
+  it("replays again on a second ready (idempotent — iframe reloads emit again)", () => {
+    player.muted = true;
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+    player._onMessage(readyMessage());
+
+    expect(findControlCalls("set-muted")).toHaveLength(2);
+  });
+
+  it("ignores ready events from a different window", () => {
+    postSpy.mockClear();
+    const otherSource = {} as Window;
+
+    player._onMessage(
+      new MessageEvent("message", {
+        source: otherSource,
+        data: { source: "hf-preview", type: "ready" },
+      }),
+    );
+
+    expect(findControlCalls("set-muted")).toHaveLength(0);
+  });
+});
+
+describe("HyperframesPlayer audio lock — Claude desktop UA fallback", () => {
+  // Some host renderers (observed on the Claude desktop Electron client) strip
+  // unknown custom-element attributes before they reach the DOM, so the
+  // `audio-locked` attribute is lost. The player self-imposes the lock based
+  // on UA detection so chat-host audio stays muted even without the attribute.
+  let player: HTMLElement & { muted: boolean; audioLocked: boolean };
+  let originalUserAgent: PropertyDescriptor | undefined;
+
+  function stubUserAgent(ua: string) {
+    Object.defineProperty(navigator, "userAgent", {
+      value: ua,
+      configurable: true,
+    });
+  }
+
+  beforeEach(async () => {
+    originalUserAgent = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(navigator),
+      "userAgent",
+    );
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as typeof player;
+  });
+
+  afterEach(() => {
+    if (originalUserAgent) {
+      Object.defineProperty(Object.getPrototypeOf(navigator), "userAgent", originalUserAgent);
+    }
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  });
+
+  it("forces muted on Claude desktop UA even without the audio-locked attribute", () => {
+    stubUserAgent(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0 Safari/537.36",
+    );
+
+    document.body.appendChild(player);
+
+    expect(player.hasAttribute("audio-locked")).toBe(false);
+    expect(player.muted).toBe(true);
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("re-asserts mute on Claude desktop when something tries to unmute", () => {
+    stubUserAgent("Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0");
+    document.body.appendChild(player);
+
+    player.muted = false;
+    expect(player.hasAttribute("muted")).toBe(true);
+
+    player.removeAttribute("muted");
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("hides the volume controls on Claude desktop without the attribute", () => {
+    stubUserAgent("Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0");
+    player.setAttribute("controls", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).toBe("none");
+  });
+
+  it("does NOT force mute on a regular browser UA", () => {
+    stubUserAgent(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    );
+
+    document.body.appendChild(player);
+
+    expect(player.hasAttribute("audio-locked")).toBe(false);
+    expect(player.muted).toBe(false);
+    expect(player.hasAttribute("muted")).toBe(false);
+  });
+
+  it("does NOT force mute on Electron apps that aren't Claude desktop", () => {
+    // Other Electron clients (e.g. VS Code embedded view) shouldn't be muted.
+    stubUserAgent(
+      "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/126.0.0.0 Electron/31.0.0 Safari/537.36",
+    );
+
+    document.body.appendChild(player);
+
+    expect(player.muted).toBe(false);
+  });
+
+  it("keeps `audioLocked` property reflecting only the attribute, not the UA fallback", () => {
+    // External consumers (pacific widget, etc.) read `audioLocked` to mirror
+    // their own state. The UA fallback is an internal safety net and must not
+    // leak into the public property — otherwise unsetting `audioLocked` would
+    // appear to have no effect from the consumer's perspective.
+    stubUserAgent("Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0");
+    document.body.appendChild(player);
+
+    expect(player.audioLocked).toBe(false);
+  });
+});
+
+// ── Playback rate ──
+
+describe("HyperframesPlayer playback rate", () => {
+  let player: HTMLElement & {
+    playbackRate: number;
+    iframeElement: HTMLIFrameElement;
+  };
+  let mockAudio: {
+    preload: string;
+    src: string;
+    muted: boolean;
+    volume: number;
+    playbackRate: number;
+    currentTime: number;
+    load: ReturnType<typeof vi.fn>;
+    play: ReturnType<typeof vi.fn>;
+    pause: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+
+    mockAudio = {
+      preload: "",
+      src: "",
+      muted: false,
+      volume: 1,
+      playbackRate: 1,
+      currentTime: 0,
+      load: vi.fn(),
+      play: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn(),
+    };
+    vi.spyOn(globalThis, "Audio").mockImplementation(
+      () => mockAudio as unknown as HTMLAudioElement,
+    );
+
+    player = document.createElement("hyperframes-player") as typeof player;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  });
+
+  it("defaults playbackRate to 1", () => {
+    document.body.appendChild(player);
+    expect(player.playbackRate).toBe(1);
+  });
+
+  it("clamps playbackRate to [0.1, 5]", () => {
+    document.body.appendChild(player);
+
+    player.playbackRate = 100;
+    expect(player.playbackRate).toBe(5);
+    // Assert the reflected attribute directly so the setter clamp is pinned
+    // independently of the getter clamp.
+    expect(player.getAttribute("playback-rate")).toBe("5");
+
+    player.playbackRate = 0.01;
+    expect(player.playbackRate).toBe(0.1);
+    expect(player.getAttribute("playback-rate")).toBe("0.1");
+  });
+
+  it("falls back to 1 for a non-positive or non-finite playbackRate", () => {
+    document.body.appendChild(player);
+
+    player.playbackRate = -2;
+    expect(player.playbackRate).toBe(1);
+    expect(player.getAttribute("playback-rate")).toBe("1");
+
+    player.playbackRate = 0;
+    expect(player.playbackRate).toBe(1);
+
+    player.playbackRate = NaN;
+    expect(player.playbackRate).toBe(1);
+  });
+
+  it("propagates the clamped rate to parent media, never an out-of-range value", () => {
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    player.setAttribute("playback-rate", "50");
+    expect(mockAudio.playbackRate).toBe(5);
+
+    player.setAttribute("playback-rate", "0.01");
+    expect(mockAudio.playbackRate).toBe(0.1);
+  });
+
+  it("sends the clamped rate as a set-playback-rate control to the iframe", () => {
+    document.body.appendChild(player);
+
+    const postMessageSpy = vi.fn();
+    Object.defineProperty(player.iframeElement, "contentWindow", {
+      value: { postMessage: postMessageSpy },
+      configurable: true,
+    });
+
+    player.setAttribute("playback-rate", "50");
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "hf-parent",
+        type: "control",
+        action: "set-playback-rate",
+        playbackRate: 5,
+      }),
+      "*",
+    );
+  });
+
+  it("clamps an out-of-range value set directly via the attribute on read", () => {
+    document.body.appendChild(player);
+
+    player.setAttribute("playback-rate", "999");
+    expect(player.playbackRate).toBe(5);
   });
 });

@@ -18,6 +18,21 @@ import { ShaderLoaderState } from "./shader-loader-state.js";
 import { PLAYER_STYLES } from "./styles.js";
 import { type DirectTimelineAdapter } from "./timeline-adapters.js";
 
+// Playback-rate bounds mirror the runtime clamp in
+// packages/core/src/runtime/init.ts (applyPlaybackRate) and media.ts so the
+// player accepts the same range as the in-iframe runtime: an out-of-range rate
+// would otherwise drive the parent-proxied <audio> outside the bounds the
+// timeline itself respects. Clamping here also shields the native
+// HTMLMediaElement.playbackRate setter, which throws for extreme values in
+// production browsers.
+const MIN_PLAYBACK_RATE = 0.1;
+const MAX_PLAYBACK_RATE = 5;
+
+function clampPlaybackRate(rate: number): number {
+  if (!Number.isFinite(rate) || rate <= 0) return 1;
+  return Math.max(MIN_PLAYBACK_RATE, Math.min(MAX_PLAYBACK_RATE, rate));
+}
+
 class HyperframesPlayer extends HTMLElement {
   static get observedAttributes() {
     return [
@@ -27,6 +42,7 @@ class HyperframesPlayer extends HTMLElement {
       "height",
       "controls",
       "muted",
+      "audio-locked",
       "volume",
       "poster",
       "playback-rate",
@@ -127,6 +143,13 @@ class HyperframesPlayer extends HTMLElement {
       this.iframe.srcdoc = prepareSrcdocForElement(this, this.getAttribute("srcdoc")!);
     if (this.hasAttribute("src"))
       this.iframe.src = prepareSrcForElement(this, this.getAttribute("src")!);
+
+    // Host-environment audio lock: when the embedding host (e.g. Claude
+    // desktop) drops the `audio-locked` attribute, attributeChangedCallback
+    // never fires for it, so apply the lock here based on UA detection.
+    if (!this.hasAttribute("audio-locked") && this._isLockedHostEnvironment()) {
+      this._applyAudioLock(true);
+    }
   }
 
   disconnectedCallback() {
@@ -142,6 +165,7 @@ class HyperframesPlayer extends HTMLElement {
     this.controlsApi?.destroy();
   }
 
+  // fallow-ignore-next-line complexity
   attributeChangedCallback(name: string, _old: string | null, val: string | null) {
     switch (name) {
       case "src":
@@ -174,7 +198,7 @@ class HyperframesPlayer extends HTMLElement {
         this.posterEl = setupPoster(this.shadow, val, this.posterEl);
         break;
       case "playback-rate": {
-        const rate = parseFloat(val || "1");
+        const rate = clampPlaybackRate(parseFloat(val || "1"));
         this._media.updatePlaybackRate(rate);
         this._sendControl("set-playback-rate", { playbackRate: rate });
         this._directTimelineAdapter?.timeScale?.(rate);
@@ -183,10 +207,10 @@ class HyperframesPlayer extends HTMLElement {
         break;
       }
       case "muted":
-        this._media.updateMuted(val !== null);
-        this._sendControl("set-muted", { muted: val !== null });
-        this.controlsApi?.updateMuted(val !== null);
-        this.dispatchEvent(new Event("volumechange"));
+        this._handleMutedChange(val);
+        break;
+      case "audio-locked":
+        this._applyAudioLock(val !== null);
         break;
       case "volume": {
         const v = Math.max(0, Math.min(1, parseFloat(val || "1")));
@@ -199,6 +223,7 @@ class HyperframesPlayer extends HTMLElement {
       }
       case "audio-src":
         if (val) this._media.setupFromUrl(val);
+        else this._media.teardownUrlAudio();
         break;
       case SHADER_CAPTURE_SCALE_ATTR:
       case SHADER_LOADING_ATTR:
@@ -296,10 +321,10 @@ class HyperframesPlayer extends HTMLElement {
   }
 
   get playbackRate() {
-    return parseFloat(this.getAttribute("playback-rate") || "1");
+    return clampPlaybackRate(parseFloat(this.getAttribute("playback-rate") || "1"));
   }
   set playbackRate(r: number) {
-    this.setAttribute("playback-rate", String(r));
+    this.setAttribute("playback-rate", String(clampPlaybackRate(r)));
   }
 
   get shaderCaptureScale() {
@@ -323,6 +348,60 @@ class HyperframesPlayer extends HTMLElement {
   set muted(m: boolean) {
     if (m) this.setAttribute("muted", "");
     else this.removeAttribute("muted");
+  }
+
+  get audioLocked() {
+    return this.hasAttribute("audio-locked");
+  }
+  set audioLocked(locked: boolean) {
+    if (locked) this.setAttribute("audio-locked", "");
+    else this.removeAttribute("audio-locked");
+  }
+
+  /**
+   * Host renderers that strip unknown custom-element attributes before they
+   * reach the DOM (observed on the Claude desktop Electron client) can defeat
+   * `audio-locked` even when the host *intends* to lock audio. When we detect
+   * such an environment, self-impose the same restriction the attribute would
+   * apply. Web (browser) hosts preserve the attribute and don't need this.
+   */
+  private _isLockedHostEnvironment(): boolean {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    // Claude desktop ships as an Electron app with a "Claude/<version>" UA token.
+    return /\bClaude\/\d/.test(ua) && /\bElectron\b/.test(ua);
+  }
+
+  /** True when audio playback must be locked: attribute OR host fallback. */
+  private _isAudioLocked(): boolean {
+    return this.hasAttribute("audio-locked") || this._isLockedHostEnvironment();
+  }
+
+  /** Apply a change to the `muted` attribute: re-assert under an audio lock,
+   *  else mute/unmute the media, sync the controls, and fire `volumechange`. */
+  private _handleMutedChange(val: string | null): void {
+    // While audio is locked, ignore any attempt to clear `muted` (host control,
+    // stray script, raw `removeAttribute`) and re-assert it. The re-set fires
+    // this callback again with val="" (not null) so it mutes normally — no loop.
+    if (val === null && this._isAudioLocked()) {
+      this.setAttribute("muted", "");
+      return;
+    }
+    this._media.updateMuted(val !== null);
+    this._sendControl("set-muted", { muted: val !== null });
+    this.controlsApi?.updateMuted(val !== null);
+    this.dispatchEvent(new Event("volumechange"));
+  }
+
+  /**
+   * Host-mandated silent playback (e.g. embedded in a chat host): force mute
+   * and hide the volume controls so the viewer cannot turn sound on. Unlocking
+   * only unhides the controls — it does not auto-unmute; callers manage `muted`
+   * explicitly after unlocking.
+   */
+  private _applyAudioLock(locked: boolean): void {
+    if (locked) this.muted = true;
+    this.controlsApi?.setVolumeControlsHidden(locked);
   }
 
   get volume() {
@@ -349,6 +428,21 @@ class HyperframesPlayer extends HTMLElement {
     } catch {
       /* cross-origin */
     }
+  }
+
+  /**
+   * Replay current bridge state to the iframe runtime. Triggered when the
+   * runtime announces `{type: "ready"}` — repairs the race where the parent
+   * posts control messages before the iframe's bridge listener is installed
+   * (warm-cache reloads, the Claude desktop Electron client, anywhere the
+   * iframe finishes loading after we've already called `set-muted` etc).
+   * Re-sending current state is idempotent — even at default values it just
+   * confirms what the runtime would have done anyway.
+   */
+  private _replayBridgeState(): void {
+    this._sendControl("set-muted", { muted: this.muted });
+    this._sendControl("set-volume", { volume: this._volume });
+    this._sendControl("set-playback-rate", { playbackRate: this.playbackRate });
   }
 
   private _reloadShaderOptions(): void {
@@ -452,6 +546,7 @@ class HyperframesPlayer extends HTMLElement {
       },
       sendControl: (action, extra) => this._sendControl(action, extra),
       getIframeDoc: () => this.iframe.contentDocument,
+      onRuntimeReady: () => this._replayBridgeState(),
       updateControlsTime: (t, d) => this.controlsApi?.updateTime(t, d),
       updateControlsPlaying: (p) => this.controlsApi?.updatePlaying(p),
       dispatchEvent: (ev) => this.dispatchEvent(ev),
@@ -510,6 +605,7 @@ class HyperframesPlayer extends HTMLElement {
         onMuteToggle: () => void (this.muted = !this.muted),
         onVolumeChange: (v) => void (this.volume = v),
       },
+      this._isAudioLocked(),
     );
   }
 

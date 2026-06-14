@@ -226,6 +226,7 @@ describe("resolveDomEditCapabilities", () => {
 });
 
 describe("resolveVisualDomEditSelectionTarget", () => {
+  // fallow-ignore-next-line code-duplication
   it("prefers the visible leaf under the pointer over an oversized container", () => {
     const document = createDocument(`
       <section id="container" class="hero-shell">
@@ -299,7 +300,7 @@ describe("resolveVisualDomEditSelectionTarget", () => {
     ).toBe(card);
   });
 
-  it("keeps explicit layer selection able to target containers", () => {
+  it("keeps explicit layer selection able to target containers", async () => {
     const document = createDocument(`
       <section id="container" class="hero-shell">
         <span id="headline" class="headline">Launch faster</span>
@@ -313,7 +314,7 @@ describe("resolveVisualDomEditSelectionTarget", () => {
     const visualTarget = resolveVisualDomEditSelectionTarget([container, headline], {
       activeCompositionPath: "index.html",
     });
-    const explicitSelection = resolveDomEditSelection(container, {
+    const explicitSelection = await resolveDomEditSelection(container, {
       activeCompositionPath: "index.html",
       isMasterView: false,
     });
@@ -430,7 +431,91 @@ describe("resolveDomEditSelection", () => {
     });
   });
 
-  it("resolves child clicks inside a composition host to the child in master view", () => {
+  it("keeps the full-canvas stage layer transform disabled while allowing style edits", async () => {
+    const document = createDocument(`
+      <div data-hf-id="hf-stage" id="stage">
+        <button id="cta">Add to basket</button>
+      </div>
+    `);
+    document.documentElement.setAttribute("data-composition-id", "root");
+    document.documentElement.setAttribute("data-width", "1920");
+    document.documentElement.setAttribute("data-height", "1080");
+    setElementRect(document.documentElement, { left: 0, top: 0, width: 1920, height: 1080 });
+    const stage = document.getElementById("stage") as HTMLElement;
+    setElementRect(stage, { left: 0, top: 0, width: 1920, height: 1080 });
+
+    const selection = await resolveDomEditSelection(stage, {
+      activeCompositionPath: null,
+      isMasterView: true,
+      skipSourceProbe: true,
+    });
+
+    expect(selection?.id).toBe("stage");
+    expect(selection?.capabilities).toMatchObject({
+      canSelect: true,
+      canEditStyles: true,
+      canMove: false,
+      canResize: false,
+      canApplyManualOffset: false,
+      canApplyManualSize: false,
+      canApplyManualRotation: false,
+      reasonIfDisabled: "The root composition defines the preview bounds.",
+    });
+  });
+
+  it("keeps direct full-bleed absolute layers editable", async () => {
+    const document = createDocument(`
+      <div id="hero" style="position: absolute; left: 0; top: 0; width: 1920px; height: 1080px;"></div>
+    `);
+    document.documentElement.setAttribute("data-composition-id", "root");
+    document.documentElement.setAttribute("data-width", "1920");
+    document.documentElement.setAttribute("data-height", "1080");
+    setElementRect(document.documentElement, { left: 0, top: 0, width: 1920, height: 1080 });
+    const hero = document.getElementById("hero") as HTMLElement;
+    setElementRect(hero, { left: 0, top: 0, width: 1920, height: 1080 });
+
+    const selection = await resolveDomEditSelection(hero, {
+      activeCompositionPath: null,
+      isMasterView: true,
+      skipSourceProbe: true,
+    });
+
+    expect(selection?.id).toBe("hero");
+    expect(selection?.capabilities).toMatchObject({
+      canSelect: true,
+      canEditStyles: true,
+      canMove: true,
+      canResize: true,
+      canApplyManualOffset: true,
+      canApplyManualSize: true,
+      canApplyManualRotation: true,
+    });
+  });
+
+  it("lets full-canvas layers opt out of root-layer classification", async () => {
+    const document = createDocument(`
+      <div data-hf-allow-root-edit id="editable-stage">
+        <button id="cta">Add to basket</button>
+      </div>
+    `);
+    document.documentElement.setAttribute("data-composition-id", "root");
+    document.documentElement.setAttribute("data-width", "1920");
+    document.documentElement.setAttribute("data-height", "1080");
+    setElementRect(document.documentElement, { left: 0, top: 0, width: 1920, height: 1080 });
+    const editableStage = document.getElementById("editable-stage") as HTMLElement;
+    setElementRect(editableStage, { left: 0, top: 0, width: 1920, height: 1080 });
+
+    const selection = await resolveDomEditSelection(editableStage, {
+      activeCompositionPath: null,
+      isMasterView: true,
+      skipSourceProbe: true,
+    });
+
+    expect(selection?.id).toBe("editable-stage");
+    expect(selection?.capabilities.canApplyManualOffset).toBe(true);
+  });
+
+  it("resolves child clicks inside a composition host to the child in master view", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div
@@ -445,7 +530,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const child = document.getElementById("inner-copy") as HTMLElement;
-    const selection = resolveDomEditSelection(child, {
+    const selection = await resolveDomEditSelection(child, {
       activeCompositionPath: null,
       isMasterView: true,
     });
@@ -457,7 +542,8 @@ describe("resolveDomEditSelection", () => {
     expect(selection?.capabilities.canEditStyles).toBe(true);
   });
 
-  it("does not prefer a scene host clip ancestor when selecting inside it", () => {
+  // fallow-ignore-next-line code-duplication
+  it("does not prefer a scene host clip ancestor when selecting inside it", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div
@@ -472,7 +558,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const child = document.getElementById("inner-copy") as HTMLElement;
-    const selection = resolveDomEditSelection(child, {
+    const selection = await resolveDomEditSelection(child, {
       activeCompositionPath: null,
       isMasterView: true,
       preferClipAncestor: true,
@@ -483,7 +569,7 @@ describe("resolveDomEditSelection", () => {
     expect(selection?.isCompositionHost).toBe(false);
   });
 
-  it("still prefers an internal clip ancestor inside a scene", () => {
+  it("still prefers an internal clip ancestor inside a scene", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div
@@ -500,7 +586,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const child = document.getElementById("inner-copy") as HTMLElement;
-    const selection = resolveDomEditSelection(child, {
+    const selection = await resolveDomEditSelection(child, {
       activeCompositionPath: null,
       isMasterView: true,
       preferClipAncestor: true,
@@ -511,7 +597,7 @@ describe("resolveDomEditSelection", () => {
     expect(selection?.isCompositionHost).toBe(false);
   });
 
-  it("scopes class selector indexing to the same source file", () => {
+  it("scopes class selector indexing to the same source file", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div class="chip">Root chip</div>
@@ -522,7 +608,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const rootChip = document.getElementsByClassName("chip")[0] as HTMLElement;
-    const selection = resolveDomEditSelection(rootChip, {
+    const selection = await resolveDomEditSelection(rootChip, {
       activeCompositionPath: null,
       isMasterView: true,
     });
@@ -533,7 +619,7 @@ describe("resolveDomEditSelection", () => {
     expect(findElementForSelection(document, selection!, null)).toBe(rootChip);
   });
 
-  it("resolves nested duplicate ids from master view without treating root as the nested source", () => {
+  it("resolves nested duplicate ids from master view without treating root as the nested source", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div id="card">Root card</div>
@@ -546,7 +632,7 @@ describe("resolveDomEditSelection", () => {
     const nestedCard = document.querySelector(
       '[data-composition-file="scenes/nested.html"] #card',
     ) as HTMLElement;
-    const selection = resolveDomEditSelection(nestedCard, {
+    const selection = await resolveDomEditSelection(nestedCard, {
       activeCompositionPath: null,
       isMasterView: true,
     });
@@ -588,7 +674,7 @@ describe("resolveDomEditSelection", () => {
     ).toBeNull();
   });
 
-  it("escapes ids and composition ids when creating stable selectors", () => {
+  it("escapes ids and composition ids when creating stable selectors", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div id="logo:light">Logo</div>
@@ -600,11 +686,11 @@ describe("resolveDomEditSelection", () => {
       (element) => element.getAttribute("data-composition-id") === "scene:one",
     ) as HTMLElement;
 
-    const logoSelection = resolveDomEditSelection(logo, {
+    const logoSelection = await resolveDomEditSelection(logo, {
       activeCompositionPath: null,
       isMasterView: true,
     });
-    const sceneSelection = resolveDomEditSelection(scene, {
+    const sceneSelection = await resolveDomEditSelection(scene, {
       activeCompositionPath: null,
       isMasterView: true,
     });
@@ -615,7 +701,7 @@ describe("resolveDomEditSelection", () => {
     expect(findElementForSelection(document, sceneSelection!, null)).toBe(scene);
   });
 
-  it("prefers the nearest clip ancestor on single-click style selection", () => {
+  it("prefers the nearest clip ancestor on single-click style selection", async () => {
     const document = createDocument(`
       <section id="card" class="clip" style="left: 10px; top: 20px; width: 200px; height: 100px; position: absolute;">
         <p id="copy">Hello</p>
@@ -623,7 +709,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const child = document.getElementById("copy") as HTMLElement;
-    const selection = resolveDomEditSelection(child, {
+    const selection = await resolveDomEditSelection(child, {
       activeCompositionPath: null,
       isMasterView: false,
       preferClipAncestor: true,
@@ -633,7 +719,7 @@ describe("resolveDomEditSelection", () => {
     expect(selection?.selector).toBe("#card");
   });
 
-  it("can resolve the exact child when clip-ancestor preference is disabled", () => {
+  it("can resolve the exact child when clip-ancestor preference is disabled", async () => {
     const document = createDocument(`
       <section id="card" class="clip" style="left: 10px; top: 20px; width: 200px; height: 100px; position: absolute;">
         <p id="copy">Hello</p>
@@ -641,7 +727,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const child = document.getElementById("copy") as HTMLElement;
-    const selection = resolveDomEditSelection(child, {
+    const selection = await resolveDomEditSelection(child, {
       activeCompositionPath: null,
       isMasterView: false,
       preferClipAncestor: false,
@@ -651,7 +737,8 @@ describe("resolveDomEditSelection", () => {
     expect(selection?.selector).toBe("#copy");
   });
 
-  it("collects simple child text blocks as separate editable fields", () => {
+  // fallow-ignore-next-line code-duplication
+  it("collects simple child text blocks as separate editable fields", async () => {
     const document = createDocument(`
       <section id="card" class="clip" style="left: 10px; top: 20px; width: 200px; height: 100px; position: absolute;">
         <strong>Headline</strong>
@@ -659,10 +746,13 @@ describe("resolveDomEditSelection", () => {
       </section>
     `);
 
-    const selection = resolveDomEditSelection(document.getElementById("card") as HTMLElement, {
-      activeCompositionPath: null,
-      isMasterView: false,
-    });
+    const selection = await resolveDomEditSelection(
+      document.getElementById("card") as HTMLElement,
+      {
+        activeCompositionPath: null,
+        isMasterView: false,
+      },
+    );
 
     expect(selection?.textFields.map((field) => field.label)).toEqual(["Text 1", "Text 2"]);
     expect(selection?.textFields.map((field) => field.value)).toEqual([
@@ -671,30 +761,36 @@ describe("resolveDomEditSelection", () => {
     ]);
   });
 
-  it("preserves user-entered text spacing in editable text fields", () => {
+  it("preserves user-entered text spacing in editable text fields", async () => {
     const document = createDocument(`
       <section id="card" class="clip" style="position: absolute;">
         <strong>Headline with trailing space </strong>
       </section>
     `);
 
-    const selection = resolveDomEditSelection(document.getElementById("card") as HTMLElement, {
-      activeCompositionPath: null,
-      isMasterView: false,
-    });
+    const selection = await resolveDomEditSelection(
+      document.getElementById("card") as HTMLElement,
+      {
+        activeCompositionPath: null,
+        isMasterView: false,
+      },
+    );
 
     expect(selection?.textFields[0]?.value).toBe("Headline with trailing space ");
   });
 
-  it("keeps an emptied text layer editable so users can type into it again", () => {
+  it("keeps an emptied text layer editable so users can type into it again", async () => {
     const document = createDocument(`
       <div id="card" class="clip" style="position: absolute;"></div>
     `);
 
-    const selection = resolveDomEditSelection(document.getElementById("card") as HTMLElement, {
-      activeCompositionPath: null,
-      isMasterView: false,
-    });
+    const selection = await resolveDomEditSelection(
+      document.getElementById("card") as HTMLElement,
+      {
+        activeCompositionPath: null,
+        isMasterView: false,
+      },
+    );
 
     expect(selection?.textFields).toMatchObject([
       {
@@ -707,7 +803,7 @@ describe("resolveDomEditSelection", () => {
     expect(selection ? isTextEditableSelection(selection) : false).toBe(true);
   });
 
-  it("keeps emptied child text layers editable after their content is cleared", () => {
+  it("keeps emptied child text layers editable after their content is cleared", async () => {
     const document = createDocument(`
       <div id="card" class="clip" style="position: absolute;">
         <strong></strong>
@@ -715,16 +811,19 @@ describe("resolveDomEditSelection", () => {
       </div>
     `);
 
-    const selection = resolveDomEditSelection(document.getElementById("card") as HTMLElement, {
-      activeCompositionPath: null,
-      isMasterView: false,
-    });
+    const selection = await resolveDomEditSelection(
+      document.getElementById("card") as HTMLElement,
+      {
+        activeCompositionPath: null,
+        isMasterView: false,
+      },
+    );
 
     expect(selection?.textFields.map((field) => field.tagName)).toEqual(["strong", "span"]);
     expect(selection?.textFields.map((field) => field.value)).toEqual(["", ""]);
   });
 
-  it("explains anonymous child elements that resolve to an editable parent", () => {
+  it("explains anonymous child elements that resolve to an editable parent", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div id="card">
@@ -734,7 +833,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const child = document.querySelector("strong") as HTMLElement;
-    const selection = resolveDomEditSelection(child, {
+    const selection = await resolveDomEditSelection(child, {
       activeCompositionPath: null,
       isMasterView: false,
       preferClipAncestor: false,
@@ -744,7 +843,7 @@ describe("resolveDomEditSelection", () => {
     expect(getDomEditNonEditableReason(child, selection)).toBe("Selection resolves to Card");
   });
 
-  it("does not mark an element as non-editable when Studio can edit it directly", () => {
+  it("does not mark an element as non-editable when Studio can edit it directly", async () => {
     const document = createDocument(`
       <div data-composition-id="main">
         <div id="card">Editable</div>
@@ -752,7 +851,7 @@ describe("resolveDomEditSelection", () => {
     `);
 
     const element = document.getElementById("card") as HTMLElement;
-    const selection = resolveDomEditSelection(element, {
+    const selection = await resolveDomEditSelection(element, {
       activeCompositionPath: null,
       isMasterView: false,
     });
@@ -1139,5 +1238,48 @@ describe("patch builders and prompt builder", () => {
         isMasterView: false,
       }),
     ).not.toThrow();
+  });
+});
+
+describe("hfId — find, key, capabilities (R7 fixes)", () => {
+  it("getDomEditTargetKey keeps two hfId-only elements distinct", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const a = getDomEditTargetKey({ sourceFile: "index.html", hfId: "hf-aaa" } as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const b = getDomEditTargetKey({ sourceFile: "index.html", hfId: "hf-bbb" } as any);
+    expect(a).not.toBe(b);
+  });
+
+  it("findElementForSelection finds element by data-hf-id when no id or selector", () => {
+    const doc = createDocument(`
+      <div data-composition-id="root">
+        <div data-hf-id="hf-xyz789" class="clip" style="position:absolute;left:0;top:0;width:100px;height:100px;"></div>
+      </div>
+    `);
+    const el = doc.querySelector('[data-hf-id="hf-xyz789"]') as HTMLElement;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const found = findElementForSelection(doc, { hfId: "hf-xyz789" } as any);
+    expect(found).toBe(el);
+  });
+
+  it("resolveDomEditCapabilities enables editing for hfId-only element (no CSS selector)", () => {
+    const result = resolveDomEditCapabilities({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      hfId: "hf-abc" as any,
+      selector: undefined,
+      inlineStyles: { left: "10px", top: "20px", width: "100px", height: "50px" },
+      computedStyles: {
+        position: "absolute",
+        left: "10px",
+        top: "20px",
+        width: "100px",
+        height: "50px",
+      },
+      isCompositionHost: false,
+      isInsideLockedComposition: false,
+      isMasterView: false,
+    });
+    expect(result.canSelect).toBe(true);
+    expect(result.canMove).toBe(true);
   });
 });
