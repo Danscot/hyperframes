@@ -1,20 +1,7 @@
 import { useCallback } from "react";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import { getStudioSaveErrorMessage, trackStudioSaveFailure } from "../utils/studioSaveDiagnostics";
-
-type CommitMutationOptions = {
-  label: string;
-  coalesceKey?: string;
-  softReload?: boolean;
-  skipReload?: boolean;
-  beforeReload?: () => void;
-};
-
-type CommitMutation = (
-  selection: DomEditSelection,
-  mutation: Record<string, unknown>,
-  options: CommitMutationOptions,
-) => Promise<void>;
+import type { CommitMutation, CommitMutationOptions } from "./gsapScriptCommitTypes";
 
 type TrackGsapSaveFailure = (
   error: unknown,
@@ -55,12 +42,16 @@ export function useSafeGsapCommitMutation(
       selection: DomEditSelection,
       mutation: Record<string, unknown>,
       options: CommitMutationOptions,
-    ) => {
-      void commitMutation(selection, mutation, options).catch((error) => {
+    ): Promise<void> =>
+      // Return the chain so awaiting consumers (gesture commit, enable-keyframes)
+      // run their post-actions AFTER the server save settles, not immediately.
+      // The `.catch` handles the failure (toast + telemetry) and resolves the
+      // chain, so awaiters see a settled (success-after-handled) promise rather
+      // than an unhandled rejection.
+      commitMutation(selection, mutation, options).catch((error) => {
         trackGsapSaveFailure(error, selection, mutation, options.label);
         showToast?.(`Couldn't save animation: ${getStudioSaveErrorMessage(error)}`, "error");
-      });
-    },
+      }),
     [commitMutation, trackGsapSaveFailure, showToast],
   );
 }

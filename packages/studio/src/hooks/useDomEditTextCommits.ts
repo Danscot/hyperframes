@@ -23,12 +23,24 @@ import {
 } from "../components/editor/domEditing";
 import type { ImportedFontAsset } from "../components/editor/fontAssets";
 import type { PersistDomEditOperations } from "./domEditCommitTypes";
+import { buildTextFieldChildOperations } from "./domEditTextFieldCommitOps";
+import {
+  DomEditPersistUnsupportedTextStructureError,
+  reportDomEditPersistFailure,
+} from "./domEditPersistFailure";
+import {
+  bumpDomEditCommitMapVersion,
+  bumpDomEditCommitVersion,
+  runDomEditCommit,
+} from "./domEditCommitRunner";
+import { useDomEditAttributeCommits } from "./useDomEditAttributeCommits";
 
 // ── Types ──
 
 export interface UseDomEditTextCommitsParams {
   activeCompPath: string | null;
   previewIframeRef: React.MutableRefObject<HTMLIFrameElement | null>;
+  showToast: (message: string, tone?: "error" | "info") => void;
   domEditSelection: DomEditSelection | null;
   applyDomSelection: (
     selection: DomEditSelection | null,
@@ -43,11 +55,86 @@ export interface UseDomEditTextCommitsParams {
   resolveImportedFontAsset: (fontFamilyValue: string) => ImportedFontAsset | null;
 }
 
+interface DomTextCommitPlan {
+  usesSerializedTextFields: boolean;
+  nextContent: string;
+  childOperations: PatchOperation[] | null;
+  operations: PatchOperation[];
+}
+
+function buildDomStyleCommitOperations(
+  property: string,
+  value: string,
+  isImageBackgroundCommit: boolean,
+): PatchOperation[] {
+  const operations: PatchOperation[] = [
+    buildDomEditStylePatchOperation(property, normalizeDomEditStyleValue(property, value)),
+  ];
+  if (isImageBackgroundCommit) {
+    operations.push(
+      buildDomEditStylePatchOperation("background-position", "center"),
+      buildDomEditStylePatchOperation("background-repeat", "no-repeat"),
+      buildDomEditStylePatchOperation("background-size", "contain"),
+    );
+  }
+  return operations;
+}
+
+function buildNextDomTextFields(
+  textFields: DomEditTextField[],
+  value: string,
+  fieldKey?: string,
+): DomEditTextField[] {
+  if (textFields.length === 0) return [];
+  return textFields.map((field) => (field.key === fieldKey ? { ...field, value } : field));
+}
+
+function planDomTextCommit(
+  originalTextFields: DomEditTextField[],
+  nextTextFields: DomEditTextField[],
+  plainTextContent: string,
+): DomTextCommitPlan {
+  const usesSerializedTextFields =
+    nextTextFields.length > 1 || nextTextFields.some((field) => field.source === "child");
+  const nextContent = usesSerializedTextFields
+    ? serializeDomEditTextFields(nextTextFields)
+    : plainTextContent;
+  const childOperations = usesSerializedTextFields
+    ? buildTextFieldChildOperations(originalTextFields, nextTextFields)
+    : null;
+  const operations =
+    childOperations ??
+    (usesSerializedTextFields ? [] : [buildDomEditTextPatchOperation(nextContent)]);
+
+  return {
+    usesSerializedTextFields,
+    nextContent,
+    childOperations,
+    operations,
+  };
+}
+
+async function resyncDomTextSelectionFromPreview(
+  doc: Document | null | undefined,
+  selection: DomEditSelection,
+  activeCompPath: string | null,
+  buildDomSelectionFromTarget: UseDomEditTextCommitsParams["buildDomSelectionFromTarget"],
+  applyDomSelection: UseDomEditTextCommitsParams["applyDomSelection"],
+): Promise<void> {
+  if (!doc) return;
+  const refreshed = findElementForSelection(doc, selection, activeCompPath);
+  if (!refreshed) return;
+  const nextSelection = await buildDomSelectionFromTarget(refreshed);
+  if (!nextSelection) return;
+  applyDomSelection(nextSelection, { revealPanel: false, preserveGroup: true });
+}
+
 // ── Hook ──
 
 export function useDomEditTextCommits({
   activeCompPath,
   previewIframeRef,
+  showToast,
   domEditSelection,
   applyDomSelection,
   refreshDomEditSelectionFromPreview,
@@ -56,53 +143,87 @@ export function useDomEditTextCommits({
   resolveImportedFontAsset,
 }: UseDomEditTextCommitsParams) {
   const domTextCommitVersionRef = useRef(0);
+  const domStyleCommitVersionRef = useRef(new Map<string, number>());
+
+  const { handleDomAttributeCommit, handleDomAttributeLiveCommit, handleDomHtmlAttributeCommit } =
+    useDomEditAttributeCommits({
+      activeCompPath,
+      previewIframeRef,
+      showToast,
+      domEditSelection,
+      refreshDomEditSelectionFromPreview,
+      persistDomEditOperations,
+    });
 
   const handleDomStyleCommit = useCallback(
     async (property: string, value: string) => {
       if (!domEditSelection) return;
       if (isManualGeometryStyleProperty(property)) return;
       if (!domEditSelection.capabilities.canEditStyles) return;
+      const styleCommitKey = `${getDomEditTargetKey(domEditSelection)}:${property}`;
+      const isLatestStyleCommit = bumpDomEditCommitMapVersion(
+        domStyleCommitVersionRef.current,
+        styleCommitKey,
+      );
       const importedFont = property === "font-family" ? resolveImportedFontAsset(value) : null;
       const iframe = previewIframeRef.current;
       const doc = iframe?.contentDocument;
-      if (doc) {
-        const el = findElementForSelection(doc, domEditSelection, activeCompPath);
-        if (el) {
-          el.style.setProperty(property, normalizeDomEditStyleValue(property, value));
-          if (property === "font-family") {
+      const normalizedValue = normalizeDomEditStyleValue(property, value);
+      const isImageBackgroundCommit =
+        property === "background-image" && isImageBackgroundValue(value);
+      let editedElement: HTMLElement | null = null;
+      let previousInlineValue: string | null = null;
+      const operations = buildDomStyleCommitOperations(property, value, isImageBackgroundCommit);
+      // Inline-style commits never full-reload the preview (that blanks the iframe
+      // until it re-renders): the live element was already mutated optimistically in
+      // apply(). z-index is no exception — setting `element.style.zIndex` restacks the
+      // element in-browser immediately, so a reload would only cost a black blink.
+      const skipRefresh = true;
+
+      await runDomEditCommit({
+        capture: () => {
+          if (!doc) return;
+          const el = findElementForSelection(doc, domEditSelection, activeCompPath);
+          if (!el) return;
+          editedElement = el;
+          previousInlineValue = el.style.getPropertyValue(property);
+        },
+        apply: () => {
+          if (!editedElement) return;
+          editedElement.style.setProperty(property, normalizedValue);
+          if (property === "font-family" && doc) {
             injectPreviewGoogleFont(doc, value);
             if (importedFont) injectPreviewImportedFont(doc, importedFont);
           }
-          if (property === "background-image" && isImageBackgroundValue(value)) {
-            el.style.setProperty("background-position", "center");
-            el.style.setProperty("background-repeat", "no-repeat");
-            el.style.setProperty("background-size", "contain");
+          if (isImageBackgroundCommit) {
+            editedElement.style.setProperty("background-position", "center");
+            editedElement.style.setProperty("background-repeat", "no-repeat");
+            editedElement.style.setProperty("background-size", "contain");
           }
-        }
-      }
-      const operations: PatchOperation[] = [
-        buildDomEditStylePatchOperation(property, normalizeDomEditStyleValue(property, value)),
-      ];
-      if (property === "background-image" && isImageBackgroundValue(value)) {
-        operations.push(
-          buildDomEditStylePatchOperation("background-position", "center"),
-          buildDomEditStylePatchOperation("background-repeat", "no-repeat"),
-          buildDomEditStylePatchOperation("background-size", "contain"),
-        );
-      }
-      const skipRefresh = property !== "z-index";
-      try {
-        await persistDomEditOperations(domEditSelection, operations, {
-          label: "Edit layer style",
-          skipRefresh,
-          prepareContent: importedFont
-            ? (html, sourceFile) => ensureImportedFontFace(html, importedFont, sourceFile)
-            : undefined,
-        });
-      } catch (err) {
-        console.warn("[Studio] Style persist failed:", err instanceof Error ? err.message : err);
-      }
-      refreshDomEditSelectionFromPreview(domEditSelection);
+        },
+        persist: () =>
+          persistDomEditOperations(domEditSelection, operations, {
+            label: "Edit layer style",
+            skipRefresh,
+            prepareContent: importedFont
+              ? (html, sourceFile) => ensureImportedFontFace(html, importedFont, sourceFile)
+              : undefined,
+          }),
+        shouldRevert: () => isLatestStyleCommit(),
+        revert: () => {
+          if (!editedElement || previousInlineValue === null) return;
+          // ponytail: background-image side-effect styles are not reverted here.
+          if (previousInlineValue === "") {
+            editedElement.style.removeProperty(property);
+          } else {
+            editedElement.style.setProperty(property, previousInlineValue);
+          }
+        },
+        onError: (error) =>
+          reportDomEditPersistFailure(domEditSelection, operations, error, showToast),
+        shouldResync: isLatestStyleCommit,
+        resync: () => refreshDomEditSelectionFromPreview(domEditSelection),
+      });
     },
     [
       activeCompPath,
@@ -110,78 +231,7 @@ export function useDomEditTextCommits({
       persistDomEditOperations,
       refreshDomEditSelectionFromPreview,
       resolveImportedFontAsset,
-      previewIframeRef,
-    ],
-  );
-
-  const handleDomAttributeCommit = useCallback(
-    async (attr: string, value: string) => {
-      if (!domEditSelection) return;
-      const iframe = previewIframeRef.current;
-      const doc = iframe?.contentDocument;
-      if (doc) {
-        const el = findElementForSelection(doc, domEditSelection, activeCompPath);
-        if (el) el.setAttribute(`data-${attr}`, value);
-      }
-      const op: PatchOperation = { type: "attribute", property: attr, value };
-      try {
-        await persistDomEditOperations(domEditSelection, [op], {
-          label: `Edit ${attr.replace(/-/g, " ")}`,
-          coalesceKey: `attr:${attr}:${getDomEditTargetKey(domEditSelection)}`,
-          skipRefresh: false,
-        });
-      } catch (err) {
-        console.warn(
-          "[Studio] Attribute persist failed:",
-          err instanceof Error ? err.message : err,
-        );
-      }
-      refreshDomEditSelectionFromPreview(domEditSelection);
-    },
-    [
-      activeCompPath,
-      domEditSelection,
-      persistDomEditOperations,
-      refreshDomEditSelectionFromPreview,
-      previewIframeRef,
-    ],
-  );
-
-  const handleDomHtmlAttributeCommit = useCallback(
-    async (attr: string, value: string | null) => {
-      if (!domEditSelection) return;
-      const iframe = previewIframeRef.current;
-      const doc = iframe?.contentDocument;
-      if (doc) {
-        const el = findElementForSelection(doc, domEditSelection, activeCompPath);
-        if (el) {
-          if (value === null || value === "" || value === "false") {
-            el.removeAttribute(attr);
-          } else {
-            el.setAttribute(attr, value);
-          }
-        }
-      }
-      const op: PatchOperation = { type: "html-attribute", property: attr, value };
-      try {
-        await persistDomEditOperations(domEditSelection, [op], {
-          label: `Edit ${attr}`,
-          coalesceKey: `html-attr:${attr}:${getDomEditTargetKey(domEditSelection)}`,
-          skipRefresh: false,
-        });
-      } catch (err) {
-        console.warn(
-          "[Studio] HTML attribute persist failed:",
-          err instanceof Error ? err.message : err,
-        );
-      }
-      refreshDomEditSelectionFromPreview(domEditSelection);
-    },
-    [
-      activeCompPath,
-      domEditSelection,
-      persistDomEditOperations,
-      refreshDomEditSelectionFromPreview,
+      showToast,
       previewIframeRef,
     ],
   );
@@ -190,53 +240,57 @@ export function useDomEditTextCommits({
     async (value: string, fieldKey?: string) => {
       if (!domEditSelection) return;
       if (!isTextEditableSelection(domEditSelection)) return;
-      const commitVersion = domTextCommitVersionRef.current + 1;
-      domTextCommitVersionRef.current = commitVersion;
-      const nextTextFields =
-        domEditSelection.textFields.length > 0
-          ? domEditSelection.textFields.map((field) =>
-              field.key === fieldKey ? { ...field, value } : field,
-            )
-          : [];
-      const nextContent =
-        nextTextFields.length > 1 || nextTextFields.some((field) => field.source === "child")
-          ? serializeDomEditTextFields(nextTextFields)
-          : value;
+      const isLatestTextCommit = bumpDomEditCommitVersion(domTextCommitVersionRef);
+      const nextTextFields = buildNextDomTextFields(domEditSelection.textFields, value, fieldKey);
+      const textCommit = planDomTextCommit(domEditSelection.textFields, nextTextFields, value);
       const iframe = previewIframeRef.current;
       const doc = iframe?.contentDocument;
-      if (doc) {
-        const el = findElementForSelection(doc, domEditSelection, activeCompPath);
-        if (el) {
-          if (
-            nextTextFields.length > 1 ||
-            nextTextFields.some((field) => field.source === "child")
-          ) {
-            el.innerHTML = nextContent;
-          } else {
-            el.textContent = value;
-          }
-        }
-      }
-      await persistDomEditOperations(
-        domEditSelection,
-        [buildDomEditTextPatchOperation(nextContent)],
-        {
-          label: "Edit text",
-          skipRefresh: true,
-          shouldSave: () => domTextCommitVersionRef.current === commitVersion,
-        },
-      );
-      if (domTextCommitVersionRef.current !== commitVersion) return;
+      let editedElement: HTMLElement | null = null;
+      let previousInnerHtml: string | null = null;
 
-      if (doc) {
-        const refreshed = findElementForSelection(doc, domEditSelection, activeCompPath);
-        if (refreshed) {
-          const nextSelection = await buildDomSelectionFromTarget(refreshed);
-          if (nextSelection) {
-            applyDomSelection(nextSelection, { revealPanel: false, preserveGroup: true });
+      await runDomEditCommit({
+        capture: () => {
+          if (!doc) return;
+          const el = findElementForSelection(doc, domEditSelection, activeCompPath);
+          if (!el) return;
+          editedElement = el;
+          previousInnerHtml = el.innerHTML;
+        },
+        apply: () => {
+          if (!editedElement) return;
+          if (textCommit.usesSerializedTextFields) {
+            editedElement.innerHTML = textCommit.nextContent;
+          } else {
+            editedElement.textContent = value;
           }
-        }
-      }
+        },
+        persist: async () => {
+          if (textCommit.usesSerializedTextFields && textCommit.childOperations === null) {
+            throw new DomEditPersistUnsupportedTextStructureError();
+          }
+          await persistDomEditOperations(domEditSelection, textCommit.operations, {
+            label: "Edit text",
+            skipRefresh: true,
+            shouldSave: isLatestTextCommit,
+          });
+        },
+        shouldRevert: () => isLatestTextCommit(),
+        revert: () => {
+          if (!editedElement || previousInnerHtml === null) return;
+          editedElement.innerHTML = previousInnerHtml;
+        },
+        onError: (error) =>
+          reportDomEditPersistFailure(domEditSelection, textCommit.operations, error, showToast),
+        shouldResync: isLatestTextCommit,
+        resync: () =>
+          resyncDomTextSelectionFromPreview(
+            doc,
+            domEditSelection,
+            activeCompPath,
+            buildDomSelectionFromTarget,
+            applyDomSelection,
+          ),
+      });
     },
     [
       activeCompPath,
@@ -245,6 +299,7 @@ export function useDomEditTextCommits({
       domEditSelection,
       persistDomEditOperations,
       previewIframeRef,
+      showToast,
     ],
   );
 
@@ -254,45 +309,63 @@ export function useDomEditTextCommits({
       nextTextFields: DomEditTextField[],
       options?: { importedFont?: ImportedFontAsset | null },
     ) => {
-      const nextContent =
-        nextTextFields.length > 1 || nextTextFields.some((field) => field.source === "child")
-          ? serializeDomEditTextFields(nextTextFields)
-          : (nextTextFields[0]?.value ?? "");
-
+      const isLatestTextCommit = bumpDomEditCommitVersion(domTextCommitVersionRef);
+      const textCommit = planDomTextCommit(
+        selection.textFields,
+        nextTextFields,
+        nextTextFields[0]?.value ?? "",
+      );
       const iframe = previewIframeRef.current;
       const doc = iframe?.contentDocument;
-      if (doc) {
-        const el = findElementForSelection(doc, selection, activeCompPath);
-        if (el) {
-          if (
-            nextTextFields.length > 1 ||
-            nextTextFields.some((field) => field.source === "child")
-          ) {
-            el.innerHTML = nextContent;
-          } else {
-            el.textContent = nextContent;
-          }
-        }
-      }
-
+      let editedElement: HTMLElement | null = null;
+      let previousInnerHtml: string | null = null;
       const importedFont = options?.importedFont ?? null;
-      await persistDomEditOperations(selection, [buildDomEditTextPatchOperation(nextContent)], {
-        label: "Edit text",
-        skipRefresh: true,
-        prepareContent: importedFont
-          ? (html, sourceFile) => ensureImportedFontFace(html, importedFont, sourceFile)
-          : undefined,
-      });
 
-      if (doc) {
-        const refreshed = findElementForSelection(doc, selection, activeCompPath);
-        if (refreshed) {
-          const nextSelection = await buildDomSelectionFromTarget(refreshed);
-          if (nextSelection) {
-            applyDomSelection(nextSelection, { revealPanel: false, preserveGroup: true });
+      await runDomEditCommit({
+        capture: () => {
+          if (!doc) return;
+          const el = findElementForSelection(doc, selection, activeCompPath);
+          if (!el) return;
+          editedElement = el;
+          previousInnerHtml = el.innerHTML;
+        },
+        apply: () => {
+          if (!editedElement) return;
+          if (textCommit.usesSerializedTextFields) {
+            editedElement.innerHTML = textCommit.nextContent;
+          } else {
+            editedElement.textContent = textCommit.nextContent;
           }
-        }
-      }
+        },
+        persist: async () => {
+          if (textCommit.usesSerializedTextFields && textCommit.childOperations === null) {
+            throw new DomEditPersistUnsupportedTextStructureError();
+          }
+          await persistDomEditOperations(selection, textCommit.operations, {
+            label: "Edit text",
+            skipRefresh: true,
+            prepareContent: importedFont
+              ? (html, sourceFile) => ensureImportedFontFace(html, importedFont, sourceFile)
+              : undefined,
+          });
+        },
+        shouldRevert: () => isLatestTextCommit(),
+        revert: () => {
+          if (!editedElement || previousInnerHtml === null) return;
+          editedElement.innerHTML = previousInnerHtml;
+        },
+        onError: (error) =>
+          reportDomEditPersistFailure(selection, textCommit.operations, error, showToast),
+        shouldResync: isLatestTextCommit,
+        resync: () =>
+          resyncDomTextSelectionFromPreview(
+            doc,
+            selection,
+            activeCompPath,
+            buildDomSelectionFromTarget,
+            applyDomSelection,
+          ),
+      });
     },
     [
       activeCompPath,
@@ -300,6 +373,7 @@ export function useDomEditTextCommits({
       buildDomSelectionFromTarget,
       persistDomEditOperations,
       previewIframeRef,
+      showToast,
     ],
   );
 
@@ -395,6 +469,7 @@ export function useDomEditTextCommits({
   return {
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomTextCommit,
     commitDomTextFields,

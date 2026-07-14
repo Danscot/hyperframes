@@ -58,6 +58,7 @@ import {
 import { defaultLogger } from "../../logger.js";
 import { runEncodeStage } from "../render/stages/encodeStage.js";
 import { runCaptureStage } from "../render/stages/captureStage.js";
+import { resolveVideoCaptureBeyondViewport } from "../render/captureBeyondViewport.js";
 import {
   type ChunkSliceJson,
   type LockedRenderConfig,
@@ -65,7 +66,12 @@ import {
 } from "../render/stages/freezePlan.js";
 import { sha256Hex } from "../render/stages/planHash.js";
 import { applyRuntimeEnvSnapshot } from "../render/runtimeEnvSnapshot.js";
-import { buildVirtualTimeShim, createFileServer, type FileServerHandle } from "../fileServer.js";
+import {
+  buildVirtualTimeShim,
+  closeFileServerSafely,
+  createFileServer,
+  type FileServerHandle,
+} from "../fileServer.js";
 import {
   buildSyntheticRenderJob,
   type DistributedFormat,
@@ -88,6 +94,7 @@ export const PLAN_HASH_MISMATCH = "PLAN_HASH_MISMATCH";
 export const MISSING_PLAN_ARTIFACT = "MISSING_PLAN_ARTIFACT";
 export const CHUNK_INDEX_OUT_OF_RANGE = "CHUNK_INDEX_OUT_OF_RANGE";
 export const MISSING_RUNTIME_ENV_SNAPSHOT = "MISSING_RUNTIME_ENV_SNAPSHOT";
+const LEGACY_DISTRIBUTED_VP9_CPU_USED = 2;
 
 export type RenderChunkValidationCode =
   | typeof FFMPEG_VERSION_MISMATCH
@@ -160,10 +167,19 @@ export interface ChunkResult {
  * Rebuild the engine's in-memory `ExtractedFrames[]` from the on-disk
  * planDir layout. `<planDir>/video-frames/<videoId>/` holds the numbered
  * frame files plan() extracted; this lists each dir and rebuilds the
- * 1-based `framePaths` Map that `FrameLookupTable` / `videoFrameInjector`
- * both index against.
+ * 0-based `framePaths` Map that `FrameLookupTable` / `videoFrameInjector`
+ * both index against — the consumer is
+ * `videoFrameExtractor.ts:getFrameAtTime`, which floors `localTime * fps`
+ * to a 0-based index and reads `framePaths.get(frameIndex)`. Any drift
+ * from that key convention silently drops every `<video>`'s first-paint
+ * frame; see HF#1731 / HF#1730.
+ *
+ * Exported so a unit test can pin the 0-based contract without spinning
+ * up the heavyweight Docker fixture — the bug surfaces only under
+ * distributed mode and only at video first-paint, so this primitive is
+ * the right granularity to guard.
  */
-function rebuildExtractedFramesFromPlanDir(
+export function rebuildExtractedFramesFromPlanDir(
   planDir: string,
   videos: PlanVideosJson["extracted"],
 ): ExtractedFrames[] {
@@ -188,8 +204,7 @@ function rebuildExtractedFramesFromPlanDir(
     for (let i = 0; i < frames.length; i++) {
       const frameName = frames[i];
       if (!frameName) continue;
-      // FrameLookupTable indexes frames 1-based.
-      framePaths.set(i + 1, join(outputDir, frameName));
+      framePaths.set(i, join(outputDir, frameName));
     }
     result.push({
       videoId: v.videoId,
@@ -288,6 +303,15 @@ export function resolvePresetForLockedEncoder<
     return { ...basePreset, codec: "h265" as const };
   }
   return basePreset;
+}
+
+export function resolveLockedVp9CpuUsed(
+  lockedEncoder: Pick<LockedRenderConfig, "encoder" | "vp9CpuUsed">,
+): number | undefined {
+  if (lockedEncoder.encoder !== "libvpx-vp9-software") return undefined;
+  // Pre-vp9CpuUsed WebM planDirs used the old closed-GOP literal. Keep replay
+  // bytes stable for those plans while new planDirs carry their resolved value.
+  return lockedEncoder.vp9CpuUsed ?? LEGACY_DISTRIBUTED_VP9_CPU_USED;
 }
 
 /**
@@ -457,6 +481,10 @@ export async function renderChunk(
           )
         : null;
 
+    const videoCaptureBeyondViewport = resolveVideoCaptureBeyondViewport(
+      planVideos?.videos.length ?? 0,
+    );
+
     // ── Per-chunk work + frames directories ──
     // Suffix workDir with pid + random bytes so concurrent invocations on
     // the SAME `(planDir, chunkIndex)` (e.g. a scheduler that double-fires
@@ -477,6 +505,9 @@ export async function renderChunk(
       compiledDir,
       port: 0,
       preHeadScripts: [buildVirtualTimeShim({ seedRandomFromFrame: true })],
+      // These dimensions are frozen by the controller from the render job, so
+      // chunk runtime seek quantization stays on the same fps grid as capture.
+      fps: { num: plan.dimensions.fpsNum, den: plan.dimensions.fpsDen },
     });
 
     const captureOptions: CaptureOptions = {
@@ -492,6 +523,9 @@ export async function renderChunk(
       // declare `data-composition-variables` leave this undefined and the
       // engine skips the `evaluateOnNewDocument` injection.
       variables: encoder.variables,
+      ...(videoCaptureBeyondViewport !== undefined
+        ? { captureBeyondViewport: videoCaptureBeyondViewport }
+        : {}),
       // lock the BeginFrame warmup loop to a fixed iteration count so
       // `beginFrameTimeTicks` is host-independent. Only chunks ever set this.
       lockWarmupTicks: true,
@@ -568,6 +602,9 @@ export async function renderChunk(
         probeSession: session,
         needsAlpha: plan.dimensions.format !== "mp4",
         captureAttempts: [],
+        // Distributed chunks run on Linux (beginframe) where dedup never arms;
+        // a throwaway sink satisfies the type without per-chunk dedup reporting.
+        dedupPerfs: [],
         buildCaptureOptions: () => captureOptions,
         createRenderVideoFrameInjector: () => videoInjector,
         abortSignal: undefined,
@@ -628,6 +665,10 @@ export async function renderChunk(
         preset,
         effectiveQuality,
         effectiveBitrate,
+        engineConfig: {
+          ffmpegEncodeTimeout: cfg.ffmpegEncodeTimeout,
+          vp9CpuUsed: resolveLockedVp9CpuUsed(encoder) ?? cfg.vp9CpuUsed,
+        },
         // Distributed chunks emit a single ffmpeg call per chunk; the
         // in-process per-chunk-within-chunk path would re-split our
         // already-chunked work.
@@ -654,7 +695,7 @@ export async function renderChunk(
           });
         }
       }
-      fileServer.close();
+      closeFileServerSafely(fileServer, "renderChunk", log);
       // Leave the temp work dir on failure (helps debugging); remove it on
       // success below.
     }
@@ -685,7 +726,7 @@ export async function renderChunk(
     // Clean up only after the hash + perf sidecar landed. Any failure above
     // leaves the framesDir in place for inspection.
     try {
-      rmSync(workDir, { recursive: true, force: true });
+      rmSync(workDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     } catch (err) {
       log.warn("[renderChunk] failed to remove work dir", {
         workDir,

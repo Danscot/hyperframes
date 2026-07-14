@@ -19,15 +19,18 @@ export interface StudioShellValue {
   renderQueue: {
     jobs: unknown[];
     isRendering: boolean;
+    loadError: string | null;
+    actionError: string | null;
+    dismissActionError: () => void;
+    reloadRenders: () => void;
     deleteRender: (jobId: string) => void;
+    cancelRender: (jobId: string) => void;
     clearCompleted: () => void;
     startRender: (options: unknown) => Promise<void>;
   };
   compositionDimensions: CompositionDimensions | null;
   waitForPendingDomEditSaves: () => Promise<void>;
   handlePreviewIframeRef: (iframe: HTMLIFrameElement | null) => void;
-  timelineVisible: boolean;
-  toggleTimelineVisibility: () => void;
 }
 
 export interface StudioPlaybackValue {
@@ -51,6 +54,15 @@ export function useStudioShellContext(): StudioShellValue {
   return ctx;
 }
 
+/**
+ * Optional access — returns null outside a provider. Lets the player-package
+ * <Timeline> (a public standalone export) read shell state when embedded in the
+ * NLE without hard-requiring the provider in standalone/test mounts.
+ */
+export function useStudioShellContextOptional(): StudioShellValue | null {
+  return useContext(StudioShellContext);
+}
+
 export function useStudioPlaybackContext(): StudioPlaybackValue {
   const ctx = useContext(StudioPlaybackContext);
   if (!ctx) throw new Error("useStudioPlaybackContext must be used within StudioPlaybackProvider");
@@ -58,6 +70,7 @@ export function useStudioPlaybackContext(): StudioPlaybackValue {
 }
 
 /** @deprecated Use useStudioShellContext and/or useStudioPlaybackContext instead. */
+// fallow-ignore-next-line unused-export
 export function useStudioContext(): StudioContextValue {
   const shell = useStudioShellContext();
   const playback = useStudioPlaybackContext();
@@ -84,8 +97,6 @@ export function StudioShellProvider({
     compositionDimensions,
     waitForPendingDomEditSaves,
     handlePreviewIframeRef,
-    timelineVisible,
-    toggleTimelineVisibility,
   } = value;
 
   const stable = useMemo<StudioShellValue>(
@@ -102,14 +113,11 @@ export function StudioShellProvider({
       compositionDimensions,
       waitForPendingDomEditSaves,
       handlePreviewIframeRef,
-      timelineVisible,
-      toggleTimelineVisibility,
     }),
     [
       projectId,
       activeCompPath,
       compositionDimensions,
-      timelineVisible,
       editHistory,
       renderQueue,
       setActiveCompPath,
@@ -119,7 +127,6 @@ export function StudioShellProvider({
       handleRedo,
       waitForPendingDomEditSaves,
       handlePreviewIframeRef,
-      toggleTimelineVisibility,
     ],
   );
   return <StudioShellContext value={stable}>{children}</StudioShellContext>;
@@ -166,6 +173,7 @@ export function StudioPlaybackProvider({
 }
 
 /** @deprecated Use StudioShellProvider and StudioPlaybackProvider instead. */
+// fallow-ignore-next-line unused-export
 export function StudioProvider({
   value,
   children,

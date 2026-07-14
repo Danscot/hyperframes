@@ -24,6 +24,7 @@ const GROUPS: Group[] = [
       ["capture", "Capture a website for video production"],
       ["catalog", "Browse and install blocks and components"],
       ["preview", "Start the studio for previewing compositions"],
+      ["present", "Open a slideshow deck in presenter mode (with audience sync)"],
       ["publish", "Upload a project and get a stable public URL"],
       ["render", "Render a composition to MP4 or WebM"],
     ],
@@ -32,8 +33,20 @@ const GROUPS: Group[] = [
     title: "Project",
     commands: [
       ["lint", "Validate a composition for common mistakes"],
+      ["check", "Run lint, runtime validation, and layout inspection as one gate"],
+      [
+        "validate",
+        "Runtime-validate a composition in headless Chrome (JS errors, missing assets, contrast)",
+      ],
+      ["beats", "Detect beats in the music track and write beats/<audio>.json"],
       ["inspect", "Inspect rendered visual layout across the timeline"],
+      ["keyframes", "Inspect keyframes and render onion-shot diagnostics"],
       ["snapshot", "Capture key frames as PNG screenshots for visual verification"],
+      [
+        "grade-compare",
+        "Render candidate color grades onto a reference frame as one labeled comparison PNG",
+      ],
+      ["compare", "Render composition variants into one labeled comparison sheet"],
       ["info", "Print project metadata"],
       ["compositions", "List all compositions in a project"],
       ["docs", "View inline documentation in the terminal"],

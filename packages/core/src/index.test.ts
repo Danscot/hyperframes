@@ -90,8 +90,8 @@ describe("@hyperframes/core public API exports", () => {
 
   describe("parser exports", () => {
     it("does NOT re-export GSAP parser functions from barrel (available via gsap-parser subpath)", () => {
-      // GSAP parser uses recast (Node.js fs), so it's excluded from the barrel
-      // to keep browser bundles clean. Use @hyperframes/core/gsap-parser instead.
+      // GSAP AST parser functions are not re-exported from the barrel —
+      // use the acorn parser (gsapParserAcorn) or writer (gsapWriterAcorn) directly.
       expect(typeof (core as Record<string, unknown>).parseGsapScript).toBe("undefined");
     });
 
@@ -128,8 +128,12 @@ describe("@hyperframes/core public API exports", () => {
   });
 
   describe("lint exports", () => {
-    it("exports lintHyperframeHtml", () => {
-      expect(typeof core.lintHyperframeHtml).toBe("function");
+    it("exposes lintHyperframeHtml via the @hyperframes/core/lint back-compat stub", async () => {
+      // Lint moved to @hyperframes/lint; core's main entry no longer re-exports
+      // it (that would cycle through the lint package). The subpath stub keeps
+      // existing @hyperframes/core/lint imports working.
+      const lint = await import("./lint/index.js");
+      expect(typeof lint.lintHyperframeHtml).toBe("function");
     });
   });
 

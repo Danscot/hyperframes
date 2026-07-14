@@ -33,6 +33,19 @@ export const PROPERTY_DEFAULTS: Record<string, number> = {
   height: 100,
 };
 
+/**
+ * A timeline write that applies an instantaneous value and then holds it.
+ * `set()` is always a hold; authored `to()` / `fromTo()` tweens are holds only
+ * when their resolved duration is exactly zero.
+ */
+export function isInstantHold(animation: GsapAnimation): boolean {
+  return (
+    animation.method === "set" ||
+    ((animation.method === "to" || animation.method === "fromTo") &&
+      resolveTweenDuration(animation) === 0)
+  );
+}
+
 // ── Selector resolution ───────────────────────────────────────────────────────
 
 /**
@@ -61,6 +74,7 @@ export function computeElementPercentage(
   if (animation) {
     const start = resolveTweenStart(animation);
     const duration = resolveTweenDuration(animation);
+    if (duration <= 0) return 0;
     if (start !== null) {
       return absoluteToPercentage(currentTime, start, duration);
     }
@@ -97,16 +111,6 @@ export function queryIframeElement(
   }
 }
 
-/** Safely access an iframe's contentDocument, returning null on cross-origin errors. */
-export function getIframeDocument(iframe: HTMLIFrameElement | null): Document | null {
-  if (!iframe) return null;
-  try {
-    return iframe.contentDocument;
-  } catch {
-    return null;
-  }
-}
-
 // ── Keyframe parsing ──────────────────────────────────────────────────────────
 
 export interface ParsedPercentageKeyframes {
@@ -124,6 +128,34 @@ export function parsePercentageKeyframes(
 ): ParsedPercentageKeyframes | null {
   const keyframes: ParsedPercentageKeyframes["keyframes"] = [];
   let easeEach: string | undefined;
+
+  // GSAP array-form keyframes — `keyframes: [{x,y}, {x,y}, ...]` — are spread
+  // evenly across the tween by default: GSAP gives each entry an equal share of
+  // the duration unless an entry carries its own `duration`/`delay`, which the
+  // studio never emits. So entry i of n maps to i/(n-1)*100% (n=4 → 0/33.3/66.7/100).
+  // Index spacing counts EVERY array slot, including a degenerate entry that
+  // contributes no animatable prop (it's still a slot GSAP allocates a position
+  // to), so dropping such an entry from the output below must NOT shift the others.
+  // A per-entry `ease` is a segment ease, not a keyframe value, so it's skipped as
+  // a property; there is no array-form `easeEach` (that's an object-form sibling key).
+  // (The object form further down uses explicit "0%" keys instead.) Without this
+  // branch, array-keyframed tweens (e.g. a multi-point shuttle) read as null → no
+  // motion path.
+  if (Array.isArray(kfObj)) {
+    const steps = kfObj as unknown[];
+    steps.forEach((entry, i) => {
+      if (!entry || typeof entry !== "object") return;
+      const percentage = steps.length > 1 ? Math.round((i / (steps.length - 1)) * 1000) / 10 : 0;
+      const properties: Record<string, number | string> = {};
+      for (const [pk, pv] of Object.entries(entry as Record<string, unknown>)) {
+        if (pk === "ease") continue;
+        if (typeof pv === "number") properties[pk] = Math.round(pv * 1000) / 1000;
+        else if (typeof pv === "string") properties[pk] = pv;
+      }
+      if (Object.keys(properties).length > 0) keyframes.push({ percentage, properties });
+    });
+    return keyframes.length > 0 ? { keyframes } : null;
+  }
 
   for (const [key, val] of Object.entries(kfObj)) {
     if (key === "easeEach") {

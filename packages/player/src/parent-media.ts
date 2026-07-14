@@ -10,6 +10,7 @@
  */
 
 import { selectMediaObserverTargets } from "./mediaObserverScope.js";
+import { isRealmElement, isRealmHtmlMediaElement } from "./media-element-guards.js";
 
 /** Minimum absolute drift before a currentTime correction is attempted. */
 const MIRROR_DRIFT_THRESHOLD_SECONDS = 0.05;
@@ -28,6 +29,12 @@ export interface ProxyEntry {
   el: HTMLMediaElement;
   start: number;
   duration: number;
+  /**
+   * The iframe media element this proxy mirrors, when adopted from the DOM.
+   * Its `data-start`/`data-duration` are re-read each tick so live timeline
+   * edits (trim/move) bound the proxy correctly. Null for URL-driven proxies.
+   */
+  source?: HTMLMediaElement | null;
   /**
    * Count of consecutive steady-state samples in which the proxy's
    * `currentTime` was found drifted beyond `MIRROR_DRIFT_THRESHOLD_SECONDS`.
@@ -104,6 +111,8 @@ export class ParentMediaManager {
     this._entries = [];
     this._urlAudioEntry = null;
     this._urlAudioSrc = null;
+    this._audioOwner = "runtime";
+    this._playbackErrorPosted = false;
   }
 
   updateMuted(muted: boolean): void {
@@ -118,21 +127,87 @@ export class ParentMediaManager {
     for (const m of this._entries) m.el.playbackRate = rate;
   }
 
-  playAll(): void {
-    for (const m of this._entries) {
-      if (!m.el.src) continue;
-      m.el.play().catch((err: unknown) => this._reportPlaybackError(err));
+  private _playEntry(m: ProxyEntry): void {
+    if (!m.el.src) return;
+    m.el.play().catch((err: unknown) => this._reportPlaybackError(err));
+  }
+
+  // Play only if the current playhead is inside the clip's (live) window, so
+  // bulk starts (playAll / adopt) don't blip audio for clips outside their
+  // window until the next mirrorTime tick gates them off.
+  private _playEntryIfActive(m: ProxyEntry): void {
+    this._refreshEntryBounds(m);
+    const relTime = this._getCurrentTime() - m.start;
+    if (relTime < 0 || relTime >= m.duration) return;
+    this._playEntry(m);
+  }
+
+  // Re-read the source clip's live timing so trims/moves bound the proxy
+  // (adopt-time values go stale when the timeline is edited).
+  private _refreshEntryBounds(m: ProxyEntry): void {
+    if (!m.source?.isConnected) return;
+    // Guard against a malformed (non-numeric) attribute parsing to NaN: an NaN
+    // duration makes every `relTime >= m.duration` window check false, so the
+    // gate never closes and the proxy plays past its clip end.
+    const start = parseFloat(m.source.getAttribute("data-start") || "0");
+    m.start = Number.isFinite(start) ? start : 0;
+    const duration = parseFloat(m.source.getAttribute("data-duration") || "");
+    m.duration = Number.isFinite(duration) && duration > 0 ? duration : Number.POSITIVE_INFINITY;
+  }
+
+  // Pause the proxy outside its clip window; resume it on re-entry during
+  // parent-owned playback. Returns whether the proxy is within the window.
+  private _gateEntryPlayback(m: ProxyEntry, relTime: number): boolean {
+    if (relTime < 0 || relTime >= m.duration) {
+      if (!m.el.paused) m.el.pause();
+      m.driftSamples = 0;
+      return false;
     }
+    if (this._audioOwner === "parent" && !this._isPaused() && m.el.paused) this._playEntry(m);
+    return true;
+  }
+
+  playAll(): void {
+    for (const m of this._entries) this._playEntryIfActive(m);
   }
 
   pauseAll(): void {
     for (const m of this._entries) m.el.pause();
   }
 
+  stopAdoptedMedia(): void {
+    for (const m of this._entries) {
+      if (m.source) m.el.pause();
+    }
+  }
+
   seekAll(timeInSeconds: number): void {
     for (const m of this._entries) {
+      // Re-read live bounds so a trim/move just before a paused scrub gates and
+      // positions against the current clip window, not the adopt-time one.
+      this._refreshEntryBounds(m);
       const relTime = timeInSeconds - m.start;
       if (relTime >= 0 && relTime < m.duration) m.el.currentTime = relTime;
+    }
+  }
+
+  // Audible scrub: position every proxy at `timeInSeconds` AND play the ones whose
+  // clip window covers it, so the viewer hears the track under the playhead while
+  // dragging the scrubber (vs seekAll, which positions silently). Each drag move
+  // re-seeks to the new position, so playback restarts from the playhead and you
+  // hear the audio you're scrubbing over. The caller settles back to silence on
+  // scrub end (a normal pause+seekAll). Muted proxies stay silent (play() is a no-op
+  // for output). Out-of-window proxies are paused.
+  scrubAll(timeInSeconds: number): void {
+    for (const m of this._entries) {
+      this._refreshEntryBounds(m);
+      const relTime = timeInSeconds - m.start;
+      if (relTime >= 0 && relTime < m.duration) {
+        m.el.currentTime = relTime;
+        this._playEntry(m);
+      } else if (!m.el.paused) {
+        m.el.pause();
+      }
     }
   }
 
@@ -145,11 +220,9 @@ export class ParentMediaManager {
   mirrorTime(timelineSeconds: number, options?: { force?: boolean }): void {
     const force = options?.force === true;
     for (const m of this._entries) {
+      this._refreshEntryBounds(m);
       const relTime = timelineSeconds - m.start;
-      if (relTime < 0 || relTime >= m.duration) {
-        m.driftSamples = 0;
-        continue;
-      }
+      if (!this._gateEntryPlayback(m, relTime)) continue;
       if (Math.abs(m.el.currentTime - relTime) > MIRROR_DRIFT_THRESHOLD_SECONDS) {
         m.driftSamples += 1;
         if (force || m.driftSamples >= MIRROR_REQUIRED_CONSECUTIVE_DRIFT_SAMPLES) {
@@ -184,8 +257,8 @@ export class ParentMediaManager {
 
     // Synchronously mute iframe media to close the race window.
     if (iframeDoc) {
-      for (const el of iframeDoc.querySelectorAll<HTMLMediaElement>("video, audio")) {
-        el.muted = true;
+      for (const el of iframeDoc.querySelectorAll("video, audio")) {
+        if (isRealmHtmlMediaElement(el)) el.muted = true;
       }
     }
 
@@ -207,10 +280,10 @@ export class ParentMediaManager {
    * install a MutationObserver for media added later (sub-composition activation).
    */
   setupFromIframe(iframeDoc: Document): void {
-    const mediaEls = iframeDoc.querySelectorAll<HTMLMediaElement>(
-      "audio[data-start], video[data-start]",
-    );
-    for (const iframeEl of mediaEls) this._adoptIframeMedia(iframeEl);
+    const mediaEls = iframeDoc.querySelectorAll("audio[data-start], video[data-start]");
+    for (const iframeEl of mediaEls) {
+      if (isRealmHtmlMediaElement(iframeEl)) this._adoptIframeMedia(iframeEl);
+    }
     this._observeDynamicMedia(iframeDoc);
   }
 
@@ -275,6 +348,7 @@ export class ParentMediaManager {
     tag: "audio" | "video",
     start: number,
     duration: number,
+    source?: HTMLMediaElement | null,
   ): ProxyEntry | null {
     if (this._entries.some((m) => m.el.src === src)) return null;
 
@@ -287,7 +361,7 @@ export class ParentMediaManager {
     const rate = this._getPlaybackRate();
     if (rate !== 1) el.playbackRate = rate;
 
-    const entry: ProxyEntry = { el, start, duration, driftSamples: 0 };
+    const entry: ProxyEntry = { el, start, duration, driftSamples: 0, source };
     this._entries.push(entry);
     return entry;
   }
@@ -312,15 +386,13 @@ export class ParentMediaManager {
     const duration = parseFloat(iframeEl.getAttribute("data-duration") || "Infinity");
     const tag = iframeEl.tagName === "VIDEO" ? ("video" as const) : ("audio" as const);
 
-    const created = this._createEntry(src, tag, start, duration);
+    const created = this._createEntry(src, tag, start, duration, iframeEl);
 
     // If already under parent ownership and playing, the new proxy must catch
     // up immediately — bypass the jitter-coalescing gate.
     if (created && this._audioOwner === "parent") {
       this.mirrorTime(this._getCurrentTime(), { force: true });
-      if (!this._isPaused() && created.el.src) {
-        created.el.play().catch((err: unknown) => this._reportPlaybackError(err));
-      }
+      if (!this._isPaused()) this._playEntryIfActive(created);
     }
   }
 
@@ -345,7 +417,7 @@ export class ParentMediaManager {
         if (m.type === "attributes" && m.attributeName === "preload") {
           const target = m.target;
           if (
-            target instanceof HTMLMediaElement &&
+            isRealmHtmlMediaElement(target) &&
             target.matches("audio[data-start], video[data-start]") &&
             target.preload === "auto"
           ) {
@@ -355,28 +427,34 @@ export class ParentMediaManager {
         }
 
         for (const added of m.addedNodes) {
-          if (!(added instanceof Element)) continue;
+          if (!isRealmElement(added)) continue;
           const candidates: HTMLMediaElement[] = [];
-          if (added.matches?.("audio[data-start], video[data-start]")) {
-            candidates.push(added as HTMLMediaElement);
+          if (
+            isRealmHtmlMediaElement(added) &&
+            added.matches("audio[data-start], video[data-start]")
+          ) {
+            candidates.push(added);
           }
-          const inside = added.querySelectorAll?.<HTMLMediaElement>(
-            "audio[data-start], video[data-start]",
-          );
-          if (inside) for (const el of inside) candidates.push(el);
+          const inside = added.querySelectorAll("audio[data-start], video[data-start]");
+          for (const el of inside) {
+            if (isRealmHtmlMediaElement(el)) candidates.push(el);
+          }
           for (const el of candidates) this._adoptIframeMedia(el);
         }
 
         for (const removed of m.removedNodes) {
-          if (!(removed instanceof Element)) continue;
+          if (!isRealmElement(removed)) continue;
           const dropped: HTMLMediaElement[] = [];
-          if (removed.matches?.("audio[data-start], video[data-start]")) {
-            dropped.push(removed as HTMLMediaElement);
+          if (
+            isRealmHtmlMediaElement(removed) &&
+            removed.matches("audio[data-start], video[data-start]")
+          ) {
+            dropped.push(removed);
           }
-          const inside = removed.querySelectorAll?.<HTMLMediaElement>(
-            "audio[data-start], video[data-start]",
-          );
-          if (inside) for (const el of inside) dropped.push(el);
+          const inside = removed.querySelectorAll("audio[data-start], video[data-start]");
+          for (const el of inside) {
+            if (isRealmHtmlMediaElement(el)) dropped.push(el);
+          }
           for (const el of dropped) this._detachIframeMedia(el);
         }
       }

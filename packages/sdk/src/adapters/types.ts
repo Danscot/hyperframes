@@ -1,11 +1,12 @@
-import type { PersistErrorEvent } from "../types.js";
+import type { PersistErrorEvent, Composition } from "../types.js";
 
 // ─── PersistAdapter ───────────────────────────────────────────────────────────
 
 export interface PersistVersionEntry {
   /** Opaque key identifying this version (adapter-defined format) */
   key: string;
-  content: string;
+  /** Full HTML content — may be omitted by adapters that load content lazily via loadFrom() */
+  content?: string;
   timestamp?: number;
 }
 
@@ -69,5 +70,27 @@ export interface PreviewAdapter {
   /** Set preview selection; fires selectionchange on the session */
   select(ids: string[], opts?: { additive?: boolean }): void;
 
+  // Stage 8 prep: fired when the preview host changes selection (e.g. user clicks an element).
+  // Not wired up in stage 7 — callers listen to the session's own selectionchange event instead.
   on(event: "selection", handler: (ids: string[]) => void): () => void;
+
+  /**
+   * Mirror this composition's edits onto the adapter's own live document —
+   * an immediate full sync of the composition's CURRENT overrides, then a
+   * subscription that replays every future patch (including undo/redo).
+   * `/script/gsap` patches are never mirrored (re-executing a live <script>
+   * tag doesn't work and would conflict with running GSAP state).
+   * Calling this again while already attached detaches the previous
+   * subscription first. Returns an unsubscribe.
+   */
+  attachSync(comp: Composition): () => void;
+
+  /**
+   * Optional: apply composition-variable values to the preview so it renders
+   * as `window.__hfVariables` injection would at render time (values must be
+   * visible to the runtime BEFORE composition scripts run — typically a
+   * preview reload with injection, not a live poke). Pass null to restore
+   * declared defaults. Values are ephemeral preview state, never persisted.
+   */
+  setPreviewVariables?(values: Record<string, unknown> | null): void;
 }

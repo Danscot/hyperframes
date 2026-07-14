@@ -1,5 +1,5 @@
 import type { PatchTarget } from "../../utils/sourcePatcher";
-import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
+import type { GsapAnimation } from "@hyperframes/parsers/gsap-parser";
 
 export const CURATED_STYLE_PROPERTIES = [
   "position",
@@ -50,6 +50,9 @@ export const CURATED_STYLE_PROPERTIES = [
 export interface DomEditCapabilities {
   canSelect: boolean;
   canEditStyles: boolean;
+  /** Can take a non-destructive `clip-path: inset()` crop — broader than
+   *  canEditStyles (a sub-composition host is croppable from the parent view). */
+  canCrop: boolean;
   /** Directly editable authored left/top style fields. Canvas drag uses manual edits instead. */
   canMove: boolean;
   /** Directly editable authored width/height style fields. Canvas resize uses manual edits instead. */
@@ -69,6 +72,7 @@ export interface DomEditTextField {
   inlineStyles: Record<string, string>;
   computedStyles: Record<string, string>;
   source: "self" | "child" | "text-node";
+  sourceChildIndex?: number;
 }
 
 export interface DomEditSelection extends PatchTarget {
@@ -108,6 +112,9 @@ export interface DomEditContextOptions {
   activeCompositionPath: string | null;
   isMasterView: boolean;
   preferClipAncestor?: boolean;
+  /** The group wrapper the user has drilled into (null = top level). Selection
+   * resolution treats groups as a unit unless drilled into one. */
+  activeGroupElement?: HTMLElement | null;
 }
 
 export interface DomEditViewport {

@@ -35,9 +35,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, relative, sep } from "node:path";
-import { type CanvasResolution } from "@hyperframes/core";
-import { type EngineConfig, getEncoderPreset, resolveConfig } from "@hyperframes/engine";
+import { type CanvasResolution, fpsToNumber } from "@hyperframes/core";
+import {
+  type EngineConfig,
+  type VideoFrameFormat,
+  getEncoderPreset,
+  normalizeVp9CpuUsed,
+  resolveConfig,
+} from "@hyperframes/engine";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
+import {
+  applyRenderWarningPolicy,
+  type RenderJob,
+  type RenderStrictness,
+} from "../renderOrchestrator.js";
+import { closeFileServerSafely } from "../fileServer.js";
 import { runAudioStage } from "../render/stages/audioStage.js";
 import { runCompileStage } from "../render/stages/compileStage.js";
 import { runExtractVideosStage } from "../render/stages/extractVideosStage.js";
@@ -53,7 +65,11 @@ import {
   type PlanDimensions,
   sha256Hex,
 } from "../render/stages/planHash.js";
-import { validateNoGpuEncode, validateNoSystemFonts } from "../render/planValidation.js";
+import {
+  validateDistributedDuration,
+  validateNoGpuEncode,
+  validateNoSystemFonts,
+} from "../render/planValidation.js";
 import { snapshotRuntimeEnv } from "../render/runtimeEnvSnapshot.js";
 import {
   buildSyntheticRenderJob,
@@ -104,6 +120,12 @@ export interface DistributedRenderConfig {
   crf?: number;
   /** Target video bitrate (e.g. `"10M"`); mutually exclusive with `crf`. */
   bitrate?: string;
+  /**
+   * Source-video frame extraction format. Defaults to `"auto"`, matching the
+   * in-process renderer: alpha/alpha-capable sources extract as PNG, other
+   * sources extract as JPG unless the caller explicitly requests `"png"`.
+   */
+  videoFrameFormat?: VideoFrameFormat;
   /** Output resolution preset; engages Chrome `deviceScaleFactor` supersampling. */
   outputResolution?: CanvasResolution;
 
@@ -182,6 +204,8 @@ export interface DistributedRenderConfig {
   producerConfig?: EngineConfig;
   /** Entry HTML file relative to `projectDir`. Defaults to `"index.html"`. */
   entryFile?: string;
+  /** Strict rejects correctness warnings; best-effort returns a qualified outcome. */
+  strictness?: RenderStrictness;
   /** Caller-supplied AbortSignal. Threaded through compile / probe / extract / audio stages. */
   abortSignal?: AbortSignal;
   /**
@@ -231,6 +255,25 @@ export interface PlanResult {
   format: DistributedFormat;
   ffmpegVersion: string;
   producerVersion: string;
+}
+
+/** Applies the same audio correctness policy used by the in-process renderer. */
+export function applyDistributedAudioWarningPolicy(
+  job: RenderJob,
+  audioError: string,
+  log: ProducerLogger = defaultLogger,
+): void {
+  applyRenderWarningPolicy(
+    job,
+    [
+      {
+        code: "audio_processing_failed",
+        message: `Audio mix failed; output would be video-only: ${audioError}`,
+        details: { mediaType: "audio" },
+      },
+    ],
+    log,
+  );
 }
 
 /**
@@ -327,6 +370,7 @@ export const FORMAT_NOT_SUPPORTED_IN_DISTRIBUTED = "FORMAT_NOT_SUPPORTED_IN_DIST
  * gate.
  */
 export class FormatNotSupportedInDistributedError extends Error {
+  // fallow-ignore-next-line unused-class-member
   readonly code: typeof FORMAT_NOT_SUPPORTED_IN_DISTRIBUTED = FORMAT_NOT_SUPPORTED_IN_DISTRIBUTED;
   readonly format: string;
   readonly reason: string;
@@ -561,12 +605,17 @@ function buildLockedRenderConfig(input: {
   forceScreenshot: boolean;
   deviceScaleFactor: number;
   ffmpegVersion: string;
+  engineConfig: Pick<EngineConfig, "vp9CpuUsed">;
   effectiveChunkSize: number;
   chunkCount: number;
   runtimeEnv: Record<string, string>;
 }): LockedRenderConfig {
   const { config, forceScreenshot, deviceScaleFactor, ffmpegVersion } = input;
   const { encoder, pixelFormat, preset } = resolveEncoderTriple(config);
+  const locksVp9CpuUsed =
+    encoder === "libvpx-vp9-software"
+      ? { vp9CpuUsed: normalizeVp9CpuUsed(input.engineConfig.vp9CpuUsed) }
+      : {};
   return {
     captureMode: forceScreenshot ? "screenshot" : "beginframe",
     forceScreenshot,
@@ -583,6 +632,7 @@ function buildLockedRenderConfig(input: {
     preset,
     crf: config.crf,
     bitrate: config.bitrate,
+    ...locksVp9CpuUsed,
     // GOP === chunkSize so every chunk's first frame is an IDR keyframe and
     // ffmpeg concat-copy round-trips losslessly.
     gopSize: input.effectiveChunkSize,
@@ -710,10 +760,12 @@ export async function plan(
     format: config.format,
     crf: config.crf,
     bitrate: config.bitrate,
+    videoFrameFormat: config.videoFrameFormat,
     outputResolution: config.outputResolution,
     // HDR is banned in distributed mode. force-sdr keeps the
     // extract / encoder paths off the HDR branches entirely.
     hdrMode: config.hdrMode ?? "force-sdr",
+    strictness: config.strictness,
     entryFile: config.entryFile ?? "index.html",
     logger: config.logger,
     producerConfig: config.producerConfig,
@@ -784,6 +836,7 @@ export async function plan(
     // Distributed renders must not capture host-specific system fonts —
     // the Lambda/worker filesystem won't have the same fonts installed.
     allowSystemFontCapture: false,
+    variables: config.variables,
   });
   let compiled = compileResult.compiled;
   const composition = compileResult.composition;
@@ -833,7 +886,12 @@ export async function plan(
   job.duration = probeResult.duration;
   job.totalFrames = probeResult.totalFrames;
   const totalFrames = probeResult.totalFrames;
-  if (probeResult.fileServer) probeResult.fileServer.close();
+  validateDistributedDuration({
+    duration: probeResult.duration,
+    totalFrames,
+    fps: fpsToNumber(job.config.fps),
+  });
+  if (probeResult.fileServer) closeFileServerSafely(probeResult.fileServer, "plan", log);
   if (probeResult.probeSession) {
     // Close inside a try/catch — leaking a Chrome process here would mask
     // the original plan() result on cancellation paths.
@@ -874,6 +932,9 @@ export async function plan(
     abortSignal,
     assertNotAborted,
   });
+  if (audioResult.audioError) {
+    applyDistributedAudioWarningPolicy(job, audioResult.audioError, log);
+  }
 
   // Promote staged artifacts from the temp work tree into the final planDir
   // shape. `workDir` is `<planDir>/.plan-work/` — always the same filesystem
@@ -941,6 +1002,7 @@ export async function plan(
     forceScreenshot,
     deviceScaleFactor,
     ffmpegVersion,
+    engineConfig: cfg,
     effectiveChunkSize,
     chunkCount,
     runtimeEnv,

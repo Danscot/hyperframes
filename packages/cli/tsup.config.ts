@@ -31,6 +31,11 @@ var __dirname = __hf_dirname(__filename);`,
     "puppeteer-core",
     "puppeteer",
     "@puppeteer/browsers",
+    // Native module — its platform binary (@img/sharp-<os>-<arch>) must be
+    // resolved from node_modules at runtime, never bundled. Loaded lazily by
+    // the capture pipeline; runtime resolution comes from the `dependencies`
+    // entry in package.json.
+    "sharp",
     "open",
     "hono",
     "hono/*",
@@ -56,6 +61,9 @@ var __dirname = __hf_dirname(__filename);`,
   ],
   noExternal: [
     "@hyperframes/core",
+    "@hyperframes/parsers",
+    "@hyperframes/studio-server",
+    "@hyperframes/lint",
     "@hyperframes/producer",
     "@hyperframes/engine",
     "@clack/prompts",

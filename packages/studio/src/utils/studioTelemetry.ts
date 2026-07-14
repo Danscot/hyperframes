@@ -1,3 +1,5 @@
+import { resolveStudioDistinctId } from "../telemetry/distinctId";
+
 // PostHog public ingest key — write-only, safe to ship in the client bundle
 const POSTHOG_API_KEY = "phc_zjjbX0PnWxERXrMHhkEJWj9A9BhGVLRReICgsfTMmpx";
 const POSTHOG_HOST = "https://us.i.posthog.com";
@@ -16,26 +18,12 @@ interface QueuedEvent {
 
 let queue: QueuedEvent[] = [];
 let flushTimer: ReturnType<typeof setInterval> | null = null;
-let distinctId: string | null = null;
 
+// Delegates to the single source of truth (telemetry/distinctId.ts) so `studio:*`
+// events share one id with `studio_*` / render events, and adopt the CLI's
+// distinct_id when the CLI launched Studio.
 function getDistinctId(): string {
-  if (distinctId) return distinctId;
-  try {
-    const stored = localStorage.getItem("hf-studio-anon-id");
-    if (stored) {
-      distinctId = stored;
-      return stored;
-    }
-  } catch {
-    // localStorage may be unavailable
-  }
-  distinctId = crypto.randomUUID();
-  try {
-    localStorage.setItem("hf-studio-anon-id", distinctId);
-  } catch {
-    // best-effort persistence
-  }
-  return distinctId;
+  return resolveStudioDistinctId();
 }
 
 function isEnabled(): boolean {
@@ -54,7 +42,10 @@ function getSessionProperties(): EventProperties {
     viewport_width: window.innerWidth,
     viewport_height: window.innerHeight,
     user_agent: navigator.userAgent,
-    url_hash: location.hash.replace(/#project\//, ""),
+    // Route slug only — drop the query string, which carries the current
+    // selection (selId / selSelector are the user's own element ids/CSS
+    // selectors) and other view state we must not send to analytics.
+    url_hash: location.hash.replace(/#project\//, "").split("?")[0],
   };
 }
 
@@ -102,27 +93,34 @@ async function flushEvents(): Promise<void> {
   }
 }
 
+// Synchronously drains the queue via sendBeacon — safe to call from any
+// tab-hide handler regardless of listener registration order. Exported so
+// other modules (e.g. sdkResolverShadow.ts) can force delivery of an event
+// they just queued without racing this module's own visibilitychange
+// listener below.
+export function flushViaBeacon(): void {
+  if (flushTimer) {
+    clearInterval(flushTimer);
+    flushTimer = null;
+  }
+  if (queue.length === 0) return;
+  const batch = queue.map((e) => ({
+    event: e.event,
+    properties: { ...e.properties, $ip: null },
+    distinct_id: getDistinctId(),
+    timestamp: e.timestamp,
+  }));
+  queue = [];
+  const body = JSON.stringify({ api_key: POSTHOG_API_KEY, batch });
+  try {
+    navigator.sendBeacon(`${POSTHOG_HOST}/batch/`, body);
+  } catch {
+    // best-effort
+  }
+}
+
 if (typeof window !== "undefined") {
   window.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") {
-      if (flushTimer) {
-        clearInterval(flushTimer);
-        flushTimer = null;
-      }
-      if (queue.length === 0) return;
-      const batch = queue.map((e) => ({
-        event: e.event,
-        properties: { ...e.properties, $ip: null },
-        distinct_id: getDistinctId(),
-        timestamp: e.timestamp,
-      }));
-      queue = [];
-      const body = JSON.stringify({ api_key: POSTHOG_API_KEY, batch });
-      try {
-        navigator.sendBeacon(`${POSTHOG_HOST}/batch/`, body);
-      } catch {
-        // best-effort
-      }
-    }
+    if (document.visibilityState === "hidden") flushViaBeacon();
   });
 }

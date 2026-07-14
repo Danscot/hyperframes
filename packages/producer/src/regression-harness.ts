@@ -1,3 +1,4 @@
+// fallow-ignore-file complexity
 import {
   existsSync,
   mkdirSync,
@@ -17,7 +18,7 @@ import process from "node:process";
 import { createRenderJob, executeRenderJob } from "./services/renderOrchestrator.js";
 import { compileForRender } from "./services/htmlCompiler.js";
 import { validateCompilation } from "./services/compilationTester.js";
-import { extractMediaMetadata } from "./utils/ffprobe.js";
+import { extractMediaMetadata, extractAudioMetadata } from "./utils/ffprobe.js";
 import {
   buildRmsEnvelope,
   compareAudioEnvelopes,
@@ -114,6 +115,13 @@ type TestMetadata = {
     /** Force HDR in the harness; omitted/false preserves historical SDR-only test behavior. */
     hdr?: boolean;
     /**
+     * Render this suite with the experimental fast-capture path
+     * (drawElementImage, `--experimental-fast-capture`). The golden must be
+     * regenerated with the flag on. Used by the `fast-capture` regression
+     * guard; omit for the default screenshot/BeginFrame capture.
+     */
+    experimentalFastCapture?: boolean;
+    /**
      * Render-time variable overrides, equivalent to `hyperframes render
      * --variables '<json>'`. Injected as `window.__hfVariables` before any
      * page script runs so the runtime helper `getVariables()` returns the
@@ -192,6 +200,12 @@ type TestResult = {
      */
     residualRmsDb?: number;
     residualError?: string;
+  };
+  streamDurationParity?: {
+    passed: boolean;
+    videoDurationSeconds: number;
+    audioDurationSeconds: number;
+    driftSeconds: number;
   };
   renderedOutputPath?: string;
 };
@@ -367,6 +381,11 @@ function validateMetadata(meta: unknown): TestMetadata {
   }
   if (rc.hdr !== undefined && typeof rc.hdr !== "boolean") {
     throw new Error("meta.json: 'renderConfig.hdr' must be a boolean (or omit for false)");
+  }
+  if (rc.experimentalFastCapture !== undefined && typeof rc.experimentalFastCapture !== "boolean") {
+    throw new Error(
+      "meta.json: 'renderConfig.experimentalFastCapture' must be a boolean (or omit for false)",
+    );
   }
   if (
     rc.variables !== undefined &&
@@ -785,6 +804,49 @@ function saveFailureDetails(
 
     logPretty(`Saved audio failure details to ${failuresDir}/`, "💾");
   }
+
+  // Save stream duration parity failures
+  if (result.streamDurationParity && !result.streamDurationParity.passed) {
+    writeFileSync(
+      join(failuresDir, "stream-parity-failure.json"),
+      JSON.stringify(result.streamDurationParity, null, 2),
+      "utf-8",
+    );
+    logPretty(`Saved stream duration parity failure to ${failuresDir}/`, "💾");
+  }
+}
+
+// ── Stream Duration Parity ──────────────────────────────────────────────────
+
+export const MAX_STREAM_DRIFT_SECONDS = 0.5;
+
+export type StreamDurationParity = {
+  passed: boolean;
+  videoDurationSeconds: number;
+  audioDurationSeconds: number;
+  driftSeconds: number;
+};
+
+export async function checkStreamDurationParity(
+  videoPath: string,
+): Promise<StreamDurationParity | null> {
+  const meta = await extractMediaMetadata(videoPath);
+  if (!meta.hasAudio) return null;
+  // Read the audio stream's own duration rather than the container's
+  // format.duration. extractAudioMetadata returns format.duration which
+  // collapses to the same value as videoStreamDurationSeconds when the
+  // fallback fires — making the check a tautology on broken muxes where
+  // both streams are truncated in sync.
+  const audioMeta = await extractAudioMetadata(videoPath);
+  const videoDur = meta.videoStreamDurationSeconds;
+  const audioDur = audioMeta.streamDurationSeconds ?? audioMeta.durationSeconds;
+  const drift = Math.abs(videoDur - audioDur);
+  return {
+    passed: drift <= MAX_STREAM_DRIFT_SECONDS,
+    videoDurationSeconds: videoDur,
+    audioDurationSeconds: audioDur,
+    driftSeconds: drift,
+  };
 }
 
 // ── Test Execution ───────────────────────────────────────────────────────────
@@ -968,18 +1030,30 @@ async function runTestSuite(
         await runDistributedSimulatedRender(distributedInput);
       }
     } else {
-      const job = createRenderJob({
-        fps: suite.meta.renderConfig.fps,
-        quality: "high", // Always use max quality for tests
-        format: outputFormat,
-        workers: suite.meta.renderConfig.workers,
-        useGpu: false,
-        debug: false,
-        hdrMode: suite.meta.renderConfig.hdr ? "force-hdr" : "force-sdr",
-        variables: suite.meta.renderConfig.variables,
-      });
+      // Opt-in fast capture (drawElementImage): drives resolveConfig via the env
+      // var, scoped to this suite's render so it never leaks to other suites.
+      const useFast = suite.meta.renderConfig.experimentalFastCapture === true;
+      const prevFast = process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE;
+      if (useFast) process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE = "true";
+      try {
+        const job = createRenderJob({
+          fps: suite.meta.renderConfig.fps,
+          quality: "high", // Always use max quality for tests
+          format: outputFormat,
+          workers: suite.meta.renderConfig.workers,
+          useGpu: false,
+          debug: false,
+          hdrMode: suite.meta.renderConfig.hdr ? "force-hdr" : "force-sdr",
+          variables: suite.meta.renderConfig.variables,
+        });
 
-      await executeRenderJob(job, tempSrcDir, renderedOutputPath);
+        await executeRenderJob(job, tempSrcDir, renderedOutputPath);
+      } finally {
+        if (useFast) {
+          if (prevFast === undefined) delete process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE;
+          else process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE = prevFast;
+        }
+      }
     }
 
     console.log(JSON.stringify({ event: "rendering_complete", suite: suite.id }));
@@ -1015,6 +1089,24 @@ async function runTestSuite(
     // Test mode: compare against snapshot
     if (!existsSync(snapshotVideoPath)) {
       throw new Error(`Snapshot not found: ${snapshotVideoPath}. Run with --update to create it.`);
+    }
+
+    if (!isPngSequence) {
+      const parity = await checkStreamDurationParity(renderedOutputPath);
+      if (parity) {
+        result.streamDurationParity = parity;
+        if (parity.passed) {
+          logPretty(
+            `Stream duration parity: PASSED (video: ${parity.videoDurationSeconds.toFixed(2)}s, audio: ${parity.audioDurationSeconds.toFixed(2)}s, drift: ${parity.driftSeconds.toFixed(3)}s)`,
+            "✓",
+          );
+        } else {
+          logPretty(
+            `Stream duration parity: FAILED (video: ${parity.videoDurationSeconds.toFixed(2)}s, audio: ${parity.audioDurationSeconds.toFixed(2)}s, drift: ${parity.driftSeconds.toFixed(3)}s > ${MAX_STREAM_DRIFT_SECONDS}s)`,
+            "✗",
+          );
+        }
+      }
     }
 
     let visualPassed: boolean;
@@ -1221,7 +1313,8 @@ async function runTestSuite(
     }
 
     // Overall test passes if all checks passed
-    result.passed = result.compilation!.passed && visualPassed && audioPassed;
+    const parityPassed = result.streamDurationParity?.passed ?? true;
+    result.passed = result.compilation!.passed && visualPassed && audioPassed && parityPassed;
     result.renderedOutputPath = options.keepTemp ? renderedOutputPath : undefined;
 
     if (result.passed) {
@@ -1418,12 +1511,14 @@ async function run(): Promise<void> {
   }
 }
 
-void run().catch((error) => {
-  console.error(
-    JSON.stringify({
-      event: "test_suite_fatal",
-      message: error instanceof Error ? error.message : String(error),
-    }),
-  );
-  process.exitCode = 1;
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  void run().catch((error) => {
+    console.error(
+      JSON.stringify({
+        event: "test_suite_fatal",
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    process.exitCode = 1;
+  });
+}

@@ -4,6 +4,7 @@
  */
 import { useRef, useState, type RefObject } from "react";
 import { useMountEffect } from "../../hooks/useMountEffect";
+import { hugRectForElement } from "./domEditOverlayCrop";
 import { type DomEditSelection, findElementForSelection } from "./domEditing";
 import {
   type GroupOverlayItem,
@@ -11,10 +12,12 @@ import {
   type ResolvedElementRef,
   groupOverlayItemsEqual,
   isElementVisibleForOverlay,
+  groupAwareOverlayRect,
+  orientedGroupAwareOverlayRect,
   rectsEqual,
   resolveElementForOverlay,
   selectionCacheKey,
-  toOverlayRect,
+  toVisibleOverlayRect,
 } from "./domEditOverlayGeometry";
 
 function childRectsEqual(a: OverlayRect[], b: OverlayRect[]): boolean {
@@ -148,8 +151,20 @@ export function useDomEditOverlayRects({
           activeCompositionPathRef.current,
           resolvedElementRef as ResolvedElementRef,
         );
+        // An explicitly-selected element's overlay must track it whenever it's laid
+        // out and not display:none/visibility:hidden/opacity:0 — use basic visibility,
+        // NOT the occlusion heuristic. Occlusion (isElementVisibleInPreview) treats any
+        // opacity:1 ancestor as an opaque cover even when it paints nothing (e.g. a
+        // backgroundless full-bleed scene above a subcomposition), which would wrongly
+        // hide the selection box. Occlusion stays for hover, where a false hide is cheap.
         if (el && isElementVisibleForOverlay(el)) {
-          const nextRect = toOverlayRect(overlayEl, iframe, el);
+          // Groups render as an AABB union of their members (a group OBB is out of
+          // scope); a single element renders as an oriented box that co-rotates
+          // with its transform. orientedOverlayRect gates on rotation internally
+          // (a cheap per-call check) and only pays for the full corner-transform
+          // measurement when the element is actually rotated — this RAF loop runs
+          // every frame for any single selection, so that gate matters here most.
+          const nextRect = orientedGroupAwareOverlayRect(overlayEl, iframe, el);
           setOverlayRect(nextRect);
           const descendants = el.querySelectorAll("*");
           if (descendants.length > 0 && descendants.length <= 60) {
@@ -157,7 +172,7 @@ export function useDomEditOverlayRects({
             for (let i = 0; i < descendants.length; i++) {
               const child = descendants[i] as HTMLElement;
               if (!child.getBoundingClientRect) continue;
-              const r = toOverlayRect(overlayEl, iframe, child);
+              const r = toVisibleOverlayRect(overlayEl, iframe, child);
               if (r && r.width > 2 && r.height > 2) nextChildRects.push(r);
             }
             if (!childRectsEqual(childRectsRef.current, nextChildRects)) {
@@ -190,9 +205,14 @@ export function useDomEditOverlayRects({
         const liveGroupKeys = new Set<string>();
         for (const groupSelection of group) {
           const key = selectionCacheKey(groupSelection);
+          // Members of the same group collapse to one selection under select-as-unit,
+          // so a multi-select can hold the same group twice — dedupe by key to avoid
+          // duplicate React keys (and a doubled overlay box).
+          if (liveGroupKeys.has(key)) continue;
           liveGroupKeys.add(key);
           const el = resolveGroupElement(doc, groupSelection);
-          const rect = el ? toOverlayRect(overlayEl, iframe, el) : null;
+          const base = el ? groupAwareOverlayRect(overlayEl, iframe, el) : null;
+          const rect = base && el ? { ...base, ...hugRectForElement(base, el) } : base;
           if (el && rect)
             nextGroupItems.push({ key, selection: groupSelection, element: el, rect });
         }
@@ -229,7 +249,7 @@ export function useDomEditOverlayRects({
         return;
       }
 
-      setHoverRect(toOverlayRect(overlayEl, iframe, hoverEl));
+      setHoverRect(orientedGroupAwareOverlayRect(overlayEl, iframe, hoverEl));
     };
 
     frame = requestAnimationFrame(update);

@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication complexity
 /**
  * Unit tests for `services/distributed/renderChunk.ts`.
  *
@@ -30,6 +31,7 @@ import {
   PLAN_HASH_MISMATCH,
   renderChunk,
   RenderChunkValidationError,
+  resolveLockedVp9CpuUsed,
   resolvePresetForLockedEncoder,
 } from "./renderChunk.js";
 
@@ -40,7 +42,7 @@ const FIXTURE_HTML = `<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>renderChunk fixture</title></head>
 <body style="margin:0;background:#000;color:#fff;font:32px sans-serif">
-  <div data-composition-id="root" data-width="160" data-height="120" data-duration="0.16667">
+  <div data-composition-id="root" data-no-timeline data-width="160" data-height="120" data-duration="0.16667">
     <p style="padding:1rem">chunk fixture</p>
   </div>
 </body>
@@ -133,7 +135,7 @@ beforeAll(async () => {
   planDir = join(runRoot, "plan");
   mkdirSync(planDir, { recursive: true });
   await plan(projectDir, { fps: 30, width: 160, height: 120, format: "png-sequence" }, planDir);
-});
+}, 30_000);
 
 afterAll(() => {
   rmSync(runRoot, { recursive: true, force: true });
@@ -330,7 +332,7 @@ describe("renderChunk() — variables threading", () => {
 <html data-composition-variables='{"color":"string"}'>
 <head><meta charset="utf-8"><title>renderChunk variables fixture</title></head>
 <body style="margin:0">
-  <div data-composition-id="root" data-width="160" data-height="120" data-duration="0.16667">
+  <div data-composition-id="root" data-no-timeline data-width="160" data-height="120" data-duration="0.16667">
     <div id="paint" style="width:160px;height:120px;background:#000"></div>
   </div>
   <script>
@@ -448,5 +450,19 @@ describe("resolvePresetForLockedEncoder", () => {
     const base = { preset: "medium", quality: 18, codec: "h264" as const, pixelFormat: "yuv420p" };
     const out = resolvePresetForLockedEncoder(base, "png-sequence");
     expect(out).toBe(base);
+  });
+});
+
+describe("resolveLockedVp9CpuUsed", () => {
+  it("uses the locked value for new VP9 planDirs", () => {
+    expect(resolveLockedVp9CpuUsed({ encoder: "libvpx-vp9-software", vp9CpuUsed: 4 })).toBe(4);
+  });
+
+  it("preserves legacy distributed VP9 replay behavior when the field is absent", () => {
+    expect(resolveLockedVp9CpuUsed({ encoder: "libvpx-vp9-software" })).toBe(2);
+  });
+
+  it("returns undefined for non-VP9 planDirs", () => {
+    expect(resolveLockedVp9CpuUsed({ encoder: "libx264-software" })).toBeUndefined();
   });
 });

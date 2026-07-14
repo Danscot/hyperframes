@@ -15,6 +15,31 @@ import { isFinitePositive } from "./playbackAdapter";
 // Duration attribute helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Read a host element's effective CSS stacking order for the timeline's reverse
+ * z→lane mapping. Prefers the inline `style.zIndex` (what the canvas context
+ * menu and LayersPanel z-edits write via handleDomZIndexReorderCommit), falls
+ * back to computed style; "auto" / empty / unparseable ⇒ 0. Works with a
+ * detached parse Document (no defaultView) as well as a live iframe. Mirrors
+ * canvasContextMenuZOrder.parseZIndex semantics so the two directions agree.
+ */
+export function readTimelineElementZIndex(el: Element): number {
+  const html = el as HTMLElement;
+  const parseZ = (value: string | null | undefined): number | null => {
+    if (value == null || value === "" || value === "auto") return null;
+    const n = Number.parseInt(value, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const fromInline = parseZ(html.style?.zIndex);
+  if (fromInline != null) return fromInline;
+  const view = el.ownerDocument?.defaultView;
+  if (view?.getComputedStyle) {
+    const fromComputed = parseZ(view.getComputedStyle(html).zIndex);
+    if (fromComputed != null) return fromComputed;
+  }
+  return 0;
+}
+
 function readDurationAttribute(el: Element | null | undefined): number {
   if (!el) return 0;
   const duration =
@@ -23,19 +48,57 @@ function readDurationAttribute(el: Element | null | undefined): number {
   return isFinitePositive(duration) ? duration : 0;
 }
 
-export function readTimelineDurationFromDocument(doc: Document | null | undefined): number {
-  if (!doc) return 0;
-  const rootDuration = readDurationAttribute(doc.querySelector("[data-composition-id]"));
-  if (rootDuration > 0) return rootDuration;
+export function isTimelineIgnoredElement(el: Element): boolean {
+  return Boolean(
+    el.closest(
+      [
+        "[data-hyperframes-ignore]",
+        "[data-hyperframes-picker-ignore]",
+        "[data-hf-ignore]",
+        "[data-hf-color-grading-canvas]",
+      ].join(","),
+    ),
+  );
+}
 
+/**
+ * Furthest clip end (start + RAW `data-duration`) over every non-root clip in the
+ * document. Reads the authored attribute, NOT any runtime-computed value — so it
+ * is immune to the runtime's clamp that truncates a clip's live duration to the
+ * composition length. This is the source of truth for content-driven duration:
+ * computing it from the store instead would feed the truncated value back in and
+ * make the composition length ratchet down (research HANDOFF-3 §6.1 feedback loop).
+ */
+export function furthestClipEndFromDocument(doc: Document | null | undefined): number {
+  if (!doc) return 0;
+  const root = doc.querySelector("[data-composition-id]");
   let maxEnd = 0;
   for (const node of Array.from(doc.querySelectorAll("[data-start]"))) {
+    if (node === root || isTimelineIgnoredElement(node)) continue;
     const start = Number.parseFloat(node.getAttribute("data-start") ?? "");
     const duration = readDurationAttribute(node);
     if (!Number.isFinite(start) || start < 0 || duration <= 0) continue;
     maxEnd = Math.max(maxEnd, start + duration);
   }
   return maxEnd;
+}
+
+export function readTimelineDurationFromDocument(doc: Document | null | undefined): number {
+  if (!doc) return 0;
+  const rootDuration = readDurationAttribute(doc.querySelector("[data-composition-id]"));
+  if (rootDuration > 0) return rootDuration;
+  return furthestClipEndFromDocument(doc);
+}
+
+/**
+ * Furthest clip end parsed straight from a composition SOURCE STRING (the HTML
+ * being saved). Uses raw `data-duration`, so it is the correct input for syncing
+ * the root duration after an edit — reading the store instead would use the
+ * runtime-truncated durations and shrink the composition (the feedback loop).
+ */
+export function furthestClipEndFromSource(source: string): number {
+  if (!source) return 0;
+  return furthestClipEndFromDocument(new DOMParser().parseFromString(source, "text/html"));
 }
 
 // ---------------------------------------------------------------------------
@@ -149,13 +212,13 @@ export function getImplicitTimelineLayerLabel(el: HTMLElement): string {
 // ---------------------------------------------------------------------------
 
 export function getTimelineElementSelector(el: Element): string | undefined {
-  if (isHtmlElement(el) && el.id) return `#${el.id}`;
+  if (isHtmlElement(el) && el.id) return `#${CSS.escape(el.id)}`;
   const compId = el.getAttribute("data-composition-id");
-  if (compId) return `[data-composition-id="${compId}"]`;
+  if (compId) return `[data-composition-id="${CSS.escape(compId)}"]`;
   if (isHtmlElement(el)) {
     const classes = el.className.split(/\s+/).filter(Boolean);
     const firstClass = classes.find((className) => className !== "clip") ?? classes[0];
-    if (firstClass) return `.${firstClass}`;
+    if (firstClass) return `.${CSS.escape(firstClass)}`;
   }
   return undefined;
 }
@@ -231,8 +294,27 @@ export function buildTimelineElementIdentity(params: {
   return { id, key };
 }
 
-export function getTimelineElementIdentity(element: TimelineElement): string {
+export function getTimelineElementIdentity(element: { key?: string | null; id: string }): string {
   return element.key ?? element.id;
+}
+
+/**
+ * Timeline store key for a z-reorder entry built OUTSIDE the timeline
+ * expansion (canvas context menu / LayersPanel), so the reorder commit can
+ * update the store's zIndex synchronously. Matches buildTimelineElementKey's
+ * stable branches (`sourceFile#domId`, else the selector-based key). Undefined
+ * when the element has neither a DOM id nor a selector — the timeline's
+ * fallback branch needs its own fallbackIndex, which these callers don't have,
+ * so such an entry simply skips the synchronous store update.
+ */
+export function deriveTimelineStoreKey(params: {
+  domId?: string;
+  selector?: string;
+  selectorIndex?: number;
+  sourceFile?: string;
+}): string | undefined {
+  if (!params.domId && !params.selector) return undefined;
+  return buildTimelineElementKey({ id: "", fallbackIndex: 0, ...params });
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +323,9 @@ export function getTimelineElementIdentity(element: TimelineElement): string {
 
 function getTimelineDomNodes(doc: Document): Element[] {
   const rootComp = doc.querySelector("[data-composition-id]");
-  return Array.from(doc.querySelectorAll("[data-start]")).filter((node) => node !== rootComp);
+  return Array.from(doc.querySelectorAll("[data-start]")).filter(
+    (node) => node !== rootComp && !isTimelineIgnoredElement(node),
+  );
 }
 
 function numbersNearlyEqual(a: number, b: number): boolean {
@@ -267,8 +351,8 @@ function nodeMatchesManifestClip(node: Element, clip: ClipManifestClip): boolean
 function findTimelineDomNode(doc: Document, id: string): Element | null {
   return (
     doc.getElementById(id) ??
-    doc.querySelector(`[data-composition-id="${id}"]`) ??
-    doc.querySelector(`.${id}`) ??
+    doc.querySelector(`[data-composition-id="${CSS.escape(id)}"]`) ??
+    doc.querySelector(`.${CSS.escape(id)}`) ??
     null
   );
 }
@@ -295,6 +379,7 @@ export function findTimelineDomNodeForClip(
 
 export function isImplicitTimelineLayerCandidate(root: Element, el: Element): el is HTMLElement {
   if (!isHtmlElement(el)) return false;
+  if (isTimelineIgnoredElement(el)) return false;
   if (el.parentElement !== root) return false;
   const tagName = el.tagName.toLowerCase();
   if (IMPLICIT_TIMELINE_LAYER_SKIP_TAGS.has(tagName)) return false;

@@ -1,5 +1,7 @@
-import { memo, useEffect, useRef, useState } from "react";
-import { Eye, Layers, Move, X } from "../../icons/SystemIcons";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Move } from "../../icons/SystemIcons";
+import { Eye, EyeSlash } from "@phosphor-icons/react";
+import { InspectorHeaderActions } from "./InspectorHeaderActions";
 import { useStudioShellContext } from "../../contexts/StudioContext";
 import { readStudioBoxSize, readStudioPathOffset, readStudioRotation } from "./manualEdits";
 import {
@@ -9,10 +11,15 @@ import {
   RESPONSIVE_GRID,
   readGsapRuntimeValuesForPanel,
   readGsapBorderRadiusForPanel,
+  isSelectedElementHidden,
 } from "./propertyPanelHelpers";
 import { MetricField, Section } from "./propertyPanelPrimitives";
+import { createTransformCommitHandlers } from "./propertyPanelTransformCommit";
 import { classifyPropertyGroup } from "@hyperframes/core/gsap-parser";
-import { isMediaElement, MediaSection } from "./propertyPanelMediaSection";
+import { resolveEditingSections } from "@hyperframes/core/editing";
+import { MediaSection } from "./propertyPanelMediaSection";
+import { ColorGradingSection } from "./propertyPanelColorGradingSection";
+import { domEditSelectionToFacts } from "./domEditingLayers";
 import { TextSection, StyleSections } from "./propertyPanelSections";
 import { GsapAnimationSection } from "./GsapAnimationSection";
 import { PropertyPanel3dTransform } from "./propertyPanel3dTransform";
@@ -22,9 +29,11 @@ import { usePlayerStore, liveTime } from "../../player";
 import { TimingSection } from "./propertyPanelTimingSection";
 import { type PropertyPanelProps } from "./propertyPanelHelpers";
 import { GestureRecordPanelButton } from "./GestureRecordControl";
+import { PropertyPanelEmptyState } from "./PropertyPanelEmptyState";
 
 // Re-export helpers that external consumers import from this module
 export {
+  buildInsetClipPathSides,
   buildStrokeStyleUpdates,
   buildStrokeWidthStyleUpdates,
   getCssFilterFunctionPx,
@@ -32,6 +41,7 @@ export {
   inferBoxShadowPreset,
   inferClipPathPreset,
   normalizePanelPxValue,
+  parseInsetClipPathSides,
   setCssFilterFunctionPx,
 } from "./propertyPanelHelpers";
 
@@ -44,9 +54,13 @@ export const PropertyPanel = memo(function PropertyPanel({
   multiSelectCount = 0,
   copiedAgentPrompt: _copiedAgentPrompt,
   onClearSelection,
+  onUngroup,
   onSetStyle,
   onSetAttribute,
+  onSetAttributeLive,
+  onApplyColorGradingScope,
   onSetHtmlAttribute,
+  onRemoveBackground,
   onSetManualOffset,
   onSetManualSize,
   onSetManualRotation,
@@ -55,6 +69,7 @@ export const PropertyPanel = memo(function PropertyPanel({
   onAddTextField,
   onRemoveTextField,
   onAskAgent: _onAskAgent,
+  onToggleElementHidden,
   onImportAssets,
   fontAssets = [],
   onImportFonts,
@@ -73,10 +88,14 @@ export const PropertyPanel = memo(function PropertyPanel({
   onAddGsapAnimation,
   onSetArcPath,
   onUpdateArcSegment,
+  onUnroll,
+  onUpdateKeyframeEase,
+  onSetAllKeyframeEases,
   onAddKeyframe,
   onRemoveKeyframe,
   onConvertToKeyframes,
   onCommitAnimatedProperty,
+  onCommitAnimatedProperties,
   onSeekToTime,
   recordingState,
   recordingDuration,
@@ -88,6 +107,10 @@ export const PropertyPanel = memo(function PropertyPanel({
   const clipboardTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const storeTime = usePlayerStore((s) => s.currentTime);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
+  const timelineElements = usePlayerStore((s) => s.elements);
+  const selectedElementId = usePlayerStore((s) => s.selectedElementId);
+  const selectedElementHidden = isSelectedElementHidden(timelineElements, selectedElementId);
+  const visibilityToggleLabel = selectedElementHidden ? "Show element" : "Hide element";
   const liveTimeRef = useRef(storeTime);
   const [, forceRender] = useState(0);
   useEffect(() => {
@@ -110,36 +133,44 @@ export const PropertyPanel = memo(function PropertyPanel({
   const cacheElementKey = element?.id ?? element?.selector ?? "";
   const cacheEntry = usePlayerStore((s) => s.keyframeCache.get(cacheElementKey));
 
+  const iframeRef = previewIframeRef ?? { current: null };
+  const gsapAnimIdForMemo = element
+    ? (gsapAnimations?.find((a: { keyframes?: unknown }) => a.keyframes)?.id ??
+      gsapAnimations?.[0]?.id ??
+      null)
+    : null;
+  const gsapRuntimeValues = useMemo(
+    () =>
+      element
+        ? readGsapRuntimeValuesForPanel(gsapAnimIdForMemo, gsapAnimations, element, iframeRef)
+        : null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- iframeRef is stable; currentTime drives re-reads during playback
+    [gsapAnimIdForMemo, gsapAnimations, element, currentTime],
+  );
+  const gsapBorderRadius = useMemo(
+    () =>
+      element
+        ? readGsapBorderRadiusForPanel(gsapRuntimeValues, gsapAnimations, element, iframeRef)
+        : null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [gsapRuntimeValues, gsapAnimations, element, currentTime],
+  );
+  // The 3D Transform panel should be reachable on ANY element, not only ones GSAP is
+  // already animating — otherwise you can't add depth/rotation to a fresh static
+  // element (the panel never appears, the classic chicken-and-egg). Default to
+  // identity when there are no runtime values yet; the first edit creates the
+  // gsap.set via commitStaticSet, after which real runtime values flow in.
+  const gsap3dValues: Record<string, number> = gsapRuntimeValues ?? {
+    rotationX: 0,
+    rotationY: 0,
+    rotationZ: 0,
+    z: 0,
+    scale: 1,
+    transformPerspective: 0,
+  };
+
   if (!element) {
-    return (
-      <div className="flex h-full flex-col bg-neutral-900">
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          {multiSelectCount > 1 ? (
-            <>
-              <Layers size={18} className="mb-3 text-neutral-600" />
-              <p className="text-sm font-medium text-neutral-200">
-                {multiSelectCount} elements selected
-              </p>
-              <p className="mt-2 max-w-[260px] text-xs leading-5 text-neutral-500">
-                Select a single element to edit its properties. Click an element in the preview or
-                use the timeline layer panel.
-              </p>
-            </>
-          ) : (
-            <>
-              <Eye size={18} className="mb-3 text-neutral-600" />
-              <p className="text-sm font-medium text-neutral-200">
-                Select an element in the preview.
-              </p>
-              <p className="mt-2 max-w-[260px] text-xs leading-5 text-neutral-500">
-                The inspector is tuned for element edits with safer geometry controls, color
-                picking, and cleaner grouped layer controls.
-              </p>
-            </>
-          )}
-        </div>
-      </div>
-    );
+    return <PropertyPanelEmptyState multiSelectCount={multiSelectCount} />;
   }
 
   const manualOffsetEditingDisabled = !element.capabilities.canApplyManualOffset;
@@ -147,6 +178,10 @@ export const PropertyPanel = memo(function PropertyPanel({
   const manualRotationEditingDisabled = !element.capabilities.canApplyManualRotation;
   const sourceLabel = element.id ? `#${element.id}` : element.selector;
   const showEditableSections = element.capabilities.canEditStyles;
+  // Capabilities are already resolved on the selection; recompute only sections,
+  // feeding the live GSAP tween count (arrives on the gsapAnimations prop, not the
+  // selection) so the Timing section shows for pure-GSAP elements with no data-start.
+  const sections = resolveEditingSections(domEditSelectionToFacts(element, gsapAnimations.length));
   const manualOffset = readStudioPathOffset(element.element);
   const manualSize = readStudioBoxSize(element.element);
   const resolvedWidth =
@@ -158,66 +193,7 @@ export const PropertyPanel = memo(function PropertyPanel({
       ? manualSize.height
       : (parsePxMetricValue(styles.height ?? "") ?? element.boundingBox.height);
 
-  const commitManualOffset = (axis: "x" | "y", nextValue: string) => {
-    const parsed = parsePxMetricValue(nextValue);
-    if (parsed == null) return;
-    if (onCommitAnimatedProperty && hasGsapAnimation) {
-      void onCommitAnimatedProperty(element, axis, parsed);
-      return;
-    }
-    if (gsapKeyframes && gsapAnimId && onAddKeyframe) {
-      const pct = Math.max(0, Math.min(100, Math.round(currentPct * 10) / 10));
-      onAddKeyframe(gsapAnimId, pct, axis, parsed);
-      return;
-    }
-    if (hasGsapAnimation) {
-      showToast?.("Cannot edit position — animation callbacks not available");
-      return;
-    }
-    const current = readStudioPathOffset(element.element);
-    void Promise.resolve(
-      onSetManualOffset(element, {
-        x: axis === "x" ? parsed : current.x,
-        y: axis === "y" ? parsed : current.y,
-      }),
-    ).catch(() => undefined);
-  };
-
-  // fallow-ignore-next-line complexity
-  const commitManualSize = (axis: "width" | "height", nextValue: string) => {
-    const parsed = parsePxMetricValue(nextValue);
-    if (parsed == null || parsed <= 0) return;
-    if (onCommitAnimatedProperty && hasGsapAnimation) {
-      void onCommitAnimatedProperty(element, axis, parsed);
-      return;
-    }
-    if (hasGsapAnimation) {
-      showToast?.("Cannot edit size — animation callbacks not available");
-      return;
-    }
-    const current = readStudioBoxSize(element.element);
-    const width =
-      current.width > 0
-        ? current.width
-        : (parsePxMetricValue(styles.width ?? "") ?? element.boundingBox.width);
-    const height =
-      current.height > 0
-        ? current.height
-        : (parsePxMetricValue(styles.height ?? "") ?? element.boundingBox.height);
-    void Promise.resolve(
-      onSetManualSize(element, {
-        width: axis === "width" ? parsed : width,
-        height: axis === "height" ? parsed : height,
-      }),
-    ).catch(() => undefined);
-  };
-
   const manualRotation = readStudioRotation(element.element);
-  const commitManualRotation = (nextValue: string) => {
-    const parsed = Number.parseFloat(nextValue);
-    if (!Number.isFinite(parsed)) return;
-    void Promise.resolve(onSetManualRotation(element, { angle: parsed })).catch(() => undefined);
-  };
 
   const elStart = Number.parseFloat(element?.dataAttributes?.start ?? "0") || 0;
   const elDuration = Number.parseFloat(element?.dataAttributes?.duration ?? "1") || 0;
@@ -227,6 +203,21 @@ export const PropertyPanel = memo(function PropertyPanel({
   const gsapKeyframes = gsapKfAnim?.keyframes?.keyframes ?? null;
   const gsapAnimId = gsapKfAnim?.id ?? gsapAnimations?.[0]?.id ?? null;
   const hasGsapAnimation = !!(gsapAnimId || gsapAnimations.length > 0);
+  const { commitManualOffset, commitManualSize, commitManualRotation } =
+    createTransformCommitHandlers({
+      element,
+      styles,
+      hasGsapAnimation,
+      gsapAnimId,
+      gsapKeyframes,
+      currentPct,
+      onCommitAnimatedProperty,
+      onAddKeyframe,
+      onSetManualOffset,
+      onSetManualSize,
+      onSetManualRotation,
+      showToast,
+    });
   const navKeyframes = cacheEntry?.keyframes ?? gsapKeyframes;
   const seekFromKfPct = (pct: number) => onSeekToTime?.(elStart + (pct / 100) * elDuration);
 
@@ -237,26 +228,60 @@ export const PropertyPanel = memo(function PropertyPanel({
     return gsapAnimId ?? "";
   };
 
-  // Read ALL GSAP-interpolated values at the current seek time.
-  const gsapRuntimeValues = readGsapRuntimeValuesForPanel(
-    gsapAnimId,
-    gsapAnimations,
-    element,
-    previewIframeRef ?? { current: null },
-  );
-
-  const gsapBorderRadius = readGsapBorderRadiusForPanel(
-    gsapRuntimeValues,
-    gsapAnimations,
-    element,
-    previewIframeRef ?? { current: null },
-  );
-
   const displayX = gsapRuntimeValues?.x ?? manualOffset.x;
   const displayY = gsapRuntimeValues?.y ?? manualOffset.y;
   const displayW = gsapRuntimeValues?.width ?? resolvedWidth;
   const displayH = gsapRuntimeValues?.height ?? resolvedHeight;
   const displayR = gsapRuntimeValues?.rotation ?? manualRotation.angle;
+
+  // fallow-ignore-next-line complexity
+  const handleCopyElementInfo = () => {
+    const file = element.sourceFile ?? "index.html";
+    let lineNum: number | null = null;
+    try {
+      const src = previewIframeRef?.current?.contentDocument?.documentElement?.outerHTML ?? "";
+      if (src && element.id) {
+        const idx = src.indexOf(`id="${element.id}"`);
+        if (idx > -1) lineNum = src.slice(0, idx).split("\n").length;
+      }
+      if (!lineNum && element.selector) {
+        const tag = element.tagName.toLowerCase();
+        const cls = element.selector.startsWith(".")
+          ? element.selector.slice(1).split(".")[0]
+          : null;
+        const search = cls ? `class="${cls}` : `<${tag}`;
+        const idx = src.indexOf(search);
+        if (idx > -1) lineNum = src.slice(0, idx).split("\n").length;
+      }
+    } catch {}
+    const fileLoc = lineNum ? `${file}:${lineNum}` : file;
+    const lines = [
+      `Element: ${element.label} (${sourceLabel})`,
+      `File: ${fileLoc}`,
+      `Position: x=${Math.round(element.boundingBox.x)}, y=${Math.round(element.boundingBox.y)}`,
+      `Size: ${Math.round(element.boundingBox.width)}×${Math.round(element.boundingBox.height)}`,
+      `Tag: <${element.tagName}>`,
+    ];
+    if (element.computedStyles["z-index"] && element.computedStyles["z-index"] !== "auto") {
+      lines.push(`Z-index: ${element.computedStyles["z-index"]}`);
+    }
+    if (gsapAnimations.length > 0) {
+      const anim = gsapAnimations[0];
+      lines.push(
+        `Animation: ${anim.method}() ${anim.duration}s at ${anim.position}s, ease: ${anim.ease ?? "default"}`,
+      );
+      const props = Object.entries(anim.properties)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(", ");
+      if (props) lines.push(`Properties: ${props}`);
+    }
+    const text = lines.join("\n");
+    void navigator.clipboard.writeText(text);
+    showToast(`Copied element info for ${element.label} — paste into any AI agent`, "info");
+    setClipboardCopied(true);
+    clearTimeout(clipboardTimerRef.current);
+    clipboardTimerRef.current = setTimeout(() => setClipboardCopied(false), 1500);
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-panel-bg text-panel-text-1">
@@ -269,89 +294,30 @@ export const PropertyPanel = memo(function PropertyPanel({
             <div className="mt-0.5 truncate text-[11px] text-neutral-500">{sourceLabel}</div>
           </div>
           <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={() => {
-                const file = element.sourceFile ?? "index.html";
-                let lineNum: number | null = null;
-                try {
-                  const src =
-                    previewIframeRef?.current?.contentDocument?.documentElement?.outerHTML ?? "";
-                  if (src && element.id) {
-                    const idx = src.indexOf(`id="${element.id}"`);
-                    if (idx > -1) lineNum = src.slice(0, idx).split("\n").length;
-                  }
-                  if (!lineNum && element.selector) {
-                    const tag = element.tagName.toLowerCase();
-                    const cls = element.selector.startsWith(".")
-                      ? element.selector.slice(1).split(".")[0]
-                      : null;
-                    const search = cls ? `class="${cls}` : `<${tag}`;
-                    const idx = src.indexOf(search);
-                    if (idx > -1) lineNum = src.slice(0, idx).split("\n").length;
-                  }
-                } catch {}
-                const fileLoc = lineNum ? `${file}:${lineNum}` : file;
-                const lines = [
-                  `Element: ${element.label} (${sourceLabel})`,
-                  `File: ${fileLoc}`,
-                  `Position: x=${Math.round(element.boundingBox.x)}, y=${Math.round(element.boundingBox.y)}`,
-                  `Size: ${Math.round(element.boundingBox.width)}×${Math.round(element.boundingBox.height)}`,
-                  `Tag: <${element.tagName}>`,
-                ];
-                if (
-                  element.computedStyles["z-index"] &&
-                  element.computedStyles["z-index"] !== "auto"
-                ) {
-                  lines.push(`Z-index: ${element.computedStyles["z-index"]}`);
-                }
-                if (gsapAnimations.length > 0) {
-                  const anim = gsapAnimations[0];
-                  lines.push(
-                    `Animation: ${anim.method}() ${anim.duration}s at ${anim.position}s, ease: ${anim.ease ?? "default"}`,
-                  );
-                  const props = Object.entries(anim.properties)
-                    .map(([k, v]) => `${k}: ${v}`)
-                    .join(", ");
-                  if (props) lines.push(`Properties: ${props}`);
-                }
-                const text = lines.join("\n");
-                void navigator.clipboard.writeText(text);
-                showToast(
-                  `Copied element info for ${element.label} — paste into any AI agent`,
-                  "info",
-                );
-                setClipboardCopied(true);
-                clearTimeout(clipboardTimerRef.current);
-                clipboardTimerRef.current = setTimeout(() => setClipboardCopied(false), 1500);
-              }}
-              className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                clipboardCopied
-                  ? "text-studio-accent"
-                  : "text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300"
-              }`}
-              title={clipboardCopied ? "Copied!" : "Copy element info to clipboard"}
-            >
-              <svg
-                width="13"
-                height="13"
-                viewBox="0 0 16 16"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
+            {selectedElementId && onToggleElementHidden && (
+              <button
+                type="button"
+                aria-label={visibilityToggleLabel}
+                title={visibilityToggleLabel}
+                onClick={() => {
+                  void onToggleElementHidden(selectedElementId, !selectedElementHidden);
+                }}
+                className="flex h-6 w-6 items-center justify-center rounded text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
               >
-                <rect x="5" y="5" width="9" height="9" rx="1.5" />
-                <path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              aria-label="Clear selection"
-              onClick={onClearSelection}
-              className="flex h-6 w-6 items-center justify-center rounded text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
-            >
-              <X size={13} />
-            </button>
+                {selectedElementHidden ? (
+                  <EyeSlash size={13} weight="bold" aria-hidden="true" />
+                ) : (
+                  <Eye size={13} weight="bold" aria-hidden="true" />
+                )}
+              </button>
+            )}
+            <InspectorHeaderActions
+              element={element}
+              copied={clipboardCopied}
+              onCopy={handleCopyElementInfo}
+              onClear={onClearSelection}
+              onUngroup={onUngroup}
+            />
           </div>
         </div>
       </div>
@@ -375,10 +341,35 @@ export const PropertyPanel = memo(function PropertyPanel({
           onRemoveTextField={onRemoveTextField}
         />
 
-        {element.dataAttributes.start != null && (
-          <TimingSection element={element} onSetAttribute={onSetAttribute} />
+        {sections.timing && (
+          // Render whenever there's an authored clip range OR animations to infer
+          // one from — a pure-GSAP element with no data-start still gets a Timing
+          // range (TimingSection derives it from its tweens).
+          <TimingSection
+            element={element}
+            animations={gsapAnimations}
+            onSetAttribute={onSetAttribute}
+          />
         )}
-        {isMediaElement(element) && (
+        {sections.colorGrading && (
+          <ColorGradingSection
+            key={[
+              element.id ?? "",
+              element.hfId ?? "",
+              element.selector ?? "",
+              String(element.selectorIndex ?? ""),
+            ].join("|")}
+            projectId={projectId}
+            element={element}
+            assets={assets}
+            previewIframeRef={previewIframeRef}
+            onImportAssets={onImportAssets}
+            onSetAttributeLive={onSetAttributeLive}
+            onApplyScope={onApplyColorGradingScope}
+          />
+        )}
+
+        {sections.media && (
           <MediaSection
             projectDir={projectDir}
             element={element}
@@ -386,6 +377,7 @@ export const PropertyPanel = memo(function PropertyPanel({
             onSetStyle={onSetStyle}
             onSetAttribute={onSetAttribute}
             onSetHtmlAttribute={onSetHtmlAttribute}
+            onRemoveBackground={onRemoveBackground}
           />
         )}
 
@@ -516,22 +508,31 @@ export const PropertyPanel = memo(function PropertyPanel({
               )}
             </div>
           </div>
-          {gsapRuntimeValues && (
-            <PropertyPanel3dTransform
-              gsapRuntimeValues={gsapRuntimeValues}
-              gsapAnimId={gsapAnimId}
-              resolveAnimIdForProp={animIdForProp}
-              gsapKeyframes={navKeyframes}
-              currentPct={currentPct}
-              elStart={elStart}
-              elDuration={elDuration}
-              element={element}
-              onCommitAnimatedProperty={onCommitAnimatedProperty}
-              onSeekToTime={onSeekToTime}
-              onRemoveKeyframe={onRemoveKeyframe}
-              onConvertToKeyframes={onConvertToKeyframes}
-            />
-          )}
+          <PropertyPanel3dTransform
+            gsapRuntimeValues={gsap3dValues}
+            gsapAnimId={gsapAnimId}
+            resolveAnimIdForProp={animIdForProp}
+            gsapKeyframes={navKeyframes}
+            currentPct={currentPct}
+            elStart={elStart}
+            elDuration={elDuration}
+            element={element}
+            onCommitAnimatedProperty={onCommitAnimatedProperty}
+            onCommitAnimatedProperties={onCommitAnimatedProperties}
+            onSeekToTime={onSeekToTime}
+            onRemoveKeyframe={onRemoveKeyframe}
+            onConvertToKeyframes={onConvertToKeyframes}
+            onLivePreviewProps={(el, props) => {
+              const iframe = iframeRef.current;
+              const win = iframe?.contentWindow as
+                | { gsap?: { set: (t: Element, v: Record<string, number>) => void } }
+                | null
+                | undefined;
+              const sel = el.id ? `#${el.id}` : el.selector;
+              const node = sel ? iframe?.contentDocument?.querySelector(sel) : null;
+              if (win?.gsap && node) win.gsap.set(node, props);
+            }}
+          />
           <div className="mt-3">
             <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-neutral-600">
               Stacking
@@ -566,6 +567,9 @@ export const PropertyPanel = memo(function PropertyPanel({
               onAddAnimation={onAddGsapAnimation}
               onSetArcPath={onSetArcPath}
               onUpdateArcSegment={onUpdateArcSegment}
+              onUnroll={onUnroll}
+              onUpdateKeyframeEase={onUpdateKeyframeEase}
+              onSetAllKeyframeEases={onSetAllKeyframeEases}
             />
           )}
 

@@ -1,9 +1,8 @@
-// fallow-ignore-file unused-file
 // fallow-ignore-file code-duplication
 import type { DomEditSelection } from "./domEditing";
 import {
   isElementVisibleForOverlay,
-  toOverlayRect,
+  toVisibleOverlayRect,
   type OverlayRect,
 } from "./domEditOverlayGeometry";
 import {
@@ -100,18 +99,13 @@ export function collectSnapContext(input: {
 
   const MAX_SNAP_TARGETS = 80;
   const elements = collectVisibleElements(root, input.excludeElements, MAX_SNAP_TARGETS);
-  if (elements.length >= MAX_SNAP_TARGETS) {
-    console.warn(
-      `[snap] Target cap reached (${MAX_SNAP_TARGETS}). Elements beyond this limit are excluded from snap alignment.`,
-    );
-  }
 
   const entries: Array<{
     rect: { left: number; top: number; width: number; height: number };
     id: string;
   }> = [];
   for (let i = 0; i < elements.length; i++) {
-    const rect = toOverlayRect(input.overlayEl, input.iframe, elements[i]);
+    const rect = toVisibleOverlayRect(input.overlayEl, input.iframe, elements[i]);
     if (rect) entries.push({ rect, id: `snap-target-${i}` });
   }
 

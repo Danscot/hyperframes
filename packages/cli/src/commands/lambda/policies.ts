@@ -22,6 +22,7 @@
 
 import { readFileSync } from "node:fs";
 import { c } from "../../ui/colors.js";
+import { normalizeErrorMessage } from "../../utils/errorMessage.js";
 
 export type PoliciesVerb = "role" | "user" | "validate";
 
@@ -122,12 +123,18 @@ const REQUIRED_ACTIONS = {
     "s3:GetBucketPolicy",
     "s3:GetBucketTagging",
     "s3:GetBucketVersioning",
+    // SAM's `--resolve-s3` managed bucket (aws-sam-cli-managed-default) sets
+    // default SSE encryption; CloudFormation reads it on update/drift. Without
+    // Get/PutEncryptionConfiguration the first `lambda deploy` 403s creating
+    // that bucket and the managed stack rolls back.
+    "s3:GetEncryptionConfiguration",
     "s3:GetLifecycleConfiguration",
     "s3:ListAllMyBuckets",
     "s3:ListBucket",
     "s3:PutBucketPolicy",
     "s3:PutBucketTagging",
     "s3:PutBucketVersioning",
+    "s3:PutEncryptionConfiguration",
     "s3:PutLifecycleConfiguration",
     "s3:PutPublicAccessBlock",
   ],
@@ -247,7 +254,7 @@ export async function runPolicies(args: PoliciesArgs): Promise<void> {
       try {
         result = validatePolicy(args.inputPath);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = normalizeErrorMessage(err);
         if (args.json) {
           console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
           process.exitCode = 1;

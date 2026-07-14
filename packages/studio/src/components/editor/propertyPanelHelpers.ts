@@ -1,78 +1,32 @@
 import { parseCssColor, type ParsedColor } from "./colorValue";
 import { COMMON_LOCAL_FONT_FAMILIES } from "./fontCatalog";
 import type { DomEditSelection } from "./domEditing";
-import type { ImportedFontAsset } from "./fontAssets";
-import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
+import type { GsapAnimation } from "@hyperframes/parsers/gsap-parser";
+import type { TimelineElement } from "../../player";
 import { roundToCenti } from "../../utils/rounding";
 
-export interface PropertyPanelProps {
-  projectId: string;
-  projectDir: string | null;
-  assets: string[];
-  element: DomEditSelection | null;
-  multiSelectCount?: number;
-  copiedAgentPrompt: boolean;
-  onClearSelection: () => void;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
-  onSetAttribute: (attr: string, value: string) => void | Promise<void>;
-  onSetHtmlAttribute: (attr: string, value: string | null) => void | Promise<void>;
-  onSetManualOffset: (element: DomEditSelection, next: { x: number; y: number }) => void;
-  onSetManualSize: (element: DomEditSelection, next: { width: number; height: number }) => void;
-  onSetManualRotation: (element: DomEditSelection, next: { angle: number }) => void;
-  onSetText: (value: string, fieldKey?: string) => void;
-  onSetTextFieldStyle: (fieldKey: string, property: string, value: string) => void;
-  onAddTextField: (afterFieldKey?: string) => string | Promise<string | null> | null;
-  onRemoveTextField: (fieldKey: string) => void;
-  onAskAgent: () => void;
-  onImportAssets?: (files: FileList) => Promise<string[]>;
-  fontAssets?: ImportedFontAsset[];
-  onImportFonts?: (files: FileList | File[]) => Promise<ImportedFontAsset[]>;
-  previewIframeRef?: React.RefObject<HTMLIFrameElement | null>;
-  gsapAnimations?: import("@hyperframes/core/gsap-parser").GsapAnimation[];
-  gsapMultipleTimelines?: boolean;
-  gsapUnsupportedTimelinePattern?: boolean;
-  onUpdateGsapProperty?: (animId: string, prop: string, value: number | string) => void;
-  onUpdateGsapMeta?: (
-    animId: string,
-    updates: { duration?: number; ease?: string; position?: number },
-  ) => void;
-  onDeleteGsapAnimation?: (animId: string) => void;
-  onAddGsapProperty?: (animId: string, prop: string) => void;
-  onRemoveGsapProperty?: (animId: string, prop: string) => void;
-  onUpdateGsapFromProperty?: (animId: string, prop: string, value: number | string) => void;
-  onAddGsapFromProperty?: (animId: string, prop: string) => void;
-  onRemoveGsapFromProperty?: (animId: string, prop: string) => void;
-  onAddGsapAnimation?: (method: "to" | "from" | "set" | "fromTo") => void;
-  onSetArcPath?: (
-    animId: string,
-    config: {
-      enabled: boolean;
-      autoRotate?: boolean | number;
-      segments?: import("@hyperframes/core/gsap-parser").ArcPathSegment[];
-    },
-  ) => void;
-  onUpdateArcSegment?: (
-    animId: string,
-    segmentIndex: number,
-    update: Partial<import("@hyperframes/core/gsap-parser").ArcPathSegment>,
-  ) => void;
-  onAddKeyframe?: (
-    animationId: string,
-    percentage: number,
-    property: string,
-    value: number | string,
-  ) => void;
-  onRemoveKeyframe?: (animationId: string, percentage: number) => void;
-  onConvertToKeyframes?: (animationId: string) => void;
-  onCommitAnimatedProperty?: (
-    selection: DomEditSelection,
-    property: string,
-    value: number | string,
-  ) => Promise<void>;
-  onSeekToTime?: (time: number) => void;
-  recordingState?: "idle" | "recording" | "preview";
-  recordingDuration?: number;
-  onToggleRecording?: () => void;
+export type {
+  BackgroundRemovalProgress,
+  BackgroundRemovalResult,
+  PropertyPanelProps,
+} from "./propertyPanelTypes";
+
+export function stripQueryAndHash(value: string): string {
+  const queryIndex = value.indexOf("?");
+  const hashIndex = value.indexOf("#");
+  if (queryIndex < 0) return hashIndex < 0 ? value : value.slice(0, hashIndex);
+  if (hashIndex < 0) return value.slice(0, queryIndex);
+  return value.slice(0, Math.min(queryIndex, hashIndex));
+}
+
+export function isSelectedElementHidden(
+  elements: readonly TimelineElement[],
+  selectedElementId: string | null,
+): boolean {
+  if (!selectedElementId) return false;
+  return (
+    elements.find((element) => (element.key ?? element.id) === selectedElementId)?.hidden === true
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -207,8 +161,8 @@ export const LABEL = "text-[11px] font-medium text-panel-text-3";
 export const RESPONSIVE_GRID = "grid grid-cols-[repeat(auto-fit,minmax(118px,1fr))] gap-3";
 export const EMPTY_STYLES: Record<string, string> = {};
 
-export const EMPTY_FILTER_VALUE = "none";
-export const BOX_SHADOW_PRESETS = {
+const EMPTY_FILTER_VALUE = "none";
+const BOX_SHADOW_PRESETS = {
   none: "none",
   soft: "0 12px 36px rgba(0, 0, 0, 0.28)",
   lift: "0 18px 54px rgba(0, 0, 0, 0.38)",
@@ -216,6 +170,16 @@ export const BOX_SHADOW_PRESETS = {
 } as const;
 
 export type BoxShadowPreset = keyof typeof BOX_SHADOW_PRESETS | "custom";
+
+export {
+  buildClipPathValue,
+  buildInsetClipPathSides,
+  buildInsetClipPathValue,
+  getClipPathInsetPx,
+  inferClipPathPreset,
+  parseInsetClipPathSides,
+  type ClipPathInsetSides,
+} from "./clipPathHelpers";
 
 /* ------------------------------------------------------------------ */
 /*  Shared types                                                       */
@@ -268,12 +232,7 @@ export function parsePxMetricValue(value: string): number | null {
   return token.value;
 }
 
-export function clampPanelNumber(
-  value: number,
-  min: number,
-  max: number,
-  fallback: number,
-): number {
+function clampPanelNumber(value: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, value));
 }
@@ -314,22 +273,24 @@ export function normalizeTextMetricValue(
 }
 
 function splitCssFunctions(value: string): string[] {
+  const source = value.trim();
   const functions: string[] = [];
-  let current = "";
   let depth = 0;
+  let start = 0;
 
-  for (const char of value.trim()) {
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
     if (char === "(") depth += 1;
     if (char === ")") depth = Math.max(0, depth - 1);
     if (/\s/.test(char) && depth === 0) {
-      if (current.trim()) functions.push(current.trim());
-      current = "";
-      continue;
+      const part = source.slice(start, index).trim();
+      if (part) functions.push(part);
+      start = index + 1;
     }
-    current += char;
   }
 
-  if (current.trim()) functions.push(current.trim());
+  const lastPart = source.slice(start).trim();
+  if (lastPart) functions.push(lastPart);
   return functions;
 }
 
@@ -374,23 +335,6 @@ export function buildBoxShadowPresetValue(
   return BOX_SHADOW_PRESETS[preset];
 }
 
-export function inferClipPathPreset(
-  value: string | undefined,
-): "none" | "inset" | "circle" | "custom" {
-  const normalized = value?.trim();
-  if (!normalized || normalized === "none") return "none";
-  if (/^inset\(/i.test(normalized)) return "inset";
-  if (/^circle\(/i.test(normalized)) return "circle";
-  return "custom";
-}
-
-export function getClipPathInsetPx(value: string | undefined): number {
-  const match = /^inset\(\s*(-?\d+(?:\.\d+)?)px\b/i.exec(value?.trim() ?? "");
-  if (!match) return 0;
-  const parsed = Number.parseFloat(match[1]);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-}
-
 export function buildStrokeWidthStyleUpdates(
   nextWidth: string,
   currentBorderStyle: string | undefined,
@@ -417,23 +361,6 @@ export function buildStrokeStyleUpdates(
     updates.push(["border-width", "1px"]);
   }
   return updates;
-}
-
-export function buildClipPathValue(
-  preset: "none" | "inset" | "circle" | "custom",
-  radiusValue: number,
-  fallback: string | undefined,
-) {
-  if (preset === "custom") return fallback?.trim() || "none";
-  if (preset === "circle") return "circle(50% at 50% 50%)";
-  if (preset === "inset") {
-    return `inset(0 round ${formatNumericValue(Math.max(0, radiusValue))}px)`;
-  }
-  return "none";
-}
-
-export function buildInsetClipPathValue(insetPx: number, radiusValue: number): string {
-  return `inset(${formatNumericValue(Math.max(0, insetPx))}px round ${formatNumericValue(Math.max(0, radiusValue))}px)`;
 }
 
 export function adjustNumericToken(
@@ -481,6 +408,39 @@ export function extractBackgroundImageUrl(value: string | undefined): string {
 
 // ── GSAP runtime value readers (used by PropertyPanel) ────────────────────
 
+// Core transform channels the panel ALWAYS reads live — even before a just-set
+// value (e.g. rotationX) has re-parsed into `gsapAnimations`. Without this the
+// cube + fields drop the prop and flicker to 0 on every commit; gsap.getProperty
+// reflects the in-place instant patch, so it's the true current value.
+// fallow-ignore-next-line complexity
+const ALWAYS_READ_CHANNELS = [
+  "x",
+  "y",
+  "rotation",
+  "rotationX",
+  "rotationY",
+  "rotationZ",
+  "z",
+  "scale",
+  "transformPerspective",
+  "opacity",
+];
+
+/** Every property key the panel should read for an element: animated props + the
+ * always-read transform channels. */
+function collectPanelPropKeys(gsapAnimations: GsapAnimation[]): Set<string> {
+  const keys = new Set<string>(ALWAYS_READ_CHANNELS);
+  for (const anim of gsapAnimations) {
+    if (anim.keyframes) {
+      for (const kf of anim.keyframes.keyframes) {
+        for (const p of Object.keys(kf.properties)) keys.add(p);
+      }
+    }
+    for (const p of Object.keys(anim.properties)) keys.add(p);
+  }
+  return keys;
+}
+
 export function readGsapRuntimeValuesForPanel(
   gsapAnimId: string | null,
   gsapAnimations: GsapAnimation[],
@@ -501,15 +461,7 @@ export function readGsapRuntimeValuesForPanel(
     if (!gsap?.getProperty) return null;
     const el = iframe.contentDocument?.querySelector(selector);
     if (!el) return null;
-    const propKeys = new Set<string>();
-    for (const anim of gsapAnimations) {
-      if (anim.keyframes) {
-        for (const kf of anim.keyframes.keyframes) {
-          for (const p of Object.keys(kf.properties)) propKeys.add(p);
-        }
-      }
-      for (const p of Object.keys(anim.properties)) propKeys.add(p);
-    }
+    const propKeys = collectPanelPropKeys(gsapAnimations);
     const result: Record<string, number> = {};
     for (const prop of propKeys) {
       const v = Number(gsap.getProperty(el, prop));

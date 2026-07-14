@@ -129,6 +129,42 @@ describe("WebAudioTransport", () => {
     expect(transport.isActive()).toBe(false);
   });
 
+  describe("ownsElement (per-element mute gate)", () => {
+    function withSource(el: HTMLMediaElement) {
+      const transport = new WebAudioTransport();
+      const source = {
+        el,
+        sourceNode: { stop: vi.fn(), disconnect: vi.fn() } as unknown as AudioBufferSourceNode,
+        gainNode: { disconnect: vi.fn() } as unknown as GainNode,
+        compositionStart: 0,
+        mediaStart: 0,
+        scheduledAt: 0,
+        priorMuted: false,
+      };
+      (transport as unknown as { _activeSources: (typeof source)[] })._activeSources = [source];
+      (transport as unknown as { _paused: boolean })._paused = false;
+      return transport;
+    }
+
+    it("returns true for an element the transport plays", () => {
+      const el = { muted: false } as HTMLMediaElement;
+      expect(withSource(el).ownsElement(el)).toBe(true);
+    });
+
+    it("returns false for an element the transport does not play", () => {
+      const el = { muted: false } as HTMLMediaElement;
+      const other = { muted: false } as HTMLMediaElement;
+      expect(withSource(el).ownsElement(other)).toBe(false);
+    });
+
+    it("returns false after stopAll releases the element", () => {
+      const el = { muted: false } as HTMLMediaElement;
+      const transport = withSource(el);
+      transport.stopAll();
+      expect(transport.ownsElement(el)).toBe(false);
+    });
+  });
+
   describe("schedulePlayback timing", () => {
     it("starts in-progress clips immediately with correct buffer offset", async () => {
       const { transport, mock, gen } = setupTransport(100);
@@ -168,6 +204,43 @@ describe("WebAudioTransport", () => {
       await transport.schedulePlayback(mockEl, mockBuffer, 5, 0, 5, 1, gen);
 
       expect(mock.startFn).toHaveBeenCalledWith(0, 0);
+    });
+  });
+
+  describe("clip duration bound (trim)", () => {
+    it("bounds an in-progress clip to its remaining authored window", async () => {
+      const { transport, mock, gen } = setupTransport(100);
+      // compStart=5, mediaStart=0, compTime=8 → elapsed=3; clipDuration=10 → 7 left
+      await transport.schedulePlayback(mockEl, mockBuffer, 5, 0, 8, 1, gen, 1, 10);
+      expect(mock.startFn).toHaveBeenCalledWith(0, 3, 7);
+    });
+
+    it("bounds a future clip to its full authored window", async () => {
+      const { transport, mock, gen } = setupTransport(100);
+      // compStart=10, mediaStart=1.5, compTime=2 → elapsed=-8 → delay 8; clipDuration=4
+      await transport.schedulePlayback(mockEl, mockBuffer, 10, 1.5, 2, 1, gen, 1, 4);
+      expect(mock.startFn).toHaveBeenCalledWith(108, 1.5, 4);
+    });
+
+    it("does not schedule a clip whose window has already elapsed", async () => {
+      const { transport, mock, gen } = setupTransport(100);
+      // elapsed=15 > clipDuration=10 → nothing to play
+      const result = await transport.schedulePlayback(mockEl, mockBuffer, 5, 0, 20, 1, gen, 1, 10);
+      expect(result).toBeNull();
+      expect(mock.startFn).not.toHaveBeenCalled();
+    });
+
+    it("scales the bound by playback rate (buffer seconds)", async () => {
+      const { transport, mock, gen } = setupTransport(100);
+      // rate=2, clipDuration=10 → clipSourceLen=20; elapsed=3 → 17 buffer seconds left
+      await transport.schedulePlayback(mockEl, mockBuffer, 5, 0, 8, 1, gen, 2, 10);
+      expect(mock.startFn).toHaveBeenCalledWith(0, 3, 17);
+    });
+
+    it("plays unbounded when clipDuration is omitted (legacy behavior)", async () => {
+      const { transport, mock, gen } = setupTransport(100);
+      await transport.schedulePlayback(mockEl, mockBuffer, 5, 0, 8, 1, gen);
+      expect(mock.startFn).toHaveBeenCalledWith(0, 3);
     });
   });
 
@@ -340,6 +413,56 @@ describe("WebAudioTransport", () => {
 
       expect(el.muted).toBe(true);
       expect(transport.isActive()).toBe(false);
+    });
+  });
+
+  describe("decodeAudioElement retry policy (late-asset self-heal)", () => {
+    function transportWithDecode(decodeImpl: () => Promise<AudioBuffer>) {
+      const transport = new WebAudioTransport();
+      const ctx = { state: "running", decodeAudioData: vi.fn(decodeImpl) };
+      (transport as unknown as { _ctx: unknown })._ctx = ctx;
+      return transport;
+    }
+    const el = (src: string) =>
+      ({ getAttribute: () => src, currentSrc: "" }) as unknown as HTMLMediaElement;
+    const failedSrcs = (t: WebAudioTransport) =>
+      (t as unknown as { _failedSrcs: Set<string> })._failedSrcs;
+
+    it("does NOT blacklist a transient fetch failure — a later play retries and succeeds", async () => {
+      const transport = transportWithDecode(async () => ({}) as AudioBuffer);
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, status: 404 }) // asset not uploaded yet
+        .mockResolvedValueOnce({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const first = await transport.decodeAudioElement(el("tts.wav"));
+      expect(first).toBeNull();
+      expect(failedSrcs(transport).has("tts.wav")).toBe(false); // not permanently silenced
+
+      const second = await transport.decodeAudioElement(el("tts.wav"));
+      expect(second).not.toBeNull(); // self-heals once the asset is available
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      vi.unstubAllGlobals();
+    });
+
+    it("DOES blacklist genuinely undecodable bytes — not retried", async () => {
+      const transport = transportWithDecode(async () => {
+        throw new Error("unsupported codec");
+      });
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValue({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const first = await transport.decodeAudioElement(el("corrupt.wav"));
+      expect(first).toBeNull();
+      expect(failedSrcs(transport).has("corrupt.wav")).toBe(true); // bad data is permanent
+
+      const second = await transport.decodeAudioElement(el("corrupt.wav"));
+      expect(second).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1); // short-circuited, no re-fetch
+      vi.unstubAllGlobals();
     });
   });
 });

@@ -32,6 +32,8 @@ jobs:
     timeout-minutes: 2
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      cli: ${{ steps.filter.outputs.cli }}
+      skills: ${{ steps.filter.outputs.skills }}
     steps:
       # Force git-based change detection instead of the pull_request REST API.
       # The API path can fail the whole workflow on transient listFiles
@@ -52,6 +54,16 @@ jobs:
               - "tsconfig*.json"
               - "Dockerfile*"
               - ".github/workflows/**"
+            cli:
+              - "packages/cli/**"
+              - "package.json"
+              - "bun.lock"
+              - ".github/workflows/ci.yml"
+            skills:
+              - "skills/**"
+              - "skills-manifest.json"
+              - "package.json"
+              - ".github/workflows/ci.yml"
 
   build:
     name: Build
@@ -67,9 +79,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.17.1 --activate
       - uses: ./.github/actions/prepare-ffmpeg-bin
       - run: bun install --frozen-lockfile
       - run: bun run build
+      - run: bun run verify:packed-manifests
 
   lint:
     name: Lint
@@ -215,8 +230,115 @@ jobs:
       - uses: ./.github/actions/prepare-ffmpeg-bin
       - run: bun install --frozen-lockfile
       - run: bun run test:scripts
+      - run: bun run --filter '@hyperframes/{parsers,lint,studio-server}' build
+      - run: bun run --cwd packages/core build
       - run: bun run --cwd packages/core build:hyperframes-runtime
       - run: bun run --filter '!@hyperframes/producer' test
+
+  producer-source-tests:
+    name: "Producer: ${{ matrix.lane }} tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [unit, integration]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          lfs: true
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install FFmpeg for integration tests
+        if: matrix.lane == 'integration'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - uses: ./.github/actions/prepare-ffmpeg-bin
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter '@hyperframes/{parsers,lint,studio-server}' build
+      - run: bun run --cwd packages/core build
+      - run: bun run --filter @hyperframes/engine build
+      - run: bun run producer:test:${{ matrix.lane }}
+
+  # Tests under skills/**/*.test.mjs are bare `node --test` files with only
+  # `node:` built-in imports. They aren't part of any workspace package, and
+  # the main `Test` job's `code` path filter excludes `skills/**`, so without
+  # this dedicated job they'd never run in CI. Examples:
+  #   * skills/media-use/scripts/resolve.test.mjs
+  #   * skills/media-use/scripts/lib/manifest.test.mjs
+  # Several of these are regression guards (e.g. shell-injection cases), so
+  # the whole point is that they fire on PRs that touch skills/.
+  test-skills:
+    name: "Test: skills"
+    needs: changes
+    if: needs.changes.outputs.skills == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Discover and run skills tests
+        # We expand the test list via bash so the job fails loudly when the
+        # matcher comes back empty, rather than silently no-op'ing (which
+        # would defeat the whole point of this job).
+        run: |
+          set -euo pipefail
+          mapfile -t SKILLS_TESTS < <(find skills -type f -name "*.test.mjs" | sort)
+          if [ "${#SKILLS_TESTS[@]}" -eq 0 ]; then
+            echo "::error::No skills/**/*.test.mjs files found. Did the layout change?"
+            exit 1
+          fi
+          printf 'Running %d skills test file(s):\n' "${#SKILLS_TESTS[@]}"
+          printf '  * %s\n' "${SKILLS_TESTS[@]}"
+          node --test "${SKILLS_TESTS[@]}"
+
+  # Guards that skills-manifest.json (the published freshness fingerprint read
+  # by `hyperframes skills check`) was regenerated when a skill changed. Runs
+  # `gen:skills-manifest --check`, which compares per-skill content hashes; the
+  # manifest carries no version/timestamp, so it only fails on real content
+  # drift. bun runs the TS script directly, no install needed.
+  skills-manifest:
+    name: "Skills: manifest in sync"
+    needs: changes
+    if: needs.changes.outputs.skills == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Verify skills-manifest.json matches skills/
+        run: bun packages/cli/scripts/gen-skills-manifest.ts --check
+
+  cli-npx-shim:
+    name: "CLI: npx shim (${{ matrix.os }})"
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        if: runner.os != 'Windows'
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install dependencies
+        if: runner.os == 'Windows'
+        run: bun install --frozen-lockfile --ignore-scripts --linker=hoisted
+      - run: bun run --cwd packages/cli test src/utils/npxCommand.test.ts src/commands/skills.test.ts
 
   sdk-tests:
     name: "SDK: unit + contract + smoke"
@@ -228,6 +350,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
+      # Build workspace deps so the sdk's @hyperframes/parsers + core subpath
+      # imports resolve via the "node" export condition (dist) under vitest.
+      - run: bun run --filter '@hyperframes/parsers' build
+      - run: bun run --cwd packages/core build
       - run: bun run --filter @hyperframes/sdk test
 
   test-runtime-contract:
@@ -246,6 +372,9 @@ jobs:
           node-version: 22
       - uses: ./.github/actions/prepare-ffmpeg-bin
       - run: bun install --frozen-lockfile
+      # Runtime coverage now imports core modules that consume workspace
+      # subpaths. Build their dist exports before Vitest resolves them.
+      - run: bun run --filter '@hyperframes/{parsers,lint,studio-server}' build
       - run: bun run --filter @hyperframes/core test:hyperframe-runtime-ci
 
   studio-load-smoke:
@@ -264,6 +393,11 @@ jobs:
           node-version: 22
       - uses: ./.github/actions/prepare-ffmpeg-bin
       - run: bun install --frozen-lockfile
+      # Build workspace deps so the studio vite.config.ts (loaded by Node) can
+      # resolve @hyperframes/core and @hyperframes/studio-server via the "node"
+      # export condition (dist).
+      - run: bun run --filter '@hyperframes/{parsers,lint,studio-server}' build
+      - run: bun run --cwd packages/core build
       - run: bun run --cwd packages/core build:hyperframes-runtime
       - name: Start studio and check for runtime errors
         run: |
@@ -285,82 +419,7 @@ jobs:
 
           # Load the studio in headless Chrome with API mocking to trigger
           # the full splash→main transition (catches hooks-after-early-return bugs)
-          cd packages/producer
-          node --input-type=module <<'SMOKE_EOF'
-          import puppeteer from "puppeteer";
-          const browser = await puppeteer.launch({
-            headless: "new",
-            args: ["--no-sandbox", "--disable-setuid-sandbox"],
-          });
-          const page = await browser.newPage();
-          const errors = [];
-          page.on("pageerror", (err) => errors.push(err.message));
-          page.on("console", (msg) => {
-            if (msg.type() === "error") errors.push(msg.text());
-          });
-
-          // Mock the project API so the studio transitions past the splash screen.
-          // Without this, useServerConnection stays in "waiting" and the full React
-          // tree (with all hooks) never renders — missing hooks-order violations.
-          const COMP_HTML = '<div data-composition-id="root" data-width="1920" data-height="1080" data-duration="1" data-start="0"><div class="clip" data-start="0" data-duration="1">Test</div></div>';
-          await page.setRequestInterception(true);
-          page.on("request", (req) => {
-            const url = req.url();
-            if (url.includes("/api/projects") && !url.includes("/files") && !url.includes("/preview") && !url.includes("/gsap")) {
-              req.respond({
-                status: 200,
-                contentType: "application/json",
-                body: JSON.stringify({ projects: [{ id: "smoke-test" }] }),
-              });
-            } else if (url.includes("/api/") && url.includes("/files")) {
-              req.respond({
-                status: 200,
-                contentType: "application/json",
-                body: JSON.stringify({ files: [{ path: "index.html", type: "file" }] }),
-              });
-            } else if (url.includes("/api/") && url.includes("/preview")) {
-              req.respond({ status: 200, contentType: "text/html", body: COMP_HTML });
-            } else if (url.includes("/api/")) {
-              req.respond({ status: 200, contentType: "application/json", body: JSON.stringify({}) });
-            } else {
-              req.continue();
-            }
-          });
-
-          await page.goto("http://localhost:5199/#project=smoke-test", {
-            waitUntil: "networkidle0",
-            timeout: 30000,
-          });
-          // Wait for React to render past splash into the full studio UI
-          await new Promise((r) => setTimeout(r, 3000));
-
-          // Check for React error boundary (catches hooks violations, render crashes)
-          const errorBoundary = await page.evaluate(() => {
-            const text = document.body.innerText;
-            if (text.includes("Something went wrong")) return text;
-            return null;
-          });
-          if (errorBoundary) {
-            errors.push("React error boundary triggered: " + errorBoundary);
-          }
-          await browser.close();
-          // Filter expected noise from mock endpoints
-          const fatal = errors.filter(
-            (e) =>
-              !e.includes("favicon") &&
-              !e.includes("ERR_CONNECTION_REFUSED") &&
-              !e.includes("Failed to fetch") &&
-              !e.includes("is not iterable") &&
-              !e.includes("Cannot read properties of undefined") &&
-              !e.includes("Cannot read properties of null"),
-          );
-          if (fatal.length > 0) {
-            console.error("FAIL: studio had runtime errors:");
-            for (const e of fatal) console.error("  •", e);
-            process.exit(1);
-          }
-          console.log("PASS: studio loaded and transitioned without runtime errors");
-          SMOKE_EOF
+          node scripts/studio-runtime-smoke.mjs http://localhost:5199/#project=smoke-test
 
           kill $SERVER_PID 2>/dev/null || true
 
@@ -475,6 +534,10 @@ jobs:
           test -s /tmp/hf-cli-input.mp4
 
       - name: Smoke-test CLI from monorepo source
+        # init's --skip-skills flag is neutered (see init.ts); opt out of the
+        # GitHub skills check via this env so the smoke test stays offline/fast.
+        env:
+          HYPERFRAMES_SKIP_SKILLS: "1"
         run: |
           set -euo pipefail
           rm -rf /tmp/hf-cli-inside
@@ -528,6 +591,10 @@ jobs:
           npm install -g --prefix /tmp/hf-cli-global "$HF_CLI_TARBALL"
 
       - name: Smoke-test packed CLI outside monorepo
+        # init's --skip-skills flag is neutered (see init.ts); opt out of the
+        # GitHub skills check via this env so the smoke test stays offline/fast.
+        env:
+          HYPERFRAMES_SKIP_SKILLS: "1"
         run: |
           set -euo pipefail
           export PATH="/tmp/hf-cli-global/bin:$PATH"

@@ -4,10 +4,11 @@ import type { TimelineElement } from "../player";
 import type { DomEditSelection } from "../components/editor/domEditing";
 import type { LeftSidebarHandle } from "../components/sidebar/LeftSidebar";
 import { STUDIO_MOTION_PATH } from "../components/editor/studioMotion";
-import { shouldHandleTimelineToggleHotkey, isEditableTarget } from "../utils/timelineDiscovery";
+import { isEditableTarget } from "../utils/timelineDiscovery";
 import { shouldIgnoreHistoryShortcut } from "../utils/studioHelpers";
 import { canSplitElement } from "../utils/timelineElementSplit";
 import { STUDIO_RAZOR_TOOL_ENABLED } from "../components/editor/manualEditingAvailability";
+import { trackStudioEvent } from "../utils/studioTelemetry";
 
 function iframeContentWindow(iframe: HTMLIFrameElement | null): Window | null {
   try {
@@ -48,6 +49,31 @@ function handleUndoRedoKey(event: KeyboardEvent, onUndo: () => void, onRedo: () 
   return false;
 }
 
+// Beat edits live in an in-memory stack interleaved with file history by
+// timestamp. Undo steps to the NEWER op (beatAt >= fileAt); redo replays the
+// inverse, stepping to the OLDER op (beatAt <= fileAt). Returns true when it
+// handled the keystroke (so the file-history path is skipped).
+// fallow-ignore-next-line complexity
+function tryApplyBeatHistory(
+  direction: "undo" | "redo",
+  fileState: {
+    undo: ReadonlyArray<{ createdAt: number }>;
+    redo: ReadonlyArray<{ createdAt: number }>;
+  },
+  showToast: (message: string, tone?: "error" | "info") => void,
+): boolean {
+  const ps = usePlayerStore.getState();
+  const beatStack = direction === "undo" ? ps.beatUndo : ps.beatRedo;
+  const beatAt = beatStack[beatStack.length - 1]?.at ?? null;
+  if (beatAt === null) return false;
+  const fileStack = fileState[direction];
+  const fileAt = fileStack[fileStack.length - 1]?.createdAt ?? null;
+  if (fileAt !== null && (direction === "undo" ? beatAt < fileAt : beatAt > fileAt)) return false;
+  const label = direction === "undo" ? ps.undoBeatEdits() : ps.redoBeatEdits();
+  if (label) showToast(`${direction === "undo" ? "Undid" : "Redid"} ${label}`, "info");
+  return true;
+}
+
 // ── Types ──
 
 interface HistoryResult {
@@ -55,6 +81,8 @@ interface HistoryResult {
   reason?: string;
   label?: string;
   paths?: string[];
+  /** Per-file restored/previous content, used to soft-apply the preview. */
+  files?: Record<string, { previous: string; restored: string }>;
 }
 interface HistoryFileCallbacks {
   readFile: (path: string) => Promise<string>;
@@ -63,10 +91,13 @@ interface HistoryFileCallbacks {
 interface EditHistoryHandle {
   undo: (cb: HistoryFileCallbacks) => Promise<HistoryResult>;
   redo: (cb: HistoryFileCallbacks) => Promise<HistoryResult>;
+  state: {
+    undo: ReadonlyArray<{ createdAt: number }>;
+    redo: ReadonlyArray<{ createdAt: number }>;
+  };
 }
 
 interface UseAppHotkeysParams {
-  toggleTimelineVisibility: () => void;
   handleTimelineElementDelete: (element: TimelineElement) => Promise<void>;
   handleTimelineElementSplit: (element: TimelineElement, splitTime: number) => Promise<void>;
   handleDomEditElementDelete: (selection: DomEditSelection) => Promise<void>;
@@ -78,7 +109,10 @@ interface UseAppHotkeysParams {
   writeProjectFile: (path: string, content: string) => Promise<void>;
   domEditSaveTimestampRef: React.MutableRefObject<number>;
   showToast: (message: string, tone?: "error" | "info") => void;
-  syncHistoryPreviewAfterApply: (paths: string[] | undefined) => Promise<void>;
+  syncHistoryPreviewAfterApply: (restore: {
+    paths?: string[];
+    files?: Record<string, { previous: string; restored: string }>;
+  }) => Promise<void>;
   waitForPendingDomEditSaves: () => Promise<void>;
   leftSidebarRef: React.RefObject<LeftSidebarHandle | null>;
   handleCopy: () => boolean;
@@ -88,12 +122,23 @@ interface UseAppHotkeysParams {
   onDeleteSelectedKeyframes: () => void;
   onAfterUndoRedo?: () => void;
   onToggleRecording?: () => void;
+  /** Group the current multi-selection into a data-hf-group wrapper (⌘G). */
+  onGroupSelection?: () => void;
+  /** Ungroup the selected group wrapper (⌘⇧G). */
+  onUngroupSelection?: () => void;
+  /** Active composition path — used to decide whether undo/redo must resync the SDK session. */
+  activeCompPath?: string | null;
+  /**
+   * Force-reload the SDK session after undo/redo reverts the active comp file,
+   * bypassing the self-write suppress window. Without this, the suppress window
+   * blocks the file-change reload and the SDK session stays on pre-undo content.
+   */
+  forceReloadSdkSession?: () => void;
 }
 
 // ── Extracted keydown dispatch (pure function, no hooks) ──
 
 interface HotkeyCallbacks {
-  toggleTimelineVisibility: () => void;
   handleTimelineElementDelete: (element: TimelineElement) => Promise<void>;
   handleTimelineElementSplit: (element: TimelineElement, splitTime: number) => Promise<void>;
   handleDomEditElementDelete: (selection: DomEditSelection) => Promise<void>;
@@ -105,8 +150,11 @@ interface HotkeyCallbacks {
   onResetKeyframes: () => boolean;
   onDeleteSelectedKeyframes: () => void;
   onToggleRecording?: () => void;
+  onGroupSelection?: () => void;
+  onUngroupSelection?: () => void;
   leftSidebarRef: React.RefObject<LeftSidebarHandle | null>;
   domEditSelectionRef: React.MutableRefObject<DomEditSelection | null>;
+  showToast: (message: string, tone?: "error" | "info") => void;
 }
 
 function dispatchModifierKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks): boolean {
@@ -114,36 +162,56 @@ function dispatchModifierKey(event: KeyboardEvent, key: string, cb: HotkeyCallba
     !shouldIgnoreHistoryShortcut(event.target) &&
     handleUndoRedoKey(
       event,
-      () => void cb.handleUndo(),
-      () => void cb.handleRedo(),
+      () => {
+        trackStudioEvent("keyboard_shortcut", { action: "undo" });
+        void cb.handleUndo();
+      },
+      () => {
+        trackStudioEvent("keyboard_shortcut", { action: "redo" });
+        void cb.handleRedo();
+      },
     )
   )
     return true;
 
   if (event.key === "1") {
     event.preventDefault();
+    trackStudioEvent("keyboard_shortcut", { action: "tab_compositions" });
     cb.leftSidebarRef.current?.selectTab("compositions");
     return true;
   }
   if (event.key === "2") {
     event.preventDefault();
+    trackStudioEvent("keyboard_shortcut", { action: "tab_assets" });
     cb.leftSidebarRef.current?.selectTab("assets");
+    return true;
+  }
+
+  if (key === "g" && !event.altKey && !isEditableTarget(event.target)) {
+    event.preventDefault();
+    if (event.shiftKey) cb.onUngroupSelection?.();
+    else cb.onGroupSelection?.();
     return true;
   }
 
   if (!event.shiftKey && !event.altKey && !isEditableTarget(event.target)) {
     if (key === "c") {
-      if (cb.handleCopy()) event.preventDefault();
+      if (cb.handleCopy()) {
+        event.preventDefault();
+        trackStudioEvent("keyboard_shortcut", { action: "copy" });
+      }
       return true;
     }
     if (key === "v") {
       event.preventDefault();
+      trackStudioEvent("keyboard_shortcut", { action: "paste" });
       void cb.handlePaste();
       return true;
     }
     if (key === "x") {
       if (usePlayerStore.getState().selectedElementId || cb.domEditSelectionRef.current) {
         event.preventDefault();
+        trackStudioEvent("keyboard_shortcut", { action: "cut" });
         void cb.handleCut();
       }
       return true;
@@ -163,6 +231,9 @@ function dispatchPlainKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks
   }
 
   if (event.key === "s" && !event.altKey) {
+    // Reserve bare `s` for Split even when the current selection cannot split,
+    // so secondary listeners do not reinterpret the same key as Snap toggle.
+    event.preventDefault();
     const { selectedElementId, elements, currentTime } = usePlayerStore.getState();
     if (selectedElementId) {
       const el = elements.find((e) => (e.key ?? e.id) === selectedElementId);
@@ -172,8 +243,14 @@ function dispatchPlainKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks
         currentTime > el.start &&
         currentTime < el.start + el.duration
       ) {
-        event.preventDefault();
         void cb.handleTimelineElementSplit(el, currentTime);
+        return;
+      }
+      // Expanded sub-comp children carry a qualified `sourceFile#id` selection
+      // that isn't in the raw `elements` list, so the s-key can't resolve them.
+      // Nudge toward the razor tool instead of failing silently.
+      if (!el && selectedElementId.includes("#")) {
+        cb.showToast("Use the razor tool (B) to split clips inside a sub-composition", "info");
         return;
       }
     }
@@ -217,9 +294,14 @@ function dispatchPlainKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks
         return;
       }
     }
-    const { selectedElementId, elements } = usePlayerStore.getState();
-    if (selectedElementId) {
-      const el = elements.find((e) => (e.key ?? e.id) === selectedElementId);
+    // Delete acts on the primary selection OR the marquee multi-selection —
+    // the delete handler expands a clip that is part of the multi-selection
+    // into an atomic delete of the whole selection (single undo).
+    const { selectedElementId, selectedElementIds, elements } = usePlayerStore.getState();
+    const selectionKeys = new Set(selectedElementIds);
+    if (selectedElementId) selectionKeys.add(selectedElementId);
+    if (selectionKeys.size > 0) {
+      const el = elements.find((e) => selectionKeys.has(e.key ?? e.id));
       if (el) {
         event.preventDefault();
         void cb.handleTimelineElementDelete(el);
@@ -243,7 +325,6 @@ function dispatchPlainKey(event: KeyboardEvent, key: string, cb: HotkeyCallbacks
 // ── Hook ──
 
 export function useAppHotkeys({
-  toggleTimelineVisibility,
   handleTimelineElementDelete,
   handleTimelineElementSplit,
   handleDomEditElementDelete,
@@ -264,18 +345,13 @@ export function useAppHotkeys({
   onDeleteSelectedKeyframes,
   onAfterUndoRedo,
   onToggleRecording,
+  onGroupSelection,
+  onUngroupSelection,
+  activeCompPath,
+  forceReloadSdkSession,
 }: UseAppHotkeysParams) {
   const previewHotkeyWindowRef = useRef<Window | null>(null);
   const previewHistoryCleanupRef = useRef<(() => void) | null>(null);
-
-  const handleTimelineToggleHotkey = useCallback(
-    (event: KeyboardEvent) => {
-      if (!shouldHandleTimelineToggleHotkey(event)) return;
-      event.preventDefault();
-      toggleTimelineVisibility();
-    },
-    [toggleTimelineVisibility],
-  );
 
   // ── Undo / Redo ──
 
@@ -294,6 +370,9 @@ export function useAppHotkeys({
 
   const applyHistory = useCallback(
     async (direction: "undo" | "redo") => {
+      // Beat edits interleave with file history by timestamp; handle them first.
+      if (tryApplyBeatHistory(direction, editHistory.state, showToast)) return;
+
       await waitForPendingDomEditSaves();
       const result = await editHistory[direction]({
         readFile: readHistoryFile,
@@ -308,7 +387,15 @@ export function useAppHotkeys({
       }
       if (result.ok && result.label) {
         onAfterUndoRedo?.();
-        await syncHistoryPreviewAfterApply(result.paths);
+        // If the active composition was among the written files, force-reload
+        // the SDK session so its in-memory doc matches the reverted content.
+        // writeHistoryFile sets domEditSaveTimestampRef which activates the
+        // 2 s suppress window — without this call the file-change event would
+        // be swallowed and the SDK session would stay on stale pre-undo content.
+        if (activeCompPath && result.paths?.includes(activeCompPath)) {
+          forceReloadSdkSession?.();
+        }
+        await syncHistoryPreviewAfterApply({ paths: result.paths, files: result.files });
         showToast(`${direction === "undo" ? "Undid" : "Redid"} ${result.label}`, "info");
       }
     },
@@ -320,6 +407,8 @@ export function useAppHotkeys({
       waitForPendingDomEditSaves,
       writeHistoryFile,
       onAfterUndoRedo,
+      activeCompPath,
+      forceReloadSdkSession,
     ],
   );
 
@@ -330,7 +419,6 @@ export function useAppHotkeys({
 
   const cbRef = useRef<HotkeyCallbacks>(null!);
   cbRef.current = {
-    toggleTimelineVisibility,
     handleTimelineElementDelete,
     handleTimelineElementSplit,
     handleDomEditElementDelete,
@@ -342,19 +430,17 @@ export function useAppHotkeys({
     onResetKeyframes,
     onDeleteSelectedKeyframes,
     onToggleRecording,
+    onGroupSelection,
+    onUngroupSelection,
     leftSidebarRef,
     domEditSelectionRef,
+    showToast,
   };
 
   // ── Keydown dispatch ──
 
   const handleAppKeyDown = useCallback((event: KeyboardEvent) => {
     const cb = cbRef.current;
-    if (shouldHandleTimelineToggleHotkey(event)) {
-      event.preventDefault();
-      cb.toggleTimelineVisibility();
-      return;
-    }
     const key = event.key.toLowerCase();
     if (event.metaKey || event.ctrlKey) {
       dispatchModifierKey(event, key, cb);
@@ -443,6 +529,5 @@ export function useAppHotkeys({
     handleRedo,
     syncPreviewTimelineHotkey,
     syncPreviewHistoryHotkey,
-    handleTimelineToggleHotkey,
   };
 }

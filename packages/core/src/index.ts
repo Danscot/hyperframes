@@ -35,12 +35,27 @@ export type {
   CompositionVariable,
   CompositionSpec,
   WaveformData,
+  OutputResolutionCompatibility,
+  OutputResolutionIssueKind,
 } from "./core.types";
+
+export type {
+  SlideshowManifest,
+  SlideRef,
+  SlideHotspot,
+  SlideSequence,
+  ResolvedSlide,
+  ResolvedSlideSequence,
+  ResolvedSlideshow,
+} from "./slideshow/index.js";
+
+export { parseSlideshowManifest, resolveSlideshow } from "./slideshow/index.js";
 
 export {
   CANVAS_DIMENSIONS,
   VALID_CANVAS_RESOLUTIONS,
   normalizeResolutionFlag,
+  checkOutputResolutionCompatibility,
   parseFps,
   parseFpsWithDefault,
   toFps,
@@ -66,11 +81,9 @@ export {
   ZOOM_CONTAINER_STYLES,
 } from "./templates/constants";
 
-// Parsers — recast-free GSAP helpers only. The AST parser (parseGsapScript and
-// the script-mutation helpers) depends on recast/@babel/parser, which break in
-// browser/SSR bundles; it is reachable only via the Node-only
-// `@hyperframes/core/gsap-parser` subpath.
-export type { GsapAnimation, GsapMethod, ParsedGsap } from "./parsers/gsapSerialize";
+// Parsers — GSAP helpers. The AST parser (parseGsapScriptAcorn and write ops)
+// is browser-safe; mutation helpers are in gsapWriterAcorn.
+export type { GsapAnimation, GsapMethod, ParsedGsap } from "@hyperframes/parsers";
 
 export {
   serializeGsapAnimations,
@@ -78,9 +91,9 @@ export {
   validateCompositionGsap,
   keyframesToGsapAnimations,
   gsapAnimationsToKeyframes,
-} from "./parsers/gsapSerialize";
+} from "@hyperframes/parsers";
 
-export type { ParsedHtml, CompositionMetadata } from "./parsers/htmlParser";
+export type { ParsedHtml, CompositionMetadata } from "@hyperframes/parsers";
 
 export {
   parseHtml,
@@ -89,7 +102,7 @@ export {
   removeElementFromHtml,
   validateCompositionHtml,
   extractCompositionMetadata,
-} from "./parsers/htmlParser";
+} from "@hyperframes/parsers";
 
 // Generators
 export type { SerializeOptions } from "./generators/hyperframes";
@@ -108,30 +121,75 @@ export type {
   CompilationResult,
 } from "./compiler/timingCompiler";
 
+// Timing resolver — shared pure resolver for word-anchored elastic timing (WS-C).
+export type {
+  WordTiming,
+  ElementAnchor,
+  AuthoredTiming,
+  ResolvedTiming,
+  ResolveTimingsInput,
+  ResolveTimingsResult,
+} from "./compiler/timingResolver";
+export { resolveTimings } from "./compiler/timingResolver";
+
 export {
   compileTimingAttrs,
   injectDurations,
   extractResolvedMedia,
   clampDurations,
   shouldClampMediaDuration,
+  MEDIA_DURATION_CLAMP_EPSILON_SECONDS,
 } from "./compiler/timingCompiler";
 
-// Lint
-export type {
-  HyperframeLintSeverity,
-  HyperframeLintFinding,
-  HyperframeLintResult,
-  HyperframeLinterOptions,
-} from "./lint/types";
-export { lintHyperframeHtml } from "./lint/hyperframeLinter";
+// Lint moved to @hyperframes/lint. Import lint APIs from @hyperframes/lint
+// directly, or via the back-compat stub at @hyperframes/core/lint. Not
+// re-exported here — doing so would cycle core's main entry through the lint
+// package (which imports core utilities back).
 export {
   rewriteAssetPaths,
   rewriteAssetPath,
   rewriteCssAssetUrls,
+  rewriteInlineStyleAssetUrls,
 } from "./compiler/rewriteSubCompPaths";
 export { CSS_URL_RE, isNonRelativeUrl, isPathInside } from "./compiler/assetPaths";
+export {
+  checkSubCompositionUsability,
+  type ParsableDocumentLike,
+  type SubCompositionValidity,
+  type SubCompositionValidityReason,
+} from "./compiler/subCompositionValidity";
+export { RUNTIME_BOOTSTRAP_ATTR, stripEmbeddedRuntimeScripts } from "./compiler/htmlDocument";
+export { queryByAttr } from "./utils/cssSelector";
 export { decodeUrlPathVariants } from "./utils/urlPath";
 export { parseAnimatedGifMetadata, type AnimatedGifMetadata } from "./media/gif";
+export {
+  HF_COLOR_GRADING_ATTR,
+  HF_COLOR_GRADING_ADJUST_KEYS,
+  HF_COLOR_GRADING_CANVAS_ID_PREFIX,
+  HF_COLOR_GRADING_COLOR_SPACE,
+  HF_COLOR_GRADING_DETAIL_KEYS,
+  HF_COLOR_GRADING_EFFECT_KEYS,
+  HF_COLOR_GRADING_PRESETS,
+  isHfColorGradingActive,
+  normalizeHfColorGrading,
+  normalizeHfColorGradingWithVariables,
+  resolveHfColorGradingVariables,
+  serializeHfColorGrading,
+  type HfColorGrading,
+  type HfColorGradingAdjust,
+  type HfColorGradingAdjustKey,
+  type HfColorGradingDetailKey,
+  type HfColorGradingDetails,
+  type HfColorGradingEffectKey,
+  type HfColorGradingEffects,
+  type HfColorGradingLutRef,
+  type HfColorGradingPreset,
+  type HfColorGradingPresetId,
+  type HfColorGradingTarget,
+  type HfColorGradingVariableMap,
+  type NormalizedHfColorGrading,
+} from "./colorGrading";
+export { parseCubeLut, CubeLutParseError, type ParseCubeLutOptions } from "./colorLuts";
 
 // Inline scripts
 export {
@@ -176,6 +234,11 @@ export type { FitTextOptions, FitTextResult } from "./text/index.js";
 
 // Runtime helpers (composition-side)
 export { getVariables } from "./runtime/getVariables.js";
+export {
+  parseStartExpression,
+  parseNumeric,
+  type ReferenceExpression,
+} from "./runtime/startExpression.js";
 
 // Variable validation (CLI / tooling-side)
 export {

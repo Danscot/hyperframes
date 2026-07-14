@@ -9,9 +9,12 @@
 import { describe, expect, it } from "bun:test";
 import {
   BROWSER_GPU_NOT_SOFTWARE,
+  DISTRIBUTED_DURATION_OUT_OF_RANGE,
+  MAX_DISTRIBUTED_DURATION_SECONDS,
   PlanValidationError,
   SYSTEM_FONT_USED,
   parseFontFamilyValue,
+  validateDistributedDuration,
   validateNoGpuEncode,
   validateNoSystemFonts,
 } from "./planValidation.js";
@@ -88,6 +91,53 @@ describe("validateNoGpuEncode", () => {
     }
     expect(caught).toBeInstanceOf(PlanValidationError);
     expect((caught as Error).message).toContain("GPU encode is banned");
+  });
+});
+
+describe("validateDistributedDuration", () => {
+  it("accepts a finite duration within the distributed ceiling", () => {
+    expect(() =>
+      validateDistributedDuration({
+        duration: MAX_DISTRIBUTED_DURATION_SECONDS,
+        totalFrames: MAX_DISTRIBUTED_DURATION_SECONDS * 30,
+        fps: 30,
+      }),
+    ).not.toThrow();
+  });
+
+  it("throws DISTRIBUTED_DURATION_OUT_OF_RANGE for the engine's infinite-timeline sentinel", () => {
+    let caught: unknown;
+    try {
+      validateDistributedDuration({
+        duration: 10_000_000_000,
+        totalFrames: 300_000_000_000,
+        fps: 30,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PlanValidationError);
+    expect((caught as PlanValidationError).code).toBe(DISTRIBUTED_DURATION_OUT_OF_RANGE);
+    expect((caught as Error).message).toContain("300000000000");
+    expect((caught as Error).message).toContain("GSAP repeat:-1");
+  });
+
+  it("throws DISTRIBUTED_DURATION_OUT_OF_RANGE for non-finite or zero values", () => {
+    for (const input of [
+      { duration: Number.POSITIVE_INFINITY, totalFrames: 1, fps: 30 },
+      { duration: 0, totalFrames: 1, fps: 30 },
+      { duration: 1, totalFrames: 0, fps: 30 },
+      { duration: 1, totalFrames: 1, fps: Number.NaN },
+    ]) {
+      let caught: unknown;
+      try {
+        validateDistributedDuration(input);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(PlanValidationError);
+      expect((caught as PlanValidationError).code).toBe(DISTRIBUTED_DURATION_OUT_OF_RANGE);
+    }
   });
 });
 
@@ -206,6 +256,30 @@ describe("validateNoSystemFonts", () => {
     // The whole point: `font-family: "Inter", -apple-system, sans-serif` is
     // the canonical fallback chain. We want this to pass.
     const ok = `<style>body { font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif; }</style>`;
+    expect(() => validateNoSystemFonts(ok)).not.toThrow();
+  });
+
+  it("resolves simple CSS var() primary aliases before rejecting system fonts", () => {
+    const offending = `<style>
+      :root { --ui-font: -apple-system, BlinkMacSystemFont, sans-serif; }
+      body { font-family: var(--ui-font), sans-serif; }
+    </style>`;
+    let caught: unknown;
+    try {
+      validateNoSystemFonts(offending);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PlanValidationError);
+    expect((caught as PlanValidationError).code).toBe(SYSTEM_FONT_USED);
+    expect((caught as Error).message).toContain(`"-apple-system"`);
+  });
+
+  it("accepts CSS var() primary aliases that resolve to deterministic fonts", () => {
+    const ok = `<style>
+      :root { --ui-font: "Inter", -apple-system, sans-serif; }
+      body { font-family: var(--ui-font), sans-serif; }
+    </style>`;
     expect(() => validateNoSystemFonts(ok)).not.toThrow();
   });
 });

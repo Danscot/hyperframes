@@ -4,7 +4,9 @@ import {
   distributeFrames,
   formatWorkerFailure,
   selectWorkerDiagnostics,
+  shouldDisableBrowserPoolForParallelWorker,
   shouldVerifyWorkerGpu,
+  resolveParallelDeVerifySamples,
 } from "./parallelCoordinator.js";
 import type { EngineConfig } from "../config.js";
 
@@ -76,6 +78,44 @@ describe("calculateOptimalWorkers", () => {
   });
 });
 
+describe("shouldDisableBrowserPoolForParallelWorker", () => {
+  const linuxHeadlessWorker = {
+    parallel: true,
+    platform: "linux" as NodeJS.Platform,
+    deviceScaleFactor: 1,
+    headlessShellPath: "/tmp/chrome-headless-shell",
+  };
+
+  it.each([
+    ["BeginFrame", false],
+    ["forced screenshot", true],
+  ])(
+    "disables the browser pool for parallel Linux/headless %s workers",
+    (_mode, forceScreenshot) => {
+      expect(
+        shouldDisableBrowserPoolForParallelWorker({
+          ...linuxHeadlessWorker,
+          forceScreenshot,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    ["non-parallel", { parallel: false, forceScreenshot: true }],
+    ["non-linux", { platform: "darwin" as NodeJS.Platform, forceScreenshot: true }],
+    ["no headless shell", { headlessShellPath: undefined, forceScreenshot: true }],
+    ["supersampled", { deviceScaleFactor: 2, forceScreenshot: false }],
+  ])("keeps the shared pool for %s workers", (_case, overrides) => {
+    expect(
+      shouldDisableBrowserPoolForParallelWorker({
+        ...linuxHeadlessWorker,
+        ...overrides,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("worker failure diagnostics", () => {
   it("keeps only actionable worker diagnostics and caps the tail", () => {
     const diagnostics = selectWorkerDiagnostics(
@@ -135,5 +175,26 @@ describe("shouldVerifyWorkerGpu", () => {
   it("returns false when config is undefined", () => {
     expect(shouldVerifyWorkerGpu(0, undefined)).toBe(false);
     expect(shouldVerifyWorkerGpu(3, undefined)).toBe(false);
+  });
+});
+
+describe("resolveParallelDeVerifySamples", () => {
+  it("densifies with worker count: 4 base + 2 per extra worker", () => {
+    expect(resolveParallelDeVerifySamples(undefined, 2)).toBe(6);
+    expect(resolveParallelDeVerifySamples(undefined, 3)).toBe(8);
+  });
+
+  it("clamps at the verify path's max of 8", () => {
+    expect(resolveParallelDeVerifySamples(undefined, 5)).toBe(8);
+    expect(resolveParallelDeVerifySamples(undefined, 16)).toBe(8);
+  });
+
+  it("leaves single-worker capture on the session default", () => {
+    expect(resolveParallelDeVerifySamples(undefined, 1)).toBeUndefined();
+    expect(resolveParallelDeVerifySamples(undefined, 0)).toBeUndefined();
+  });
+
+  it("passes a caller-set value through untouched", () => {
+    expect(resolveParallelDeVerifySamples(2, 3)).toBe(2);
   });
 });

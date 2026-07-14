@@ -1,6 +1,10 @@
+// fallow-ignore-file code-duplication
 import { defineCommand } from "citty";
 import type { Example } from "./_examples.js";
 import { existsSync, writeFileSync } from "node:fs";
+import { findParakeet, transcribeWithParakeet } from "../whisper/parakeet.js";
+
+type CaptionExportFormat = "srt" | "vtt";
 
 export const examples: Example[] = [
   ["Transcribe an audio file", "hyperframes transcribe audio.mp3"],
@@ -9,11 +13,17 @@ export const examples: Example[] = [
   ["Set language to filter non-target speech", "hyperframes transcribe audio.mp3 --language en"],
   ["Import an existing SRT file", "hyperframes transcribe subtitles.srt"],
   ["Import an OpenAI Whisper JSON response", "hyperframes transcribe response.json"],
+  ["Export captions to SRT", "hyperframes transcribe transcript.json --to srt"],
+  [
+    "Export single-word/CJK captions without re-grouping",
+    "hyperframes transcribe transcript.json --to vtt --preserve-cues",
+  ],
 ];
 import { resolve, join, extname, dirname } from "node:path";
 import * as clack from "@clack/prompts";
 import { c } from "../ui/colors.js";
-import { DEFAULT_MODEL } from "../whisper/manager.js";
+import { DEFAULT_MODEL, isWhisperUnavailable } from "../whisper/manager.js";
+import { trackCommandFailure, trackTranscribeUnavailable } from "../telemetry/events.js";
 
 export default defineCommand({
   meta: {
@@ -33,6 +43,12 @@ export default defineCommand({
       description: "Project directory (default: current directory)",
       alias: "d",
     },
+    engine: {
+      type: "string",
+      description:
+        "ASR engine: auto (Parakeet if installed, else whisper), parakeet, or whisper. Default: auto. Parakeet is more accurate and faster; enable with `uv pip install parakeet-mlx`.",
+      alias: "e",
+    },
     model: {
       type: "string",
       description: `Whisper model (default: ${DEFAULT_MODEL}). Options: tiny.en, base.en, small.en, medium.en, large-v3`,
@@ -48,11 +64,34 @@ export default defineCommand({
       description: "Output result as JSON",
       default: false,
     },
+    to: {
+      type: "string",
+      description: "Export transcript sidecar format: srt or vtt",
+    },
+    output: {
+      type: "string",
+      alias: "o",
+      description: "Output path for exported SRT/VTT sidecar",
+    },
+    "preserve-cues": {
+      type: "boolean",
+      description:
+        "Keep each transcript entry as its own caption cue (skip word-level grouping). Use when exporting an already-cued transcript whose entries have no internal spaces, e.g. single-word or CJK captions.",
+      default: false,
+    },
+    optional: {
+      type: "boolean",
+      description:
+        "Treat captions as optional: if whisper-cpp is unavailable, skip and exit 0 instead of failing. For pipelines that continue without captions.",
+      default: false,
+    },
   },
   async run({ args }) {
     const inputPath = resolve(args.input);
     if (!existsSync(inputPath)) {
-      console.error(c.error(`File not found: ${args.input}`));
+      const message = `File not found: ${args.input}`;
+      trackCommandFailure("transcribe", message);
+      console.error(c.error(message));
       process.exit(1);
     }
 
@@ -64,32 +103,67 @@ export default defineCommand({
 
     // ── Import mode: convert existing transcript ──────────────────────────
     const isImport = ext === ".json" || ext === ".srt" || ext === ".vtt";
+    const to = parseExportFormat(args.to, args.json);
+
+    if (to) {
+      if (!isImport) {
+        failWith(
+          "--to can only export from transcript files (.json, .srt, .vtt). Run transcribe first.",
+          args.json,
+        );
+      }
+      return exportTranscript(inputPath, dir, to, args.output, args.json, args["preserve-cues"]);
+    }
 
     if (isImport) {
       return importTranscript(inputPath, dir, args.json);
     }
 
-    // ── Transcribe mode: run whisper ─────────────────────────────────────
+    // ── Transcribe mode: run the ASR engine ──────────────────────────────
     return transcribeAudio(inputPath, dir, {
+      engine: args.engine,
       model: args.model,
       language: args.language,
       json: args.json,
+      optional: args.optional,
     });
   },
 });
+
+function failWith(message: string, json: boolean): never {
+  trackCommandFailure("transcribe", message);
+  if (json) {
+    console.log(JSON.stringify({ ok: false, error: message }));
+  } else {
+    console.error(c.error(message));
+  }
+  process.exit(1);
+}
+
+function parseExportFormat(
+  value: string | undefined,
+  json: boolean,
+): CaptionExportFormat | undefined {
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (normalized === "srt" || normalized === "vtt") return normalized;
+
+  failWith(`Unsupported caption export format: ${value}. Use srt or vtt.`, json);
+}
 
 // ---------------------------------------------------------------------------
 // Import existing transcript
 // ---------------------------------------------------------------------------
 
+function exitNoWords(json: boolean): never {
+  failWith("No words found in transcript.", json);
+}
+
 async function importTranscript(inputPath: string, dir: string, json: boolean): Promise<void> {
   const { loadTranscript, patchCaptionHtml } = await import("../whisper/normalize.js");
   const { words, format } = loadTranscript(inputPath);
 
-  if (words.length === 0) {
-    console.error(c.error("No words found in transcript."));
-    process.exit(1);
-  }
+  if (words.length === 0) exitNoWords(json);
 
   const outPath = join(dir, "transcript.json");
   writeFileSync(outPath, JSON.stringify(words, null, 2));
@@ -107,28 +181,86 @@ async function importTranscript(inputPath: string, dir: string, json: boolean): 
 }
 
 // ---------------------------------------------------------------------------
+// Export transcript sidecars
+// ---------------------------------------------------------------------------
+
+async function exportTranscript(
+  inputPath: string,
+  dir: string,
+  to: CaptionExportFormat,
+  output: string | undefined,
+  json: boolean,
+  preserveCues: boolean,
+): Promise<void> {
+  const { loadTranscript, formatSrt, formatVtt } = await import("../whisper/normalize.js");
+  const { words, format } = loadTranscript(inputPath);
+
+  if (words.length === 0) exitNoWords(json);
+
+  // A .srt/.vtt source is already phrase-level; keep its cue boundaries 1:1.
+  // --preserve-cues forces the same for an already-cued transcript.json whose
+  // entries have no internal whitespace (single-word or CJK captions), which
+  // the automatic whitespace heuristic in wordsToCues can't detect.
+  const preGrouped = preserveCues || format === "srt" || format === "vtt" || undefined;
+  const outPath = resolve(output ?? join(dir, `transcript.${to}`));
+  const content =
+    to === "srt" ? formatSrt(words, { preGrouped }) : formatVtt(words, { preGrouped });
+  writeFileSync(outPath, content);
+
+  if (json) {
+    console.log(
+      JSON.stringify({ ok: true, format: to, wordCount: words.length, outputPath: outPath }),
+    );
+  } else {
+    console.log(
+      `${c.success("◇")}  Exported ${c.accent(String(words.length))} words to ${c.accent(to.toUpperCase())} → ${c.accent(outPath)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Transcribe audio/video with whisper
 // ---------------------------------------------------------------------------
 
+// fallow-ignore-next-line complexity
 async function transcribeAudio(
   inputPath: string,
   dir: string,
-  opts: { model?: string; language?: string; json?: boolean },
+  opts: { engine?: string; model?: string; language?: string; json?: boolean; optional?: boolean },
 ): Promise<void> {
   const { transcribe } = await import("../whisper/transcribe.js");
   const { loadTranscript, patchCaptionHtml, stripBeforeOnset } =
     await import("../whisper/normalize.js");
 
+  // Engine: auto (Parakeet if installed, else whisper), or forced parakeet/whisper.
+  const engine = (opts.engine ?? "auto").toLowerCase();
+  if (engine !== "auto" && engine !== "parakeet" && engine !== "whisper") {
+    failWith(`Unknown --engine: ${opts.engine}. Use auto, parakeet, or whisper.`, !!opts.json);
+  }
+  const useParakeet = engine === "parakeet" || (engine === "auto" && !!findParakeet());
+
   const model = opts.model ?? DEFAULT_MODEL;
+  // --model selects the whisper model only; Parakeet uses its own fixed model.
+  if (useParakeet && opts.model && !opts.json) {
+    console.error(
+      c.dim(`  Note: --model applies to the whisper engine only; ignored under Parakeet.`),
+    );
+  }
+  const label = useParakeet ? "Parakeet" : model;
   const spin = opts.json ? null : clack.spinner();
-  spin?.start(`Transcribing with ${c.accent(model)}...`);
+  spin?.start(`Transcribing with ${c.accent(label)}...`);
 
   try {
-    const result = await transcribe(inputPath, dir, {
-      model,
-      language: opts.language,
-      onProgress: spin ? (msg) => spin.message(msg) : undefined,
-    });
+    const result = useParakeet
+      ? transcribeWithParakeet(inputPath, dir, {
+          language: opts.language,
+          onProgress: spin ? (msg) => spin.message(msg) : undefined,
+        })
+      : await transcribe(inputPath, dir, {
+          model,
+          language: opts.language,
+          onProgress: spin ? (msg) => spin.message(msg) : undefined,
+        });
 
     let { words } = loadTranscript(result.transcriptPath);
 
@@ -150,7 +282,8 @@ async function transcribeAudio(
       console.log(
         JSON.stringify({
           ok: true,
-          model,
+          engine: useParakeet ? "parakeet" : "whisper",
+          model: useParakeet ? "parakeet-tdt-0.6b-v3" : model,
           wordCount: words.length,
           durationSeconds: result.durationSeconds,
           speechOnsetSeconds: result.speechOnsetSeconds,
@@ -169,7 +302,35 @@ async function transcribeAudio(
       );
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    // Surface the last few lines of the ASR subprocess's stderr, which
+    // execFileSync captures but otherwise drops on the floor — that's where
+    // parakeet-mlx / whisper report the actual failure cause.
+    const stderr =
+      err && typeof err === "object" && "stderr" in err && err.stderr
+        ? String(err.stderr).trim().split("\n").slice(-3).join("\n")
+        : "";
+    const base = err instanceof Error ? err.message : String(err);
+    const message = stderr ? `${base}\n${stderr}` : base;
+
+    // whisper-cpp is an optional prerequisite, not part of the CLI. When it is
+    // simply unavailable (no binary, no toolchain to build one), that is a setup
+    // condition, not a command crash — report it on its own metric so it does
+    // not inflate the cli_error budget, and let `--optional` callers continue.
+    if (isWhisperUnavailable(err)) {
+      trackTranscribeUnavailable({ optional: opts.optional === true });
+      if (opts.json) {
+        console.log(JSON.stringify({ ok: false, skipped: true, reason: "whisper_unavailable" }));
+      } else {
+        spin?.stop(c.warn(`Captions skipped — ${message}`));
+      }
+      // Optional callers (pipelines) treat a missing prerequisite as a clean
+      // skip; explicit runs still surface non-zero. Set the status and return
+      // rather than guarding a process.exit() on the flag.
+      process.exitCode = opts.optional ? 0 : 1;
+      return;
+    }
+
+    trackCommandFailure("transcribe", err);
     if (opts.json) {
       console.log(JSON.stringify({ ok: false, error: message }));
     } else {

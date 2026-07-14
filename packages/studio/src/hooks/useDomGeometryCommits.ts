@@ -1,5 +1,4 @@
 import { useCallback } from "react";
-import { STUDIO_GSAP_DRAG_INTERCEPT_ENABLED } from "../components/editor/manualEditingAvailability";
 import { getDomEditTargetKey, type DomEditSelection } from "../components/editor/domEditing";
 import {
   applyStudioPathOffset,
@@ -17,46 +16,11 @@ import {
   buildClearBoxSizePatches,
   buildClearRotationPatches,
 } from "../components/editor/manualEditsDomPatches";
-import type { DomEditGroupPathOffsetCommit } from "../components/editor/DomEditOverlay";
 import type { PatchOperation } from "../utils/sourcePatcher";
+import { isElementGsapTargeted } from "./gsapTargetCache";
 
-export const GSAP_CSS_FALLBACK_BLOCKED_MESSAGE =
+const GSAP_CSS_FALLBACK_BLOCKED_MESSAGE =
   "This element is GSAP-animated — dragging via CSS would corrupt keyframes";
-
-// ── Helpers ──
-
-type TimelineLike = { getChildren?: (nested: boolean) => Array<{ targets?: () => Element[] }> };
-
-// fallow-ignore-next-line complexity
-function isElementGsapTargeted(iframe: HTMLIFrameElement | null, element: HTMLElement): boolean {
-  // When the GSAP drag intercept is disabled for debugging, treat every
-  // element as un-targeted so commits take the plain CSS persist path.
-  if (!STUDIO_GSAP_DRAG_INTERCEPT_ENABLED) return false;
-  if (!iframe?.contentWindow) return false;
-  let timelines: Record<string, TimelineLike> | undefined;
-  try {
-    timelines = (iframe.contentWindow as Window & { __timelines?: Record<string, TimelineLike> })
-      .__timelines;
-  } catch {
-    return false;
-  }
-  if (!timelines) return false;
-  const id = element.id;
-  for (const tl of Object.values(timelines)) {
-    if (!tl?.getChildren) continue;
-    try {
-      for (const child of tl.getChildren(true)) {
-        if (!child.targets) continue;
-        for (const t of child.targets()) {
-          if (t === element || (id && t.id === id)) return true;
-        }
-      }
-    } catch {
-      continue;
-    }
-  }
-  return false;
-}
 
 // ── Hook ──
 
@@ -77,7 +41,12 @@ export function useDomGeometryCommits({
 }: UseDomGeometryCommitsParams) {
   const handleDomPathOffsetCommit = useCallback(
     (selection: DomEditSelection, next: { x: number; y: number }) => {
-      if (isElementGsapTargeted(previewIframeRef.current, selection.element)) {
+      // ponytail: GSAP-targeted elements are blocked (no SDK position-in-script op); CSS-path
+      // elements fall through to commitPositionPatchToHtml → persistDomEditOperations →
+      // onTrySdkPersist and are already SDK-cut-over as setStyle/setAttribute (§3.3 done).
+      // Upgrade path for GSAP: add a moveElementGsap SDK op in a separate SDK PR.
+      const gsapTargeted = isElementGsapTargeted(previewIframeRef.current, selection.element);
+      if (gsapTargeted) {
         const error = new Error(GSAP_CSS_FALLBACK_BLOCKED_MESSAGE);
         showToast(error.message, "error");
         return Promise.reject(error);
@@ -91,42 +60,30 @@ export function useDomGeometryCommits({
     [commitPositionPatchToHtml, previewIframeRef, showToast],
   );
 
-  const handleDomGroupPathOffsetCommit = useCallback(
-    (updates: DomEditGroupPathOffsetCommit[]) => {
-      if (updates.length === 0) return Promise.resolve();
-      const blockedUpdate = updates.find(({ selection }) =>
-        isElementGsapTargeted(previewIframeRef.current, selection.element),
-      );
-      if (blockedUpdate) {
-        const error = new Error(GSAP_CSS_FALLBACK_BLOCKED_MESSAGE);
-        showToast(error.message, "error");
-        return Promise.reject(error);
-      }
-      const coalesceKey = updates
-        .map((u) => getDomEditTargetKey(u.selection))
-        .sort()
-        .join(":");
-      const saves = updates.map(({ selection, next }) => {
-        applyStudioPathOffset(selection.element, next);
-        return commitPositionPatchToHtml(selection, buildPathOffsetPatches(selection.element), {
-          label: `Move ${updates.length} layers`,
-          coalesceKey: `group-path-offset:${coalesceKey}`,
-        });
-      });
-      return Promise.all(saves).then(() => undefined);
-    },
-    [commitPositionPatchToHtml, previewIframeRef, showToast],
-  );
-
   const handleDomBoxSizeCommit = useCallback(
-    (selection: DomEditSelection, next: { width: number; height: number }) => {
+    (
+      selection: DomEditSelection,
+      next: { width: number; height: number },
+      offset?: { x: number; y: number },
+    ) => {
       if (isElementGsapTargeted(previewIframeRef.current, selection.element)) {
         const error = new Error(GSAP_CSS_FALLBACK_BLOCKED_MESSAGE);
         showToast(error.message, "error");
         return Promise.reject(error);
       }
       applyStudioBoxSize(selection.element, next);
-      return commitPositionPatchToHtml(selection, buildBoxSizePatches(selection.element), {
+      // Anchored-corner resize (NW/NE/SW) also moves the element to keep the
+      // opposite corner fixed. Apply the offset and emit BOTH patch sets in a
+      // SINGLE commit: one persist = one undo entry, and there is no
+      // intermediate re-stamp where the new size is in source but the anchor
+      // offset is not (that frame was the release "jump"). Both builders read
+      // the already-mutated live element, so concatenation is safe.
+      const patches = buildBoxSizePatches(selection.element);
+      if (offset) {
+        applyStudioPathOffset(selection.element, offset);
+        patches.push(...buildPathOffsetPatches(selection.element));
+      }
+      return commitPositionPatchToHtml(selection, patches, {
         label: "Resize layer box",
         coalesceKey: `box-size:${getDomEditTargetKey(selection)}`,
       });
@@ -173,7 +130,6 @@ export function useDomGeometryCommits({
 
   return {
     handleDomPathOffsetCommit,
-    handleDomGroupPathOffsetCommit,
     handleDomBoxSizeCommit,
     handleDomRotationCommit,
     handleDomManualEditsReset,

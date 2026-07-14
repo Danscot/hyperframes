@@ -1,3 +1,8 @@
+// The scaffolding command predates the complexity gate: run(), probeVideo,
+// handleVideoFile, and applyResolutionPreset carry its interactive branching.
+// This branch only repointed the scaffolded npm scripts; the refactor is its
+// own task.
+// fallow-ignore-file complexity
 import { defineCommand, runCommand } from "citty";
 import type { Example } from "./_examples.js";
 
@@ -9,8 +14,14 @@ export const examples: Example[] = [
   ["Start from an existing video file", "hyperframes init my-video --video clip.mp4"],
   ["Start from an audio file", "hyperframes init my-video --audio track.mp3"],
   ["Scaffold with Tailwind CSS", "hyperframes init my-video --example blank --tailwind"],
-  ["Non-interactive mode (for CI or AI agents)", "hyperframes init my-video --non-interactive"],
-  ["Skip AI coding skills installation", "hyperframes init my-video --skip-skills"],
+  [
+    "Non-interactive mode (for CI or AI agents)",
+    "hyperframes init my-video --example blank --non-interactive",
+  ],
+  [
+    "Opt out of the GitHub skills check (CI/tests only)",
+    "HYPERFRAMES_SKIP_SKILLS=1 hyperframes init my-video --example blank --non-interactive",
+  ],
 ];
 import {
   existsSync,
@@ -182,10 +193,16 @@ function resolveAssetDir(devSegments: string[], builtSegments: string[]): string
 
 // Resolves bundled templates shipped inside the CLI package
 // (packages/cli/src/templates/<id> in dev, dist/templates/<id> when packed).
-// Not to be confused with the repo-root registry/examples/ directory, which
-// is fetched remotely via fetchRemoteTemplate.
+// Dev-mode also checks registry/examples/<id> so that smoke CI tests pick up
+// PR-branch template changes before the PR is merged to main.
 function getStaticTemplateDir(templateId: string): string {
-  return resolveAssetDir(["..", "templates", templateId], ["templates", templateId]);
+  const base = dirname(fileURLToPath(import.meta.url));
+  const devPath = resolve(base, "..", "templates", templateId);
+  if (existsSync(devPath)) return devPath;
+  // fallback: repo-root registry/examples/<id> (4 levels up from src/commands/)
+  const registryPath = resolve(base, "..", "..", "..", "..", "registry", "examples", templateId);
+  if (existsSync(registryPath)) return registryPath;
+  return resolve(base, "templates", templateId);
 }
 
 function getSharedTemplateDir(): string {
@@ -215,9 +232,7 @@ function hyperframesScript(command: string): string {
 function buildPackageScripts(): Record<string, string> {
   return {
     dev: hyperframesScript("preview"),
-    check:
-      `${hyperframesScript("lint")} && ${hyperframesScript("validate")} && ` +
-      `${hyperframesScript("inspect")}`,
+    check: hyperframesScript("check"),
     render: hyperframesScript("render"),
     publish: hyperframesScript("publish"),
   };
@@ -567,6 +582,50 @@ async function scaffoldProject(
   }
 }
 
+/**
+ * Keep the AI coding skills present and current — TARGETED, not the full
+ * set. Guarantees the core set (the `/hyperframes` entry router + shared
+ * domain skills) and refreshes any skill already installed; the end-user
+ * workflow skills are NOT pulled here — they install on demand when their
+ * workflow is triggered (`hyperframes skills update <name>`, which the router
+ * runs before entering a workflow). Re-running `init` on an up-to-date machine
+ * is a no-op, and `init` never expands a deliberate partial install.
+ * Best-effort: offline, it degrades to a presence check and never breaks init.
+ * The install itself lands once GLOBALLY (~/.claude/skills + ~/.agents/skills)
+ * and mirrors into every other installed agent, so it is project-independent —
+ * the check is global-first to match.
+ */
+async function keepSkillsCurrent(destDir: string): Promise<void> {
+  const { updateSkills } = await import("./skills.js");
+
+  console.log();
+  console.log(c.bold("Checking AI coding skills against GitHub..."));
+  // Wrap defensively (non-strict already swallows most failures): a
+  // skills-install failure can never break `init` itself — it warns and
+  // proceeds, since --skip-skills no longer escapes this path.
+  try {
+    const result = await updateSkills({ refreshInstalled: true, cwd: destDir });
+    if (result.presenceOnly) {
+      // Freshness never got checked (GitHub unreachable) — don't claim
+      // "up to date"; the engine already reported what it could verify or
+      // blind-install. Point at the recovery command instead.
+      console.log(
+        c.dim("Skills freshness unverified — run `npx hyperframes skills update` when online."),
+      );
+    } else if (result.installed.length === 0) {
+      console.log(c.success("AI coding skills are already up to date."));
+    } else {
+      console.log(
+        c.dim("Workflow skills not installed here are added on demand, when first used."),
+      );
+    }
+  } catch (err) {
+    console.log(
+      c.dim(`AI coding skills install skipped: ${err instanceof Error ? err.message : err}`),
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Exported command
 // ---------------------------------------------------------------------------
@@ -630,7 +689,8 @@ export default defineCommand({
     },
     "skip-skills": {
       type: "boolean",
-      description: "Skip AI coding skills installation",
+      description:
+        "[temporarily ignored] init always checks AI skills against GitHub while the skills.sh registry catches up; set HYPERFRAMES_SKIP_SKILLS=1 to opt out (CI/tests)",
     },
     tailwind: {
       type: "boolean",
@@ -662,15 +722,38 @@ export default defineCommand({
       process.exit(1);
     }
     const exampleFlag = args.example;
+    if (exampleFlag?.startsWith("-")) {
+      console.error(c.error(`--example requires a value; received flag "${exampleFlag}" instead.`));
+      process.exit(1);
+    }
     const videoFlag = args.video;
     const audioFlag = args.audio;
     const skipTranscribe = args["skip-transcribe"] === true;
-    const skipSkills = args["skip-skills"] === true;
+    // Temporary measure while the skills.sh registry sync lags GitHub main: the
+    // `--skip-skills` FLAG is neutered so an agent (or user) that passes it can
+    // NOT dodge the GitHub skills freshness check. The "don't pass --skip-skills"
+    // guidance lives in SKILL.md, which ships through the same laggy skills.sh
+    // channel and can't be relied on to reach the agent — so the guarantee has to
+    // live in the CLI, the one channel that updates promptly (`npx
+    // hyperframes@latest`). CI and unit tests still opt out via the
+    // HYPERFRAMES_SKIP_SKILLS=1 env var, which the agent/user CLI path never sets.
+    // Revert to `args["skip-skills"] === true` once skills.sh catches up.
+    const skipSkills = process.env.HYPERFRAMES_SKIP_SKILLS === "1";
+    const skipSkillsFlagIgnored = args["skip-skills"] === true && !skipSkills;
     const tailwind = args.tailwind === true;
     const nonInteractive = args["non-interactive"] === true;
     const modelFlag = args.model;
     const languageFlag = args.language;
     const interactive = !nonInteractive && process.stdout.isTTY === true;
+
+    if (skipSkillsFlagIgnored) {
+      console.log(
+        c.dim(
+          "Note: --skip-skills is temporarily ignored — init always checks AI skills " +
+            "against GitHub while the skills.sh registry catches up.",
+        ),
+      );
+    }
 
     let resolutionPreset: CanvasResolution | undefined;
     if (args.resolution !== undefined) {
@@ -691,6 +774,16 @@ export default defineCommand({
     // Non-interactive mode — all inputs from flags, defaults where missing
     // -----------------------------------------------------------------------
     if (!interactive) {
+      if (!exampleFlag && !videoFlag && !audioFlag) {
+        console.error(
+          c.error(
+            "Non-interactive init requires --example, --video, or --audio. " +
+              "For an empty starter project, pass --example blank explicitly.",
+          ),
+        );
+        process.exit(1);
+      }
+
       const templateId = exampleFlag ?? "blank";
       const name = args.name ?? "my-video";
       const destDir = resolve(name);
@@ -700,24 +793,33 @@ export default defineCommand({
         process.exit(1);
       }
 
+      if (videoFlag && audioFlag) {
+        console.error(c.error("Cannot use --video and --audio together"));
+        process.exit(1);
+      }
+
+      // Validate source files before creating destDir so a failed run does
+      // not leave an empty orphan directory behind. The interactive path
+      // already validates in this order.
+      const videoPath = videoFlag ? resolve(videoFlag) : undefined;
+      if (videoPath && !existsSync(videoPath)) {
+        console.error(c.error(`Video file not found: ${videoFlag}`));
+        process.exit(1);
+      }
+      const audioPath = audioFlag ? resolve(audioFlag) : undefined;
+      if (audioPath && !existsSync(audioPath)) {
+        console.error(c.error(`Audio file not found: ${audioFlag}`));
+        process.exit(1);
+      }
+
       mkdirSync(destDir, { recursive: true });
 
       let localVideoName: string | undefined;
       let videoDuration: number | undefined;
       let sourceFilePath: string | undefined;
 
-      if (videoFlag && audioFlag) {
-        console.error(c.error("Cannot use --video and --audio together"));
-        process.exit(1);
-      }
-
       // Handle video
-      if (videoFlag) {
-        const videoPath = resolve(videoFlag);
-        if (!existsSync(videoPath)) {
-          console.error(c.error(`Video file not found: ${videoFlag}`));
-          process.exit(1);
-        }
+      if (videoPath) {
         sourceFilePath = videoPath;
         const result = await handleVideoFile(videoPath, destDir, false);
         localVideoName = result.localVideoName;
@@ -728,12 +830,7 @@ export default defineCommand({
       }
 
       // Handle audio
-      if (audioFlag) {
-        const audioPath = resolve(audioFlag);
-        if (!existsSync(audioPath)) {
-          console.error(c.error(`Audio file not found: ${audioFlag}`));
-          process.exit(1);
-        }
+      if (audioPath) {
         sourceFilePath = audioPath;
         copyFileSync(audioPath, resolve(destDir, basename(audioPath)));
         console.log(`Audio: ${basename(audioPath)}`);
@@ -790,11 +887,22 @@ export default defineCommand({
       for (const f of readdirSync(destDir).filter((f) => !f.startsWith("."))) {
         console.log(`  ${c.accent(f)}`);
       }
+
+      if (!skipSkills) {
+        await keepSkillsCurrent(destDir);
+      }
+
       console.log();
       console.log("Get started:");
       console.log();
-      console.log(`  ${c.accent("1.")} Install AI coding skills (one-time):`);
-      console.log(`     ${c.accent("npx skills add heygen-com/hyperframes")}`);
+      if (skipSkills) {
+        console.log(`  ${c.accent("1.")} Install AI coding skills (one-time):`);
+        console.log(`     ${c.accent("npx hyperframes skills update")}`);
+      } else {
+        console.log(
+          `  ${c.accent("1.")} Restart your AI agent (new session) so it loads the skills.`,
+        );
+      }
       console.log();
       console.log(`  ${c.accent("2.")} Open this project with your AI coding agent:`);
       console.log(
@@ -997,20 +1105,12 @@ export default defineCommand({
     const files = readdirSync(destDir);
     clack.note(files.map((f) => c.accent(f)).join("\n"), c.success(`Created ${name}/`));
 
-    // Offer to install AI coding skills
+    // Check skills against GitHub and refresh only what's stale — the core set
+    // plus anything already installed; workflow skills install on demand. The
+    // --skip-skills flag is temporarily neutered (see above); CI/tests opt out
+    // via HYPERFRAMES_SKIP_SKILLS=1.
     if (!skipSkills) {
-      const installSkills = await clack.confirm({
-        message: "Install AI coding skills? (for Claude Code, Cursor, Codex, etc.)",
-        initialValue: true,
-      });
-      if (clack.isCancel(installSkills)) {
-        clack.cancel("Setup cancelled.");
-        process.exit(0);
-      }
-      if (installSkills) {
-        const skillsCmd = await import("./skills.js").then((m) => m.default);
-        await runCommand(skillsCmd, { rawArgs: [] });
-      }
+      await keepSkillsCurrent(destDir);
     }
 
     // Auto-launch studio preview

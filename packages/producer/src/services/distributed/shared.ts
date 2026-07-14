@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { type Fps } from "@hyperframes/core";
-import { type VideoElement, type VideoMetadata } from "@hyperframes/engine";
+import { type VideoElement, type VideoFrameFormat, type VideoMetadata } from "@hyperframes/engine";
 import { type RenderConfig, type RenderJob, createRenderJob } from "../renderOrchestrator.js";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
 
@@ -97,8 +97,10 @@ export interface SyntheticRenderJobInput {
   quality: RenderConfig["quality"];
   crf?: number;
   bitrate?: string;
+  videoFrameFormat?: VideoFrameFormat;
   outputResolution?: RenderConfig["outputResolution"];
   hdrMode: RenderConfig["hdrMode"];
+  strictness?: RenderConfig["strictness"];
   entryFile: string;
   logger?: ProducerLogger;
   producerConfig?: RenderConfig["producerConfig"];
@@ -116,6 +118,7 @@ export function buildSyntheticRenderJob(input: SyntheticRenderJobInput): RenderJ
     format: input.format,
     crf: input.crf,
     videoBitrate: input.bitrate,
+    videoFrameFormat: input.videoFrameFormat,
     outputResolution: input.outputResolution,
     // Distributed mode hard-pins to software GPU. The plan-time validator
     // refuses to fan out otherwise.
@@ -124,6 +127,7 @@ export function buildSyntheticRenderJob(input: SyntheticRenderJobInput): RenderJ
     entryFile: input.entryFile,
     logger: input.logger ?? defaultLogger,
     hdrMode: input.hdrMode,
+    strictness: input.strictness,
     producerConfig: input.producerConfig,
   };
   return createRenderJob(renderConfig);

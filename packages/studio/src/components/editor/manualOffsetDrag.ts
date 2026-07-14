@@ -4,11 +4,73 @@ import {
   applyStudioPathOffsetDraft,
   beginStudioManualEditGesture,
   captureStudioPathOffset,
+  clearStudioPathOffset,
   endStudioManualEditGesture,
-  readStudioPathOffset,
+  readAppliedStudioPathOffset,
   restoreStudioPathOffset,
   type StudioPathOffsetSnapshot,
 } from "./manualEdits";
+import { computeDraggedGsapPosition } from "../../hooks/draggedGsapPosition";
+
+interface OffsetDragGsap {
+  set: (el: Element, vars: Record<string, number | string>) => void;
+  getProperty: (el: Element, prop: string) => number;
+}
+
+function getOffsetDragGsap(element: HTMLElement): OffsetDragGsap | null {
+  const win = element.ownerDocument.defaultView as
+    | (Window & { gsap?: Partial<OffsetDragGsap> })
+    | null;
+  const gsap = win?.gsap;
+  return gsap?.set && gsap.getProperty ? (gsap as OffsetDragGsap) : null;
+}
+
+/**
+ * Live drag preview through the GSAP channel — the SAME channel the commit
+ * lands in (a `tl.set`/keyframe on the timeline), so what the user sees while
+ * dragging equals what gets written (plan R3/R4). Reuses the commit's
+ * base+delta+rotation math so preview and commit agree by construction. Returns
+ * true when handled via gsap; false when gsap is unavailable (caller falls back
+ * to the CSS draft).
+ */
+function applyOffsetDragDraftViaGsap(
+  element: HTMLElement,
+  offset: { x: number; y: number },
+  baseGsap: { x: number; y: number },
+): boolean {
+  const gsap = getOffsetDragGsap(element);
+  if (!gsap) return false;
+  // GSAP owns the transform; neutralize the CSS translate longhand so the two
+  // channels can't compose into a doubled position.
+  element.style.setProperty("translate", "none");
+  // Use the STABLE gesture-start base (captured in JS), NOT `gsap.getProperty`.
+  // After `translate: none`, getProperty reads the transform we set last frame,
+  // so `base + delta` would integrate frame-over-frame and fling the element.
+  const { newX, newY } = computeDraggedGsapPosition(element, offset, baseGsap);
+  gsap.set(element, { x: newX, y: newY });
+  return true;
+}
+
+/**
+ * Live rotation preview through the GSAP channel — the SAME channel the commit
+ * lands in (a `tl.set`/keyframe rotation), mirroring `applyOffsetDragDraftViaGsap`.
+ * GSAP owns the transform rotation, so neutralize the CSS `rotate` longhand to keep
+ * the two channels from composing. `angle` is the absolute target rotation. Returns
+ * false when gsap is unavailable (caller falls back to the CSS draft).
+ */
+export function applyRotationDraftViaGsap(element: HTMLElement, angle: number): boolean {
+  const gsap = getOffsetDragGsap(element);
+  if (!gsap) return false;
+  element.style.setProperty("rotate", "none");
+  gsap.set(element, { rotation: angle });
+  return true;
+}
+
+/** Current GSAP transform rotation — the single-source rotation base. 0 if gsap is unavailable. */
+export function readGsapRotation(element: HTMLElement): number {
+  const gsap = getOffsetDragGsap(element);
+  return gsap ? Number(gsap.getProperty(element, "rotation")) || 0 : 0;
+}
 
 const DEFAULT_OFFSET_PROBE_PX = 100;
 const MIN_PROBE_VECTOR_LENGTH_PX = 0.01;
@@ -35,6 +97,14 @@ export interface ManualOffsetDragMember {
   selection: DomEditSelection;
   element: HTMLElement;
   initialOffset: { x: number; y: number };
+  /**
+   * The element's GSAP x/y at gesture start, captured in JS so a mid-drag
+   * re-render (which reverts inline style + wipes the `data-hf-drag-gsap-base-*`
+   * attrs) can't drop the base. Without this the draft falls back to the LIVE
+   * transform — i.e. the value it set last frame — and `base + delta` integrates,
+   * making the element accelerate away ("flies"). See applyOffsetDragDraftViaGsap.
+   */
+  baseGsap: { x: number; y: number };
   initialPathOffset: StudioPathOffsetSnapshot;
   gestureToken: string;
   screenToOffset: ManualOffsetDragMatrix;
@@ -139,6 +209,22 @@ export function applyManualOffsetDragMatrix(matrix: ManualOffsetDragMatrix, poin
   };
 }
 
+/**
+ * The perspective w-divisor (matrix3d m44) of the element's current transform.
+ * For a plain `translateZ(z)` under `perspective(p)`, m44 = (p - z) / p, so the
+ * element renders 1/m44× larger and a translate of `d` composition px moves
+ * `d / m44` px on screen. Returns 1 for 2D transforms (no foreshortening). Used
+ * to keep the drag offset → screen-movement mapping correct for depth elements,
+ * which the flat-scale fast path below would otherwise get wrong by 1/m44.
+ */
+function readTransformWDivisor(element: HTMLElement): number {
+  const t = element.ownerDocument.defaultView?.getComputedStyle(element).transform;
+  if (!t || !t.startsWith("matrix3d(")) return 1;
+  const parts = t.slice("matrix3d(".length, -1).split(",");
+  const w = Number.parseFloat(parts[15] ?? "");
+  return Number.isFinite(w) && w > 0 ? w : 1;
+}
+
 export function measureManualOffsetDragScreenToOffsetMatrix(
   element: HTMLElement,
   initialOffset: { x: number; y: number },
@@ -151,7 +237,11 @@ export function measureManualOffsetDragScreenToOffsetMatrix(
   ) {
     const sx = options.scaleX || 1;
     const sy = options.scaleY || 1;
-    return { ok: true, matrix: { a: 1 / sx, b: 0, c: 0, d: 1 / sy } };
+    // Fold in the perspective foreshortening: a depth element (z≠0) moves
+    // 1/m44× faster on screen than its flat scale implies, so the screen→offset
+    // matrix must scale by m44 or the element outruns the pointer/overlay.
+    const w = readTransformWDivisor(element);
+    return { ok: true, matrix: { a: w / sx, b: 0, c: 0, d: w / sy } };
   }
 
   const probeSize = options.probeSize ?? DEFAULT_OFFSET_PROBE_PX;
@@ -241,7 +331,10 @@ export function createManualOffsetDragMember(input: {
   element: HTMLElement;
   rect: ManualOffsetDragRect;
 }): ManualOffsetDragMemberResult {
-  const initialOffset = readStudioPathOffset(input.element);
+  // Base the drag on the offset ACTUALLY applied, never the raw (possibly dormant)
+  // var — see readAppliedStudioPathOffset. This keeps the commit purely relative
+  // (applied + delta) so a stale offset can't fling the element off-screen.
+  const initialOffset = readAppliedStudioPathOffset(input.element);
   input.element.setAttribute("data-hf-drag-initial-offset-x", String(initialOffset.x));
   input.element.setAttribute("data-hf-drag-initial-offset-y", String(initialOffset.y));
 
@@ -279,6 +372,7 @@ export function createManualOffsetDragMember(input: {
     scaleX: input.rect.editScaleX,
     scaleY: input.rect.editScaleY,
   });
+  const baseGsap = { x: gsapX, y: gsapY };
   if (!measured.ok) {
     // Fallback: when GSAP transforms interfere with probe measurement, use
     // the preview scale as an approximation. The commit path reads the actual
@@ -286,6 +380,7 @@ export function createManualOffsetDragMember(input: {
     // drag is acceptable — the final committed position is always exact.
     const scaleX = input.rect.editScaleX || 1;
     const scaleY = input.rect.editScaleY || 1;
+    const w = readTransformWDivisor(input.element);
     return {
       ok: true,
       member: {
@@ -293,9 +388,10 @@ export function createManualOffsetDragMember(input: {
         selection: input.selection,
         element: input.element,
         initialOffset,
+        baseGsap,
         initialPathOffset,
         gestureToken,
-        screenToOffset: { a: 1 / scaleX, b: 0, c: 0, d: 1 / scaleY },
+        screenToOffset: { a: w / scaleX, b: 0, c: 0, d: w / scaleY },
         originRect: input.rect,
       },
     };
@@ -308,6 +404,7 @@ export function createManualOffsetDragMember(input: {
       selection: input.selection,
       element: input.element,
       initialOffset,
+      baseGsap,
       initialPathOffset,
       gestureToken,
       screenToOffset: measured.matrix,
@@ -335,7 +432,42 @@ export function applyManualOffsetDragDraft(
   dy: number,
 ): { x: number; y: number } {
   const offset = resolveManualOffsetDragMemberOffset(member, dx, dy);
-  applyStudioPathOffsetDraft(member.element, offset);
+  // Position is single-sourced on the GSAP timeline; preview through gsap.set so
+  // the live draft matches the committed `tl.set`/keyframe. CSS draft only when
+  // gsap is unavailable (no preview iframe runtime).
+  if (!applyOffsetDragDraftViaGsap(member.element, offset, member.baseGsap)) {
+    applyStudioPathOffsetDraft(member.element, offset);
+  }
+  return offset;
+}
+
+/**
+ * Re-stamp the STABLE gesture-start base/offset before the source commit reads
+ * them. A mid-gesture re-render can wipe these attrs; the commit converts the
+ * drop offset → gsap x/y via computeDraggedGsapPosition, which without the base
+ * falls back to the live (already-dragged) transform and re-adds the delta — so
+ * the element flies off-screen the instant you drop it. The member holds the
+ * true gesture-start values in JS, immune to the re-render.
+ */
+function restampManualOffsetDragGestureBase(member: ManualOffsetDragMember): void {
+  member.element.setAttribute("data-hf-drag-gsap-base-x", String(member.baseGsap.x));
+  member.element.setAttribute("data-hf-drag-gsap-base-y", String(member.baseGsap.y));
+  member.element.setAttribute("data-hf-drag-initial-offset-x", String(member.initialOffset.x));
+  member.element.setAttribute("data-hf-drag-initial-offset-y", String(member.initialOffset.y));
+}
+
+function applyManualOffsetCommitValue(
+  member: ManualOffsetDragMember,
+  offset: { x: number; y: number },
+): { x: number; y: number } {
+  restampManualOffsetDragGestureBase(member);
+  // Optimistic visual through the GSAP channel (same as the live draft and the
+  // committed `tl.set`), so the element holds its dropped position until the
+  // source mutation soft-reloads — no transient CSS `--hf-studio-offset` write.
+  // CSS apply only when gsap is unavailable.
+  if (!applyOffsetDragDraftViaGsap(member.element, offset, member.baseGsap)) {
+    applyStudioPathOffset(member.element, offset);
+  }
   return offset;
 }
 
@@ -344,9 +476,38 @@ export function applyManualOffsetDragCommit(
   dx: number,
   dy: number,
 ): { x: number; y: number } {
-  const offset = resolveManualOffsetDragMemberOffset(member, dx, dy);
-  applyStudioPathOffset(member.element, offset);
+  return applyManualOffsetCommitValue(member, resolveManualOffsetDragMemberOffset(member, dx, dy));
+}
+
+/**
+ * Arrow-key nudge, in OFFSET units (composition px), not screen px — "nudge
+ * 1px" means one composition pixel regardless of canvas zoom, so the delta
+ * adds to the gesture-start offset directly instead of going through the
+ * screen→offset matrix. Draft/commit land in the same GSAP channel (with the
+ * same CSS fallback) as the drag equivalents above.
+ */
+export function applyManualOffsetNudgeDraft(
+  member: ManualOffsetDragMember,
+  delta: { x: number; y: number },
+): { x: number; y: number } {
+  const offset = {
+    x: member.initialOffset.x + delta.x,
+    y: member.initialOffset.y + delta.y,
+  };
+  if (!applyOffsetDragDraftViaGsap(member.element, offset, member.baseGsap)) {
+    applyStudioPathOffsetDraft(member.element, offset);
+  }
   return offset;
+}
+
+export function applyManualOffsetNudgeCommit(
+  member: ManualOffsetDragMember,
+  delta: { x: number; y: number },
+): { x: number; y: number } {
+  return applyManualOffsetCommitValue(member, {
+    x: member.initialOffset.x + delta.x,
+    y: member.initialOffset.y + delta.y,
+  });
 }
 
 function restoreManualOffsetDragMember(member: ManualOffsetDragMember): void {
@@ -368,6 +529,23 @@ export function endManualOffsetDragMembers(members: ManualOffsetDragMember[]): v
     member.element.removeAttribute("data-hf-drag-initial-offset-y");
     member.element.removeAttribute("data-hf-drag-gsap-base-x");
     member.element.removeAttribute("data-hf-drag-gsap-base-y");
+    // Clear the draft's `translate: none` so the soft reload starts clean —
+    // otherwise button-less pointermoves after the reload compute deltas
+    // from a stale base and fling the element off-screen (#1673).
+    // Do NOT clearProps:"transform" — that nukes the committed GSAP position
+    // and causes a visual snap-back before the soft reload re-applies it.
+    if (member.element.style.getPropertyValue("translate") === "none") {
+      member.element.style.removeProperty("translate");
+    }
+    // Migration: when GSAP owns the position (the committed value lives in the
+    // GSAP transform), the legacy `--hf-studio-offset` CSS channel is obsolete.
+    // Clear it on the LIVE element — otherwise the leftover `translate:
+    // var(--hf-studio-offset)` composes with the GSAP transform and the element
+    // renders offset by the stale value until a full page reload (the source is
+    // already stripped). clearStudioPathOffset leaves `transform` untouched.
+    if (getOffsetDragGsap(member.element)) {
+      clearStudioPathOffset(member.element);
+    }
     resumeGsapTimelines(member.element);
   }
 }

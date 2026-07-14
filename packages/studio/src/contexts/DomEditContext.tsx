@@ -14,6 +14,7 @@ export interface DomEditActionsValue extends Pick<
   | "clearDomSelection"
   | "handleDomStyleCommit"
   | "handleDomAttributeCommit"
+  | "handleDomAttributeLiveCommit"
   | "handleDomHtmlAttributeCommit"
   | "handleDomPathOffsetCommit"
   | "handleDomGroupPathOffsetCommit"
@@ -30,6 +31,9 @@ export interface DomEditActionsValue extends Pick<
   | "handleBlockedDomMove"
   | "handleDomManualDragStart"
   | "handleDomEditElementDelete"
+  | "handleGroupSelection"
+  | "handleUngroupSelection"
+  | "setActiveGroupElement"
   | "buildDomSelectionFromTarget"
   | "buildDomSelectionForTimelineElement"
   | "updateDomEditHoverSelection"
@@ -50,15 +54,23 @@ export interface DomEditActionsValue extends Pick<
   | "handleGsapAddKeyframe"
   | "handleGsapAddKeyframeBatch"
   | "handleGsapRemoveKeyframe"
+  | "handleGsapMoveKeyframeToPlayhead"
+  | "handleGsapMoveKeyframe"
+  | "handleGsapResizeKeyframedTween"
   | "handleGsapConvertToKeyframes"
   | "handleGsapRemoveAllKeyframes"
   | "handleResetSelectedElementKeyframes"
   | "commitAnimatedProperty"
+  | "commitAnimatedProperties"
   | "handleSetArcPath"
   | "handleUpdateArcSegment"
+  | "handleUnroll"
   | "invalidateGsapCache"
   | "previewIframeRef"
   | "commitMutation"
+  | "applyMarqueeSelection"
+  | "handleUpdateKeyframeEase"
+  | "handleSetAllKeyframeEases"
 > {}
 
 export interface DomEditSelectionValue extends Pick<
@@ -66,6 +78,7 @@ export interface DomEditSelectionValue extends Pick<
   | "domEditSelection"
   | "domEditGroupSelections"
   | "domEditHoverSelection"
+  | "activeGroupElement"
   | "domEditSelectionRef"
   | "selectedGsapAnimations"
   | "gsapMultipleTimelines"
@@ -83,6 +96,15 @@ export function useDomEditActionsContext(): DomEditActionsValue {
   const ctx = useContext(DomEditActionsContext);
   if (!ctx) throw new Error("useDomEditActionsContext must be used within DomEditProvider");
   return ctx;
+}
+
+/**
+ * Optional access — returns null outside a provider. Lets the player-package
+ * <Timeline> (a public standalone export) reach the z-order persist path when
+ * embedded in the NLE without hard-requiring the provider in standalone/test mounts.
+ */
+export function useDomEditActionsContextOptional(): DomEditActionsValue | null {
+  return useContext(DomEditActionsContext);
 }
 
 export function useDomEditSelectionContext(): DomEditSelectionValue {
@@ -114,6 +136,7 @@ export function DomEditProvider({
     clearDomSelection,
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomPathOffsetCommit,
     handleDomGroupPathOffsetCommit,
@@ -131,6 +154,10 @@ export function DomEditProvider({
     handleBlockedDomMove,
     handleDomManualDragStart,
     handleDomEditElementDelete,
+    handleGroupSelection,
+    handleUngroupSelection,
+    setActiveGroupElement,
+    activeGroupElement,
     buildDomSelectionFromTarget,
     buildDomSelectionForTimelineElement,
     updateDomEditHoverSelection,
@@ -154,15 +181,23 @@ export function DomEditProvider({
     handleGsapAddKeyframe,
     handleGsapAddKeyframeBatch,
     handleGsapRemoveKeyframe,
+    handleGsapMoveKeyframeToPlayhead,
+    handleGsapMoveKeyframe,
+    handleGsapResizeKeyframedTween,
     handleGsapConvertToKeyframes,
     handleGsapRemoveAllKeyframes,
     handleResetSelectedElementKeyframes,
     commitAnimatedProperty,
+    commitAnimatedProperties,
     handleSetArcPath,
     handleUpdateArcSegment,
+    handleUnroll,
     invalidateGsapCache,
     previewIframeRef,
     commitMutation,
+    applyMarqueeSelection,
+    handleUpdateKeyframeEase,
+    handleSetAllKeyframeEases,
   },
   children,
 }: {
@@ -187,6 +222,7 @@ export function DomEditProvider({
       clearDomSelection,
       handleDomStyleCommit,
       handleDomAttributeCommit,
+      handleDomAttributeLiveCommit,
       handleDomHtmlAttributeCommit,
       handleDomPathOffsetCommit,
       handleDomGroupPathOffsetCommit,
@@ -203,6 +239,9 @@ export function DomEditProvider({
       handleBlockedDomMove,
       handleDomManualDragStart,
       handleDomEditElementDelete,
+      handleGroupSelection,
+      handleUngroupSelection,
+      setActiveGroupElement,
       buildDomSelectionFromTarget,
       buildDomSelectionForTimelineElement,
       updateDomEditHoverSelection,
@@ -223,15 +262,23 @@ export function DomEditProvider({
       handleGsapAddKeyframe,
       handleGsapAddKeyframeBatch,
       handleGsapRemoveKeyframe,
+      handleGsapMoveKeyframeToPlayhead,
+      handleGsapMoveKeyframe,
+      handleGsapResizeKeyframedTween,
       handleGsapConvertToKeyframes,
       handleGsapRemoveAllKeyframes,
       handleResetSelectedElementKeyframes,
       commitAnimatedProperty,
+      commitAnimatedProperties,
       handleSetArcPath,
       handleUpdateArcSegment,
+      handleUnroll,
       invalidateGsapCache,
       previewIframeRef,
       commitMutation: stableCommitMutation,
+      applyMarqueeSelection,
+      handleUpdateKeyframeEase,
+      handleSetAllKeyframeEases,
     }),
     [
       handleTimelineElementSelect,
@@ -242,6 +289,7 @@ export function DomEditProvider({
       clearDomSelection,
       handleDomStyleCommit,
       handleDomAttributeCommit,
+      handleDomAttributeLiveCommit,
       handleDomHtmlAttributeCommit,
       handleDomPathOffsetCommit,
       handleDomGroupPathOffsetCommit,
@@ -258,6 +306,9 @@ export function DomEditProvider({
       handleBlockedDomMove,
       handleDomManualDragStart,
       handleDomEditElementDelete,
+      handleGroupSelection,
+      handleUngroupSelection,
+      setActiveGroupElement,
       buildDomSelectionFromTarget,
       buildDomSelectionForTimelineElement,
       updateDomEditHoverSelection,
@@ -278,15 +329,23 @@ export function DomEditProvider({
       handleGsapAddKeyframe,
       handleGsapAddKeyframeBatch,
       handleGsapRemoveKeyframe,
+      handleGsapMoveKeyframeToPlayhead,
+      handleGsapMoveKeyframe,
+      handleGsapResizeKeyframedTween,
       handleGsapConvertToKeyframes,
       handleGsapRemoveAllKeyframes,
       handleResetSelectedElementKeyframes,
       commitAnimatedProperty,
+      commitAnimatedProperties,
       handleSetArcPath,
       handleUpdateArcSegment,
+      handleUnroll,
       invalidateGsapCache,
       previewIframeRef,
       stableCommitMutation,
+      applyMarqueeSelection,
+      handleUpdateKeyframeEase,
+      handleSetAllKeyframeEases,
     ],
   );
 
@@ -295,6 +354,7 @@ export function DomEditProvider({
       domEditSelection,
       domEditGroupSelections,
       domEditHoverSelection,
+      activeGroupElement,
       domEditSelectionRef,
       selectedGsapAnimations,
       gsapMultipleTimelines,
@@ -308,6 +368,7 @@ export function DomEditProvider({
       domEditSelection,
       domEditGroupSelections,
       domEditHoverSelection,
+      activeGroupElement,
       domEditSelectionRef,
       selectedGsapAnimations,
       gsapMultipleTimelines,

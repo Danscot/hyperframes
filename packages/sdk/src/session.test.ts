@@ -17,6 +17,7 @@ const BASE_HTML = `
 class TestPreviewAdapter implements PreviewAdapter {
   private selectionHandlers: Array<(ids: string[]) => void> = [];
 
+  // fallow-ignore-next-line code-duplication
   elementAtPoint(_x: number, _y: number, _opts?: { atTime?: number }): ElementAtPointResult | null {
     return null;
   }
@@ -230,5 +231,419 @@ describe("batch rollback on throw", () => {
     }
     comp.undo();
     expect(comp.getElement("hf-title")?.inlineStyles["color"]).toBe("#fff");
+  });
+});
+
+// ─── canUndo / canRedo ────────────────────────────────────────────────────────
+
+describe("canUndo / canRedo", () => {
+  it("returns false before any mutation", async () => {
+    const comp = await openComposition(BASE_HTML);
+    expect(comp.canUndo()).toBe(false);
+    expect(comp.canRedo()).toBe(false);
+  });
+
+  it("canUndo true after a mutation, false after undoing back to start", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setStyle("hf-title", { color: "#ff0000" });
+    expect(comp.canUndo()).toBe(true);
+    expect(comp.canRedo()).toBe(false);
+
+    comp.undo();
+    expect(comp.canUndo()).toBe(false);
+    expect(comp.canRedo()).toBe(true);
+  });
+
+  it("canRedo cleared after a new mutation", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setStyle("hf-title", { color: "#ff0000" });
+    comp.undo();
+    expect(comp.canRedo()).toBe(true);
+
+    comp.setStyle("hf-title", { color: "#00ff00" });
+    expect(comp.canRedo()).toBe(false);
+  });
+
+  it("returns false in embedded (T3) mode — no history", async () => {
+    const comp = await openComposition(BASE_HTML, { overrides: {} });
+    comp.setStyle("hf-title", { color: "#ff0000" });
+    expect(comp.canUndo()).toBe(false);
+    expect(comp.canRedo()).toBe(false);
+  });
+});
+
+// ─── override-set orphan cleanup ──────────────────────────────────────────────
+
+describe("override-set orphan cleanup on removeElement", () => {
+  it("purges property keys for removed element from the override-set", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setStyle("hf-title", { color: "#ff0000", fontSize: "96px" });
+    expect(Object.keys(comp.getOverrides())).toContain("hf-title.style.color");
+
+    comp.removeElement("hf-title");
+    const overrides = comp.getOverrides();
+    // removal marker present
+    expect(overrides["hf-title"]).toBeNull();
+    // orphan property keys gone
+    expect(Object.keys(overrides)).not.toContain("hf-title.style.color");
+    expect(Object.keys(overrides)).not.toContain("hf-title.style.fontSize");
+  });
+
+  it("property keys for other elements are unaffected", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setStyle("hf-title", { color: "#ff0000" });
+    comp.setStyle("hf-sub", { opacity: "1" });
+    comp.removeElement("hf-title");
+    const overrides = comp.getOverrides();
+    expect(overrides["hf-sub.style.opacity"]).toBe("1");
+  });
+});
+
+describe("single-dispatch undo reverses the inverse patch list", () => {
+  // A single dispatch that emits order-dependent inverse patches (here a nested
+  // parent+child removeElement) must undo in reverse application order. Without
+  // the reverse, undo replays 'add child' before 'add parent' → the child has no
+  // parent to attach to and is dropped.
+  it("removeElement([child, parent]) undo restores both, child included", async () => {
+    const NESTED = `<div data-hf-id="hf-root" data-hf-root data-duration="5">
+  <div data-hf-id="hf-parent"><span data-hf-id="hf-child">x</span></div>
+</div>`;
+    const comp = await openComposition(NESTED);
+    comp.dispatch({ type: "removeElement", target: ["hf-child", "hf-parent"] });
+    expect(comp.getElement("hf-parent")).toBeNull();
+    expect(comp.getElement("hf-child")).toBeNull();
+
+    comp.undo();
+    expect(comp.getElement("hf-parent")).not.toBeNull();
+    expect(comp.getElement("hf-child")).not.toBeNull();
+  });
+
+  // Defense-in-depth: an aliased multi-target (the same element twice) makes the
+  // 2nd id capture the value the 1st already wrote; undo must replay the inverse
+  // in reverse to land on the ORIGINAL, not the intermediate.
+  it("setStyle with a duplicate target undoes to the original, not the intermediate", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.dispatch({
+      type: "setStyle",
+      target: ["hf-title", "hf-title"],
+      styles: { fontSize: "96px" },
+    });
+    expect(comp.getElement("hf-title")?.inlineStyles.fontSize).toBe("96px");
+    comp.undo();
+    expect(comp.getElement("hf-title")?.inlineStyles.fontSize).toBe("64px");
+  });
+});
+
+// ─── setSelection / getSelection / selectionchange ───────────────────────────
+
+describe("setSelection", () => {
+  it("getSelection returns empty array before any setSelection call", async () => {
+    const comp = await openComposition(BASE_HTML);
+    expect(comp.getSelection()).toEqual([]);
+  });
+
+  it("setSelection updates getSelection", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setSelection(["hf-title"]);
+    expect(comp.getSelection()).toEqual(["hf-title"]);
+  });
+
+  it("setSelection with multiple ids", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setSelection(["hf-title", "hf-sub"]);
+    expect(comp.getSelection()).toEqual(["hf-title", "hf-sub"]);
+  });
+
+  it("setSelection([]) clears selection", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setSelection(["hf-title"]);
+    comp.setSelection([]);
+    expect(comp.getSelection()).toEqual([]);
+  });
+
+  it("setSelection fires selectionchange with new ids", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const calls: string[][] = [];
+    comp.on("selectionchange", (ids) => calls.push(ids));
+    comp.setSelection(["hf-title"]);
+    expect(calls).toEqual([["hf-title"]]);
+  });
+
+  it("setSelection fires selectionchange with empty array when clearing", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setSelection(["hf-title"]);
+    const calls: string[][] = [];
+    comp.on("selectionchange", (ids) => calls.push(ids));
+    comp.setSelection([]);
+    expect(calls).toEqual([[]]);
+  });
+
+  it("selectionchange listener receives a fresh copy each call", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const snapshots: string[][] = [];
+    comp.on("selectionchange", (ids) => snapshots.push(ids));
+    comp.setSelection(["hf-title"]);
+    comp.setSelection(["hf-sub"]);
+    expect(snapshots[0]).toEqual(["hf-title"]);
+    expect(snapshots[1]).toEqual(["hf-sub"]);
+  });
+
+  it("unsubscribed listener does not fire", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const calls: string[][] = [];
+    const off = comp.on("selectionchange", (ids) => calls.push(ids));
+    off();
+    comp.setSelection(["hf-title"]);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("selection() proxy operates on ids at call time", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setSelection(["hf-title"]);
+    const proxy = comp.selection();
+    expect(proxy.ids).toEqual(["hf-title"]);
+  });
+
+  it("setSelection does not affect undo stack", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setStyle("hf-title", { color: "#ff0000" });
+    comp.setSelection(["hf-sub"]);
+    expect(comp.canUndo()).toBe(true);
+    comp.undo();
+    // selection must not have been pushed to history
+    expect(comp.canUndo()).toBe(false);
+  });
+
+  it("setSelection does not emit a patch event", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const patches: unknown[] = [];
+    comp.on("patch", (e) => patches.push(e));
+    comp.setSelection(["hf-title"]);
+    expect(patches).toHaveLength(0);
+  });
+
+  // fallow-ignore-next-line code-duplication
+  it("setSelection with same ids does not fire selectionchange again", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const calls: string[][] = [];
+    comp.on("selectionchange", (ids) => calls.push(ids));
+    comp.setSelection(["hf-title"]);
+    comp.setSelection(["hf-title"]); // same ids — must be a no-op
+    expect(calls).toHaveLength(1);
+  });
+
+  it("setSelection with same ids in different order fires selectionchange", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const calls: string[][] = [];
+    comp.on("selectionchange", (ids) => calls.push(ids));
+    comp.setSelection(["hf-title", "hf-sub"]);
+    comp.setSelection(["hf-sub", "hf-title"]); // order differs — must fire
+    expect(calls).toHaveLength(2);
+  });
+
+  it("setSelection de-duplicates repeated ids", async () => {
+    const comp = await openComposition(BASE_HTML);
+    comp.setSelection(["hf-title", "hf-title", "hf-sub", "hf-title"]);
+    expect(comp.getSelection()).toEqual(["hf-title", "hf-sub"]);
+  });
+
+  it("setSelection with duplicates matching stored selection does not fire selectionchange", async () => {
+    const comp = await openComposition(BASE_HTML);
+    const calls: string[][] = [];
+    comp.on("selectionchange", (ids) => calls.push(ids));
+    comp.setSelection(["hf-title"]);
+    comp.setSelection(["hf-title", "hf-title"]); // de-duped = ["hf-title"] — no change
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe("animationIds population", () => {
+  const GSAP_HTML = `
+<div data-hf-id="hf-stage" data-hf-root style="width: 1280px; height: 720px">
+  <div data-hf-id="hf-box" style="opacity: 0">box</div>
+  <div data-hf-id="hf-plain">plain</div>
+  <script>var tl = gsap.timeline({ paused: true });
+tl.to("[data-hf-id=\\"hf-box\\"]", { opacity: 1, duration: 0.5 }, 0.2);
+window.__timelines["t"] = tl;</script>
+</div>`.trim();
+
+  it("attaches the parser's stable tween id to the targeted element", async () => {
+    const comp = await openComposition(GSAP_HTML);
+    const box = comp.getElement("hf-box");
+    expect(box?.animationIds.length).toBe(1);
+    // Stable id-space shared with studio-api / GSAP ops: targetSelector-method-position.
+    expect(box?.animationIds[0]).toContain("hf-box");
+    expect(box?.animationIds[0]).toContain("-to-");
+  });
+
+  it("leaves untargeted elements with an empty animationIds", async () => {
+    const comp = await openComposition(GSAP_HTML);
+    expect(comp.getElement("hf-plain")?.animationIds).toEqual([]);
+  });
+
+  it("the populated id is dispatchable as a removeGsapTween target", async () => {
+    const comp = await openComposition(GSAP_HTML);
+    const id = comp.getElement("hf-box")?.animationIds[0];
+    expect(id).toBeDefined();
+    if (id) expect(comp.can({ type: "removeGsapTween", animationId: id }).ok).toBe(true);
+  });
+
+  it("attaches multiple distinct tween ids when one element has several tweens", async () => {
+    const html = `
+<div data-hf-id="hf-stage" data-hf-root style="width: 1280px; height: 720px">
+  <div data-hf-id="hf-box" style="opacity: 0">box</div>
+  <script>var tl = gsap.timeline({ paused: true });
+tl.to("[data-hf-id=\\"hf-box\\"]", { opacity: 1, duration: 0.5 }, 0);
+tl.from("[data-hf-id=\\"hf-box\\"]", { x: -100, duration: 0.5 }, 1);
+window.__timelines["t"] = tl;</script>
+</div>`.trim();
+    const ids = (await openComposition(html)).getElement("hf-box")?.animationIds ?? [];
+    expect(ids.length).toBe(2);
+    expect(new Set(ids).size).toBe(2); // distinct
+  });
+
+  it("fans a shared-selector tween out to every matched element", async () => {
+    const html = `
+<div data-hf-id="hf-stage" data-hf-root style="width: 1280px; height: 720px">
+  <div data-hf-id="hf-a" class="fade">a</div>
+  <div data-hf-id="hf-b" class="fade">b</div>
+  <script>var tl = gsap.timeline({ paused: true });
+tl.to(".fade", { opacity: 1, duration: 0.5 }, 0);
+window.__timelines["t"] = tl;</script>
+</div>`.trim();
+    const comp = await openComposition(html);
+    const a = comp.getElement("hf-a")?.animationIds ?? [];
+    const b = comp.getElement("hf-b")?.animationIds ?? [];
+    expect(a.length).toBe(1);
+    expect(b).toEqual(a); // same tween id on both matched elements
+  });
+});
+
+describe("getAllAnimationIds", () => {
+  it("includes a tween id even when its selector matches no live DOM element", async () => {
+    const html = /* html */ `<!DOCTYPE html>
+<html><body>
+  <div data-hf-id="hf-box" style="color: red">Hello</div>
+  <script>var tl = gsap.timeline({ paused: true }); tl.to("#does-not-exist", { x: 100, duration: 1 }, 3);</script>
+</body></html>`;
+    const comp = await openComposition(html);
+    const flatIds = comp.getAllAnimationIds();
+    expect(flatIds.size).toBeGreaterThan(0);
+    const [unmatchedId] = [...flatIds];
+    // Confirms the bug this fixes: no element's animationIds contains this id,
+    // because "#does-not-exist" never CSS-matches anything in the document.
+    expect(comp.getElements().some((el) => el.animationIds.includes(unmatchedId ?? ""))).toBe(
+      false,
+    );
+  });
+
+  it("returns an empty set when the composition has no GSAP script", async () => {
+    const html = /* html */ `<!DOCTYPE html>
+<html><body><div data-hf-id="hf-box">Hello</div></body></html>`;
+    const comp = await openComposition(html);
+    expect(comp.getAllAnimationIds().size).toBe(0);
+  });
+
+  it("still includes ids for tweens that DO match a live DOM element", async () => {
+    const html = /* html */ `<!DOCTYPE html>
+<html><body>
+  <div data-hf-id="hf-box" style="color: red">Hello</div>
+  <script>var tl = gsap.timeline({ paused: true }); tl.to("[data-hf-id=\\"hf-box\\"]", { x: 100, duration: 1 }, 0);</script>
+</body></html>`;
+    const comp = await openComposition(html);
+    const realId = comp.getElements().flatMap((e) => [...e.animationIds])[0] ?? "";
+    expect(realId).not.toBe("");
+    expect(comp.getAllAnimationIds().has(realId)).toBe(true);
+  });
+});
+
+// ─── getVariableValue / listVariables / declareVariable / removeVariable ──────
+
+const VARIABLES_HTML = `<!DOCTYPE html>
+<html data-composition-id="c1" data-composition-duration="5" data-composition-variables='${JSON.stringify(
+  [{ id: "brand-color", type: "color", label: "Brand color", default: "#0066cc" }],
+)}'>
+<body>${BASE_HTML}</body>
+</html>`;
+
+describe("variable declarations (Composition API)", () => {
+  it("getVariableValue reads a declared variable's current default", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+    expect(comp.getVariableValue("brand-color")).toBe("#0066cc");
+  });
+
+  it("getVariableValue returns undefined for an undeclared id", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+    expect(comp.getVariableValue("never-declared")).toBeUndefined();
+  });
+
+  it("listVariables returns every declared variable's full schema", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+    expect(comp.listVariables()).toEqual([
+      { id: "brand-color", type: "color", label: "Brand color", default: "#0066cc" },
+    ]);
+  });
+
+  it("listVariables returns [] when the composition declares none", async () => {
+    const comp = await openComposition(BASE_HTML);
+    expect(comp.listVariables()).toEqual([]);
+  });
+
+  it("declareVariable creates a new declaration a variables panel can list immediately", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+    comp.declareVariable({ id: "brand-title", type: "string", label: "Title", default: "Hi" });
+    expect(comp.getVariableValue("brand-title")).toBe("Hi");
+    expect(comp.listVariables()).toHaveLength(2);
+  });
+
+  it("declareVariable can create where setVariableValue's model write silently no-ops", async () => {
+    // Full document (not a fragment): declareVariable refuses fragment sources,
+    // whose synthetic <html> is stripped on serialize. No declarations yet.
+    const comp = await openComposition(`<!DOCTYPE html><html><body>${BASE_HTML}</body></html>`);
+    comp.setVariableValue("never-declared", "x");
+    expect(comp.getVariableValue("never-declared")).toBeUndefined();
+    comp.declareVariable({ id: "never-declared", type: "string", label: "New", default: "x" });
+    expect(comp.getVariableValue("never-declared")).toBe("x");
+  });
+
+  it("removeVariable removes the declaration; listVariables reflects it immediately", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+    comp.removeVariable("brand-color");
+    expect(comp.listVariables()).toEqual([]);
+    expect(comp.getVariableValue("brand-color")).toBeUndefined();
+  });
+
+  it("declareVariable / removeVariable both support undo", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+    comp.declareVariable({ id: "brand-title", type: "string", label: "Title", default: "Hi" });
+    expect(comp.listVariables()).toHaveLength(2);
+    comp.undo();
+    expect(comp.listVariables()).toHaveLength(1);
+
+    comp.removeVariable("brand-color");
+    expect(comp.listVariables()).toEqual([]);
+    comp.undo();
+    expect(comp.listVariables()).toEqual([
+      { id: "brand-color", type: "color", label: "Brand color", default: "#0066cc" },
+    ]);
+  });
+
+  it("declareVariable / removeVariable both support redo after undo", async () => {
+    const comp = await openComposition(VARIABLES_HTML);
+
+    comp.declareVariable({ id: "brand-title", type: "string", label: "Title", default: "Hi" });
+    comp.undo();
+    comp.redo();
+    expect(comp.listVariables()).toEqual([
+      { id: "brand-color", type: "color", label: "Brand color", default: "#0066cc" },
+      { id: "brand-title", type: "string", label: "Title", default: "Hi" },
+    ]);
+
+    comp.removeVariable("brand-color");
+    comp.undo();
+    comp.redo();
+    expect(comp.listVariables()).toEqual([
+      { id: "brand-title", type: "string", label: "Title", default: "Hi" },
+    ]);
   });
 });

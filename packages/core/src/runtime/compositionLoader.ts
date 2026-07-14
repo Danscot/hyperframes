@@ -1,5 +1,12 @@
 import { scopeCssToComposition, wrapScopedCompositionScript } from "../compiler/compositionScoping";
-import { readDeclaredDefaults } from "./getVariables";
+import { markFlattenedInnerRoot } from "./flattenedRoot";
+import {
+  applyCssVariables,
+  clearAppliedCssVariables,
+  parseHostVariableValues,
+  readDeclaredDefaults,
+  readRenderOverrides,
+} from "./getVariables";
 
 type LoadExternalCompositionsParams = {
   injectedStyles: HTMLStyleElement[];
@@ -26,6 +33,117 @@ type PendingScript =
 
 const EXTERNAL_SCRIPT_LOAD_TIMEOUT_MS = 8000;
 const BARE_RELATIVE_PATH_RE = /^(?![a-zA-Z][a-zA-Z\d+\-.]*:)(?!\/\/)(?!\/)(?!\.\.?\/).+/;
+const CSS_URL_RE = /\burl\(\s*(["']?)([^)"']+)\1\s*\)/g;
+const PATH_ATTRS = ["src", "href"] as const;
+
+/**
+ * Return true for URLs/prefixes that should never be rewritten — absolute
+ * URLs, protocol-relative, data:, hash fragments, root-relative. Mirrors
+ * the compiler's `isNonRelativeUrl` so server-side bundling and client-side
+ * runtime rewrite use the same rules.
+ */
+function isNonRelativeRuntimeUrl(value: string): boolean {
+  return (
+    !value ||
+    value.startsWith("http://") ||
+    value.startsWith("https://") ||
+    value.startsWith("//") ||
+    value.startsWith("data:") ||
+    value.startsWith("#") ||
+    value.startsWith("/")
+  );
+}
+
+/**
+ * Resolve a relative asset path from a sub-composition's URL to one that
+ * works in the live document.
+ *
+ * Server-side `inlineSubCompositions` rewrites `../foo.svg` from
+ * `compositions/scene.html` to `foo.svg` (project root). When the runtime
+ * mounts a sub-composition by fetching its HTML and importing its nodes
+ * into the main document, no such rewriting happens — so a `<video
+ * src="../../assets/x.mp4">` authored from `compositions/frames/*.html`
+ * resolves against the main document's base, climbing **above** the
+ * project root (e.g. `/api/projects/assets/x.mp4`) and 404s. This is the
+ * Studio-preview-vs-render divergence noted in the bug report.
+ *
+ * For each path that traverses up with `../`, resolve against the
+ * sub-composition's URL and return an absolute URL the browser can use
+ * directly. Plain relative paths (`assets/x.mp4`) and absolute / special
+ * URLs are returned unchanged — they already resolve correctly via the
+ * main document's base.
+ */
+function rewriteRuntimeAssetPath(value: string, compositionUrl: URL | null): string {
+  if (!compositionUrl) return value;
+  const trimmed = value.trim();
+  if (isNonRelativeRuntimeUrl(trimmed)) return value;
+  if (!trimmed.startsWith("../") && trimmed !== "..") return value;
+  try {
+    return new URL(trimmed, compositionUrl).href;
+  } catch {
+    return value;
+  }
+}
+
+function rewriteRuntimeCssAssetUrls(cssText: string, compositionUrl: URL | null): string {
+  if (!compositionUrl || !cssText) return cssText;
+  return cssText.replace(CSS_URL_RE, (full, quote: string, rawUrl: string) => {
+    const rewritten = rewriteRuntimeAssetPath(rawUrl || "", compositionUrl);
+    if (rewritten === rawUrl) return full;
+    return `url(${quote || ""}${rewritten}${quote || ""})`;
+  });
+}
+
+function rewritePathAttrsInTree(root: ParentNode, compositionUrl: URL): void {
+  for (const el of Array.from(root.querySelectorAll<Element>("[src], [href]"))) {
+    for (const attr of PATH_ATTRS) {
+      const value = el.getAttribute(attr);
+      if (value == null) continue;
+      const rewritten = rewriteRuntimeAssetPath(value, compositionUrl);
+      if (rewritten !== value) el.setAttribute(attr, rewritten);
+    }
+  }
+}
+
+function rewriteInlineStyleUrlsInTree(root: ParentNode, compositionUrl: URL): void {
+  for (const el of Array.from(root.querySelectorAll<Element>("[style]"))) {
+    const value = el.getAttribute("style");
+    if (value == null) continue;
+    const rewritten = rewriteRuntimeCssAssetUrls(value, compositionUrl);
+    if (rewritten !== value) el.setAttribute("style", rewritten);
+  }
+}
+
+function rewriteStyleElementUrlsInTree(root: ParentNode, compositionUrl: URL): void {
+  for (const styleEl of Array.from(root.querySelectorAll<HTMLStyleElement>("style"))) {
+    const text = styleEl.textContent || "";
+    const rewritten = rewriteRuntimeCssAssetUrls(text, compositionUrl);
+    if (rewritten !== text) styleEl.textContent = rewritten;
+  }
+}
+
+/**
+ * Rewrite relative asset paths in a parsed sub-composition document so
+ * that `../`-traversing paths resolve against the sub-composition's URL
+ * rather than the main document's base. Touches `[src]`, `[href]`,
+ * `[style]` url(...) references, and `<style>` element CSS — the same
+ * surface the server-side `inlineSubCompositions` rewrites.
+ *
+ * Recurses into `<template>` content because authored compositions wrap
+ * their rendered body in a `<template>` and querySelectorAll does not
+ * enter template content (it lives in a detached DocumentFragment).
+ * Without recursion, the rewrite would miss every `<video>` and
+ * `<img>` that an author placed inside the canonical template wrapper.
+ */
+function rewriteSubCompositionAssetPaths(root: ParentNode, compositionUrl: URL | null): void {
+  if (!compositionUrl) return;
+  rewritePathAttrsInTree(root, compositionUrl);
+  rewriteInlineStyleUrlsInTree(root, compositionUrl);
+  rewriteStyleElementUrlsInTree(root, compositionUrl);
+  for (const templateEl of Array.from(root.querySelectorAll<HTMLTemplateElement>("template"))) {
+    rewriteSubCompositionAssetPaths(templateEl.content, compositionUrl);
+  }
+}
 
 function uniqueCompositionId(baseId: string, index: number): string {
   return `${baseId}__hf${index}`;
@@ -61,30 +179,9 @@ function resetCompositionHost(host: Element) {
   host.textContent = "";
 }
 
-const FLATTENED_INNER_ROOT_STRIP_ATTRS = [
-  "data-composition-id",
-  "data-composition-file",
-  "data-start",
-  "data-duration",
-  "data-end",
-  "data-track-index",
-  "data-track",
-  "data-composition-src",
-  "data-hf-authored-duration",
-  "data-hf-authored-end",
-];
-
 function prepareFlattenedInnerRoot(innerRoot: HTMLElement): HTMLElement {
   const prepared = document.importNode(innerRoot, true) as HTMLElement;
-  const authoredRootId = prepared.getAttribute("id")?.trim();
-  for (const attrName of FLATTENED_INNER_ROOT_STRIP_ATTRS) {
-    prepared.removeAttribute(attrName);
-  }
-  if (authoredRootId) {
-    prepared.removeAttribute("id");
-    prepared.setAttribute("data-hf-authored-id", authoredRootId);
-  }
-  prepared.setAttribute("data-hf-inner-root", "true");
+  markFlattenedInnerRoot(prepared);
   const w = prepared.getAttribute("data-width");
   const h = prepared.getAttribute("data-height");
   prepared.style.width = w ? `${w}px` : "100%";
@@ -107,19 +204,6 @@ function resolveScriptSourceUrl(scriptSrc: string, compositionUrl: URL | null): 
   } catch {
     return scriptSrc;
   }
-}
-
-function parseHostVariableValues(host: Element): Record<string, unknown> {
-  const raw = host.getAttribute("data-variable-values");
-  if (!raw) return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return {};
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-  return parsed as Record<string, unknown>;
 }
 
 type HostCompositionIdentity = {
@@ -282,14 +366,15 @@ async function mountCompositionContent(params: {
     details: Record<string, string | number | boolean | null | string[]>;
   }) => void;
 }): Promise<void> {
-  let innerRoot: Element | null = null;
+  let innerRoot: HTMLElement | null = null;
   if (params.authoredCompositionId) {
     const candidateRoots = Array.from(
-      params.sourceNode.querySelectorAll<Element>("[data-composition-id]"),
+      params.sourceNode.querySelectorAll<HTMLElement>("[data-composition-id]"),
     );
     innerRoot =
       candidateRoots.find(
         (candidate) =>
+          candidate instanceof HTMLElement &&
           candidate.getAttribute("data-composition-id") === params.authoredCompositionId,
       ) ?? null;
   }
@@ -312,10 +397,8 @@ async function mountCompositionContent(params: {
     }
   }
 
-  // Inject <head> styles from non-template sub-compositions first (they define
-  // element styles like backgrounds and positioning that the composition needs).
-  if (params.headStyles) {
-    for (const style of params.headStyles) {
+  const injectScopedStyles = (styleEls: Iterable<HTMLStyleElement>): void => {
+    for (const style of styleEls) {
       const clonedStyle = style.cloneNode(true);
       if (!(clonedStyle instanceof HTMLStyleElement)) continue;
       if (authoredScopeCompositionId) {
@@ -324,28 +407,22 @@ async function mountCompositionContent(params: {
           authoredScopeCompositionId,
           runtimeScopeSelector,
           authoredRootId,
+          // Sub-comp styles are injected into the PARENT preview document, so
+          // remap html/body/:root to the composition box — otherwise a sub-comp
+          // `body { width/height/overflow }` clobbers the host body and clips
+          // the preview to the last-mounted sub-comp's size.
+          { scopeRootSelectors: true },
         );
       }
       document.head.appendChild(clonedStyle);
       params.injectedStyles.push(clonedStyle);
     }
-  }
-
-  const styles = Array.from(contentNode.querySelectorAll<HTMLStyleElement>("style"));
-  for (const style of styles) {
-    const clonedStyle = style.cloneNode(true);
-    if (!(clonedStyle instanceof HTMLStyleElement)) continue;
-    if (authoredScopeCompositionId) {
-      clonedStyle.textContent = scopeCssToComposition(
-        clonedStyle.textContent || "",
-        authoredScopeCompositionId,
-        runtimeScopeSelector,
-        authoredRootId,
-      );
-    }
-    document.head.appendChild(clonedStyle);
-    params.injectedStyles.push(clonedStyle);
-  }
+  };
+  // Inject <head> styles from non-template sub-compositions first (they define
+  // element styles like backgrounds and positioning that the composition needs),
+  // then the content styles.
+  if (params.headStyles) injectScopedStyles(params.headStyles);
+  injectScopedStyles(Array.from(contentNode.querySelectorAll<HTMLStyleElement>("style")));
 
   // Collect head scripts first (e.g. GSAP CDN loaded in <head> of non-template sub-comps),
   // then content scripts. Head scripts must execute before content scripts.
@@ -425,16 +502,7 @@ async function mountCompositionContent(params: {
   // `window.__hfVariablesByComp[compId]`, so this table must be populated
   // before the wrapped IIFE evaluates.
   if (runtimeScopeCompositionId) {
-    const merged = {
-      ...(params.declaredVariableDefaults ?? {}),
-      ...parseHostVariableValues(params.host),
-    };
-    if (Object.keys(merged).length > 0) {
-      if (!window.__hfVariablesByComp) window.__hfVariablesByComp = {};
-      window.__hfVariablesByComp[runtimeScopeCompositionId] = merged;
-    } else if (window.__hfVariablesByComp) {
-      delete window.__hfVariablesByComp[runtimeScopeCompositionId];
-    }
+    stashInstanceVariables(params, contentNode, runtimeScopeCompositionId);
   }
 
   for (const scriptPayload of scriptPayloads) {
@@ -580,6 +648,16 @@ export async function loadExternalCompositions(
         const html = await response.text();
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, "text/html");
+        // Rewrite project-root-traversing (`../`) asset paths against the
+        // sub-composition's URL before extracting any nodes. Without this,
+        // `<video src="../../assets/x.mp4">` authored from
+        // `compositions/frames/scene.html` resolves against the main
+        // document's base (the project preview root) and climbs above it
+        // to 404 — the Studio-preview-vs-render divergence reported by
+        // OSS users. The server-side bundler already does this for the
+        // baked render via `inlineSubCompositions`; this is the runtime
+        // mirror so live preview matches.
+        rewriteSubCompositionAssetPaths(doc, compositionUrl);
         const template =
           (authoredCompositionId
             ? doc.querySelector<HTMLTemplateElement>(
@@ -621,6 +699,10 @@ export async function loadExternalCompositions(
           headStyles,
           headScripts,
           headLinks,
+          // TODO(template-var-carriers): reads `<html>` only. A template/fragment
+          // sub-comp that declares on its `[data-composition-id]` root div (the
+          // dual-carrier contract from #2081) loses its defaults on this lazy
+          // external-load path — see inlineSubCompositions for the fixed path.
           declaredVariableDefaults: readDeclaredDefaults(doc.documentElement),
           onDiagnostic: params.onDiagnostic,
         });
@@ -639,4 +721,36 @@ export async function loadExternalCompositions(
       }
     }),
   );
+}
+
+/**
+ * Stash per-instance variables BEFORE running scripts (the scoped
+ * getVariables() reads window.__hfVariablesByComp[compId]) and mirror them
+ * as CSS custom properties on the host so imported var(--slug, literal)
+ * fills inside the sub-comp resolve per instance (cascade beats the document
+ * root). Inline templates carry declared defaults on the content root;
+ * external loads pass them explicitly. Render-time overrides (--variables)
+ * always win. Stale custom properties from a previous mount are cleared
+ * before (re)applying.
+ */
+function stashInstanceVariables(
+  params: { host: Element; declaredVariableDefaults?: Record<string, unknown> },
+  contentNode: Node,
+  runtimeScopeCompositionId: string,
+): void {
+  const declaredDefaults =
+    params.declaredVariableDefaults ??
+    (contentNode instanceof Element ? readDeclaredDefaults(contentNode) : {});
+  const merged = {
+    ...declaredDefaults,
+    ...parseHostVariableValues(params.host),
+  };
+  clearAppliedCssVariables(params.host);
+  if (Object.keys(merged).length > 0) {
+    if (!window.__hfVariablesByComp) window.__hfVariablesByComp = {};
+    window.__hfVariablesByComp[runtimeScopeCompositionId] = merged;
+    applyCssVariables(params.host, { ...merged, ...readRenderOverrides() });
+  } else if (window.__hfVariablesByComp) {
+    delete window.__hfVariablesByComp[runtimeScopeCompositionId];
+  }
 }

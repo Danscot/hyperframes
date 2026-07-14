@@ -101,6 +101,8 @@ try {
 
 import { defineCommand, runMain } from "citty";
 import type { ArgsDef, CommandDef } from "citty";
+import { getRunId } from "./telemetry/runId.js";
+import { reportCommandFailure, trackCommandFailures } from "./utils/command-failure-tracking.js";
 
 const isHelp = process.argv.includes("--help") || process.argv.includes("-h");
 
@@ -108,16 +110,20 @@ const isHelp = process.argv.includes("--help") || process.argv.includes("-h");
 // CLI definition — all commands are lazy-loaded via dynamic import()
 // ---------------------------------------------------------------------------
 
-const subCommands = {
+const commandLoaders = {
   init: () => import("./commands/init.js").then((m) => m.default),
   add: () => import("./commands/add.js").then((m) => m.default),
   catalog: () => import("./commands/catalog.js").then((m) => m.default),
   play: () => import("./commands/play.js").then((m) => m.default),
+  present: () => import("./commands/present.js").then((m) => m.default),
   preview: () => import("./commands/preview.js").then((m) => m.default),
   publish: () => import("./commands/publish.js").then((m) => m.default),
   render: () => import("./commands/render.js").then((m) => m.default),
   lint: () => import("./commands/lint.js").then((m) => m.default),
+  check: () => import("./commands/check.js").then((m) => m.default),
+  beats: () => import("./commands/beats.js").then((m) => m.default),
   inspect: () => import("./commands/inspect.js").then((m) => m.default),
+  keyframes: () => import("./commands/keyframes.js").then((m) => m.default),
   layout: () => import("./commands/layout.js").then((m) => m.default),
   info: () => import("./commands/info.js").then((m) => m.default),
   compositions: () => import("./commands/compositions.js").then((m) => m.default),
@@ -132,14 +138,29 @@ const subCommands = {
   skills: () => import("./commands/skills.js").then((m) => m.default),
   feedback: () => import("./commands/feedback.js").then((m) => m.default),
   telemetry: () => import("./commands/telemetry.js").then((m) => m.default),
+  events: () => import("./commands/events.js").then((m) => m.default),
   validate: () => import("./commands/validate.js").then((m) => m.default),
   snapshot: () => import("./commands/snapshot.js").then((m) => m.default),
+  "grade-compare": () => import("./commands/grade-compare.js").then((m) => m.default),
+  compare: () => import("./commands/compare.js").then((m) => m.default),
   capture: () => import("./commands/capture.js").then((m) => m.default),
   lambda: () => import("./commands/lambda.js").then((m) => m.default),
   cloudrun: () => import("./commands/cloudrun.js").then((m) => m.default),
   cloud: () => import("./commands/cloud.js").then((m) => m.default),
   auth: () => import("./commands/auth.js").then((m) => m.default),
+  figma: () => import("./commands/figma.js").then((m) => m.default),
 };
+
+// Wrap each command's run() so a thrown failure reports its reason to telemetry
+// before citty catches the error and exits 1. The error is re-thrown unchanged,
+// preserving citty's print + exit-1 behavior. Commands that call process.exit()
+// themselves (e.g. `browser path`) bypass this and report inline.
+const subCommands = Object.fromEntries(
+  Object.entries(commandLoaders).map(([name, load]) => [
+    name,
+    trackCommandFailures(load, (err) => reportCommandFailure(command, err)),
+  ]),
+);
 
 const main = defineCommand({
   meta: {
@@ -155,7 +176,10 @@ const main = defineCommand({
 // ---------------------------------------------------------------------------
 
 const cliCommandArg = process.argv[2];
-const command = cliCommandArg && cliCommandArg in subCommands ? cliCommandArg : "unknown";
+// Explicit annotation breaks a type cycle: `subCommands` references `command`
+// (in the failure reporter) and `command` references `subCommands` (the `in`
+// check), so its type can't be inferred from its own initializer.
+const command: string = cliCommandArg && cliCommandArg in subCommands ? cliCommandArg : "unknown";
 const hasJsonFlag = process.argv.includes("--json");
 
 // Captured references — populated when the lazy imports resolve.
@@ -173,23 +197,47 @@ let _trackCliError:
     }) => void)
   | undefined;
 let _trackCommandResult:
-  | ((props: { command: string; success: boolean; exitCode: number; durationMs: number }) => void)
+  | ((props: {
+      command: string;
+      success: boolean;
+      exitCode: number;
+      durationMs: number;
+      runId?: string;
+    }) => void)
   | undefined;
 let _printUpdateNotice: (() => void) | undefined;
+let _printSkillsUpdateNotice: (() => void) | undefined;
 
-if (!isHelp && command !== "telemetry" && command !== "unknown") {
+// `events` is a telemetry-internal beacon: it self-tracks + self-flushes, so it
+// skips the per-command wrapper (no duplicate cli_command, no first-run notice
+// printed into a skill's captured output).
+if (!isHelp && command !== "telemetry" && command !== "events" && command !== "unknown") {
   import("./telemetry/index.js").then((mod) => {
     _flush = mod.flush;
     _flushSync = mod.flushSync;
     _trackCliError = mod.trackCliError;
     _trackCommandResult = mod.trackCommandResult;
     mod.showTelemetryNotice();
-    mod.trackCommand(command);
+    mod.trackCommand(command, runId);
     if (mod.shouldTrack()) mod.incrementCommandCount();
   });
 }
 
-if (!isHelp && !hasJsonFlag && command !== "upgrade") {
+// `events` skips the update check too — a skill-usage beacon must not add
+// network latency or trigger a background self-upgrade on the calling skill.
+// `skills` is excluded from the SKILLS nudge for the same reason `upgrade` is
+// excluded from the self-update notice: a command that is itself actively
+// checking/reconciling skills (`skills check`, `skills update`) must not also
+// tell the user to go run `skills update` — that's either redundant (it just
+// did) or, worse, misleading (it printed a stale nudge count from the last
+// cached check while reporting fresh results of its own).
+if (
+  !isHelp &&
+  !hasJsonFlag &&
+  command !== "upgrade" &&
+  command !== "events" &&
+  command !== "skills"
+) {
   // Report any completed auto-install from the previous run first, before
   // kicking off the next check — so the user sees "updated to vX" once and
   // we don't over-print.
@@ -203,9 +251,17 @@ if (!isHelp && !hasJsonFlag && command !== "upgrade") {
       auto?.scheduleBackgroundInstall(result.latest, result.current);
     }
   });
+
+  // Skills freshness nudge — same gating as the CLI self-update notice. The
+  // check is cached (24h) and best-effort: it never blocks or fails the command.
+  import("./utils/skillsUpdateCheck.js").then(async (mod) => {
+    _printSkillsUpdateNotice = mod.printSkillsUpdateNotice;
+    await mod.checkSkillsForUpdate().catch(() => null);
+  });
 }
 
 const commandStart = Date.now();
+const runId = getRunId();
 
 // Async flush for normal exit. `beforeExit` re-fires every time the
 // event loop drains, and the async `_flush()` itself schedules new
@@ -214,7 +270,10 @@ const commandStart = Date.now();
 // detaches after first invocation, which is what we want for both.
 process.once("beforeExit", () => {
   _flush?.().catch(() => {});
-  if (!hasJsonFlag) _printUpdateNotice?.();
+  if (!hasJsonFlag) {
+    _printUpdateNotice?.();
+    _printSkillsUpdateNotice?.();
+  }
 });
 
 // Sync-only: exit handlers cannot await promises or drain microtasks.
@@ -226,6 +285,7 @@ process.on("exit", (code) => {
     success: code === 0 && !commandFailed,
     exitCode: code,
     durationMs: Date.now() - commandStart,
+    runId,
   });
   _flushSync?.();
 });

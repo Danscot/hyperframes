@@ -67,25 +67,34 @@ export const STUDIO_GSAP_PANEL_ENABLED = resolveStudioBooleanEnvFlag(
 export const STUDIO_KEYFRAMES_ENABLED = resolveStudioBooleanEnvFlag(
   env,
   ["VITE_STUDIO_ENABLE_KEYFRAMES", "VITE_STUDIO_KEYFRAMES_ENABLED"],
-  false,
+  true,
 );
 
 export const STUDIO_RAZOR_TOOL_ENABLED = resolveStudioBooleanEnvFlag(
   env,
   ["VITE_STUDIO_ENABLE_RAZOR_TOOL", "VITE_STUDIO_RAZOR_TOOL_ENABLED"],
-  false,
-);
-
-// When disabled (the default), drag/resize/rotate commits always take the CSS
-// persist path instead of being intercepted into GSAP script keyframe
-// mutations. The keyframe intercept rewrites timeline tweens from drag
-// gestures and is opt-in until its recording path is hardened.
-export const STUDIO_GSAP_DRAG_INTERCEPT_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  ["VITE_STUDIO_ENABLE_GSAP_DRAG_INTERCEPT", "VITE_STUDIO_GSAP_DRAG_INTERCEPT_ENABLED"],
   true,
 );
 
 export const STUDIO_PREVIEW_SELECTION_ENABLED = STUDIO_INSPECTOR_PANELS_ENABLED;
+
+// Stage 7 Step 3c: SDK cutover — routes inline-style ops through SDK dispatch
+// instead of the server patch-element API. Default false; enable via
+// VITE_STUDIO_SDK_CUTOVER_ENABLED=true. Requires SDK session to be open.
+export const STUDIO_SDK_CUTOVER_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_SDK_CUTOVER_ENABLED"],
+  false,
+);
+
+// Resolver-parity tripwire (telemetry-only, decoupled from cutover).
+// Runs the SDK resolver alongside any edit and emits sdk_resolver_shadow on
+// divergence. Default true; disable via VITE_STUDIO_SDK_RESOLVER_SHADOW_ENABLED=false.
+// Soak gate: retire once zero element_not_found divergences over a clean window.
+export const STUDIO_SDK_RESOLVER_SHADOW_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_SDK_RESOLVER_SHADOW_ENABLED"],
+  true,
+);
 
 export const STUDIO_MANUAL_EDITING_DISABLED_TITLE = "Manual editing is temporarily disabled";

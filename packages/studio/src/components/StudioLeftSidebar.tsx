@@ -18,6 +18,7 @@ export interface StudioLeftSidebarProps {
   linting: boolean;
   lintFindingCount?: number;
   lintFindingsByFile?: Map<string, { count: number; messages: string[] }>;
+  onAddAssetToTimeline?: (path: string) => void;
 }
 
 // fallow-ignore-next-line complexity
@@ -30,10 +31,12 @@ export function StudioLeftSidebar({
   linting,
   lintFindingCount,
   lintFindingsByFile,
+  onAddAssetToTimeline,
 }: StudioLeftSidebarProps) {
   const {
     leftCollapsed,
     leftWidth,
+    setLeftWidth,
     toggleLeftSidebar,
     handlePanelResizeStart,
     handlePanelResizeMove,
@@ -68,7 +71,7 @@ export function StudioLeftSidebar({
 
   if (leftCollapsed) {
     return (
-      <div className="flex w-10 flex-shrink-0 flex-col items-center border-r border-neutral-800/50 bg-neutral-950 pt-1">
+      <div className="mr-0.5 flex w-10 flex-shrink-0 flex-col items-center rounded-lg border border-neutral-800/50 bg-neutral-950 pt-1">
         <button
           type="button"
           onClick={toggleLeftSidebar}
@@ -114,14 +117,22 @@ export function StudioLeftSidebar({
         onRenameFile={handleRenameFile}
         onDuplicateFile={handleDuplicateFile}
         onMoveFile={handleMoveFile}
-        onImportFiles={handleImportFiles}
+        onImportFiles={async (files, dir) => {
+          await handleImportFiles(files, dir);
+        }}
         codeChildren={
           editingFile ? (
             isMediaFile(editingFile.path) ? (
               <MediaPreview projectId={projectId} filePath={editingFile.path} />
+            ) : editingFile.content == null ? (
+              // Never mount the editor on unloaded content: a keystroke would
+              // autosave an empty document over the real file.
+              <div className="flex h-full items-center justify-center text-[11px] text-neutral-600">
+                Loading {editingFile.path}…
+              </div>
             ) : (
               <SourceEditor
-                content={editingFile.content ?? ""}
+                content={editingFile.content}
                 filePath={editingFile.path}
                 onChange={handleContentChange}
                 revealOffset={revealSourceOffset}
@@ -138,15 +149,35 @@ export function StudioLeftSidebar({
         onToggleCollapse={toggleLeftSidebar}
         onAddBlock={onAddBlock}
         onPreviewBlock={onPreviewBlock}
+        onAddAssetToTimeline={onAddAssetToTimeline}
       />
+      {/* Vertical resize divider: 3px visible seam, 8px pointer-capture zone via
+          the absolutely-positioned inner hit area. The outer element is w-[3px] so
+          it contributes only 3px of gap in the flex row; the inner -left-[2.5px]
+          element widens the hit area to 8px without affecting layout. */}
       <div
-        className="group w-2 flex-shrink-0 cursor-col-resize flex items-center justify-center"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        tabIndex={0}
+        className="group relative w-[3px] flex-shrink-0 cursor-col-resize outline-none focus-visible:bg-studio-accent/20"
         style={{ touchAction: "none" }}
         onPointerDown={(e) => handlePanelResizeStart("left", e)}
         onPointerMove={handlePanelResizeMove}
         onPointerUp={handlePanelResizeEnd}
+        onPointerCancel={handlePanelResizeEnd}
+        onKeyDown={(e) => {
+          if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+          e.preventDefault();
+          const delta = e.key === "ArrowLeft" ? -16 : 16;
+          const maxLeft = Math.floor(window.innerWidth * 0.5);
+          setLeftWidth(Math.max(160, Math.min(maxLeft, leftWidth + delta)));
+        }}
       >
-        <div className="h-[52px] w-px bg-white/12 transition-colors group-hover:bg-white/18 group-active:bg-white/24" />
+        {/* Expanded hit zone: 8px wide, centered on the 3px seam */}
+        <div className="absolute inset-y-0 -left-[2.5px] w-2" />
+        {/* Visible hairline */}
+        <div className="absolute top-1/2 left-0 h-[52px] w-[3px] -translate-y-1/2 bg-white/12 transition-colors group-hover:bg-white/18 group-active:bg-white/24" />
       </div>
     </>
   );

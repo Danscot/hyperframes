@@ -13,7 +13,19 @@ export interface AppToast {
   tone: "error" | "info";
 }
 
-export type RightPanelTab = "layers" | "design" | "renders" | "block-params";
+export type RightPanelTab =
+  | "layers"
+  | "design"
+  | "renders"
+  | "block-params"
+  | "slideshow"
+  | "variables";
+export type RightInspectorPane = "layers" | "design";
+
+export interface RightInspectorPanes {
+  layers: boolean;
+  design: boolean;
+}
 
 export interface AgentModalAnchorPoint {
   x: number;
@@ -116,41 +128,113 @@ export function getHistoryShortcutLabel(action: "undo" | "redo"): string {
   return action === "undo" ? `${modifier}+Z` : `${modifier}+Shift+Z`;
 }
 
+type ElementMatchSelection = Pick<
+  DomEditSelection,
+  "id" | "selector" | "selectorIndex" | "sourceFile" | "compositionSrc" | "isCompositionHost"
+>;
+
+function matchesByDomId(
+  selection: ElementMatchSelection,
+  element: TimelineElement,
+  selectionSourceFile: string,
+): boolean {
+  if (!selection.id) return false;
+  return (
+    element.domId === selection.id && (element.sourceFile || "index.html") === selectionSourceFile
+  );
+}
+
+function matchesByCompositionHost(
+  selection: ElementMatchSelection,
+  element: TimelineElement,
+): boolean {
+  if (!selection.isCompositionHost || !selection.compositionSrc) return false;
+  return element.compositionSrc === selection.compositionSrc;
+}
+
+function matchesBySelector(selection: ElementMatchSelection, element: TimelineElement): boolean {
+  if (!selection.selector) return false;
+  return (
+    element.selector === selection.selector &&
+    (element.selectorIndex ?? 0) === (selection.selectorIndex ?? 0) &&
+    (element.sourceFile ?? "index.html") === selection.sourceFile
+  );
+}
+
+function elementMatchesSelection(
+  selection: ElementMatchSelection,
+  element: TimelineElement,
+  selectionSourceFile: string,
+): boolean {
+  return (
+    matchesByDomId(selection, element, selectionSourceFile) ||
+    matchesByCompositionHost(selection, element) ||
+    matchesBySelector(selection, element)
+  );
+}
+
 export function findMatchingTimelineElementId(
-  selection: Pick<
-    DomEditSelection,
-    "id" | "selector" | "selectorIndex" | "sourceFile" | "compositionSrc" | "isCompositionHost"
-  >,
+  selection: ElementMatchSelection,
   elements: TimelineElement[],
 ): string | null {
   const selectionSourceFile = selection.sourceFile || "index.html";
-  for (const element of elements) {
-    const elementSourceFile = element.sourceFile || "index.html";
-    if (
-      selection.id &&
-      element.domId === selection.id &&
-      elementSourceFile === selectionSourceFile
-    ) {
-      return element.key ?? element.id;
-    }
-    if (
-      selection.isCompositionHost &&
-      selection.compositionSrc &&
-      element.compositionSrc === selection.compositionSrc
-    ) {
-      return element.key ?? element.id;
-    }
-    if (
-      selection.selector &&
-      element.selector === selection.selector &&
-      (element.selectorIndex ?? 0) === (selection.selectorIndex ?? 0) &&
-      (element.sourceFile ?? "index.html") === selection.sourceFile
-    ) {
-      return element.key ?? element.id;
-    }
+  const match = elements.find((el) => elementMatchesSelection(selection, el, selectionSourceFile));
+  if (match) return match.key ?? match.id;
+
+  // Child inside a sub-composition: return a qualified ID so the expansion
+  // hook can resolve the child via clipParentMap even though no timeline
+  // element exists for it yet (the expansion creates it on the fly).
+  if (selection.id && selectionSourceFile !== "index.html") {
+    return `${selectionSourceFile}#${selection.id}`;
   }
 
   return null;
+}
+
+/**
+ * A selected DOM node may be a static descendant of a clip (e.g. the `.num` text
+ * inside a `#stat1` card) — not a timeline element itself. Walk up to the nearest
+ * ancestor that IS a clip so the timeline still selects + inline-expands around it.
+ */
+export function findTimelineIdByAncestor(
+  element: Element | null | undefined,
+  elements: TimelineElement[],
+  sourceFile: string,
+): string | null {
+  let ancestor = element?.parentElement ?? null;
+  while (ancestor) {
+    const id = ancestor.id;
+    if (id) {
+      const match = elements.find(
+        (el) => el.domId === id && (el.sourceFile ?? "index.html") === sourceFile,
+      );
+      if (match) return match.key ?? match.id;
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return null;
+}
+
+/**
+ * Resolve the timeline element id for a DOM selection: direct match first, then
+ * nearest clip ancestor. The ancestor lookup resolves against the selection's own
+ * source file, falling back to the active composition path, then index.html — so a
+ * sub-composition selection with no explicit sourceFile resolves against the comp
+ * currently open, not always the root file.
+ */
+export function resolveTimelineIdForSelection(
+  selection: DomEditSelection,
+  elements: TimelineElement[],
+  activeCompPath: string | null,
+): string | null {
+  return (
+    findMatchingTimelineElementId(selection, elements) ??
+    findTimelineIdByAncestor(
+      selection.element,
+      elements,
+      selection.sourceFile || activeCompPath || "index.html",
+    )
+  );
 }
 
 export function resolveTimelineSelectionSeekTime(
@@ -172,6 +256,7 @@ export function clampNumber(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+// fallow-ignore-next-line unused-export
 export { COMPOSITION_ROOT_OPEN_TAG_RE } from "./compositionPatterns";
 
 export function collectHtmlIds(source: string): string[] {
@@ -222,4 +307,66 @@ export async function resolveDroppedAssetDuration(
   media.src = "";
   media.load();
   return duration;
+}
+
+export async function resolveDroppedAssetDimensions(
+  projectId: string,
+  assetPath: string,
+  kind: TimelineAssetKind,
+): Promise<{ width: number; height: number } | null> {
+  if (kind === "audio") return null;
+  const src = `/api/projects/${projectId}/preview/${assetPath}`;
+
+  if (kind === "image") {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const timeout = window.setTimeout(() => resolve(null), 3000);
+      img.addEventListener(
+        "load",
+        () => {
+          window.clearTimeout(timeout);
+          resolve(
+            img.naturalWidth > 0 && img.naturalHeight > 0
+              ? { width: img.naturalWidth, height: img.naturalHeight }
+              : null,
+          );
+        },
+        { once: true },
+      );
+      img.addEventListener(
+        "error",
+        () => {
+          window.clearTimeout(timeout);
+          resolve(null);
+        },
+        { once: true },
+      );
+      img.src = src;
+    });
+  }
+
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    const timeout = window.setTimeout(() => resolve(null), 3000);
+    const finalize = (value: { width: number; height: number } | null) => {
+      window.clearTimeout(timeout);
+      video.src = "";
+      video.load();
+      resolve(value);
+    };
+    video.addEventListener(
+      "loadedmetadata",
+      () => {
+        finalize(
+          video.videoWidth > 0 && video.videoHeight > 0
+            ? { width: video.videoWidth, height: video.videoHeight }
+            : null,
+        );
+      },
+      { once: true },
+    );
+    video.addEventListener("error", () => finalize(null), { once: true });
+    video.src = src;
+  });
 }

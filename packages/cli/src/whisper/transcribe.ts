@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { findFFmpeg, findFFprobe, getFFmpegInstallHint } from "../browser/ffmpeg.js";
 import { ensureWhisper, ensureModel, hasFFmpeg, DEFAULT_MODEL } from "./manager.js";
 
@@ -42,6 +43,7 @@ function findWavDataChunk(buf: Buffer): { offset: number; size: number } | null 
  * sustained energy jump above the track's median RMS. Returns onset time in
  * seconds, or null if the track has consistent energy throughout.
  */
+// fallow-ignore-next-line complexity
 export function detectSpeechOnset(wavPath: string): number | null {
   const SAMPLE_RATE = 16000;
   const WINDOW_SECONDS = 0.5;
@@ -123,6 +125,20 @@ function isVideoFile(filePath: string): boolean {
 }
 
 /**
+ * Unique path for the temporary 16kHz mono WAV fed to whisper.
+ *
+ * MUST be unique per call AND per process: callers run many `transcribe`
+ * invocations in parallel (e.g. the product-launch-video audio pipeline spawns
+ * one `hyperframes transcribe` per scene at once). A `Date.now()`-based name
+ * collides when two conversions land in the same millisecond — they clobber
+ * each other's WAV in the shared tmpdir, so whisper transcribes the wrong
+ * scene's audio and every colliding scene gets identical word timings.
+ */
+function tempWavPath(): string {
+  return join(tmpdir(), `hyperframes-audio-${process.pid}-${randomUUID()}.wav`);
+}
+
+/**
  * Extract audio from a video file as 16kHz mono WAV (whisper requirement).
  */
 function extractAudio(videoPath: string): string {
@@ -132,7 +148,7 @@ function extractAudio(videoPath: string): string {
       `ffmpeg is required to extract audio from video. Install: ${getFFmpegInstallHint()}`,
     );
   }
-  const wavPath = join(tmpdir(), `hyperframes-audio-${Date.now()}.wav`);
+  const wavPath = tempWavPath();
   execFileSync(
     ffmpegPath,
     ["-i", videoPath, "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", "-y", wavPath],
@@ -180,7 +196,7 @@ function prepareAudio(audioPath: string): string {
   if (!ffmpegPath) {
     throw new Error(`ffmpeg is required to prepare audio. Install: ${getFFmpegInstallHint()}`);
   }
-  const wavPath = join(tmpdir(), `hyperframes-audio-${Date.now()}.wav`);
+  const wavPath = tempWavPath();
   execFileSync(
     ffmpegPath,
     ["-i", audioPath, "-ar", "16000", "-ac", "1", "-f", "wav", "-y", wavPath],
@@ -190,8 +206,24 @@ function prepareAudio(audioPath: string): string {
 }
 
 /**
+ * Map a ggml model file-stem to whisper.cpp's `--dtw` alignment-heads preset.
+ *
+ * The two mostly coincide, so the stem was long passed straight to `--dtw` — but
+ * they diverge for the large family: the model files are hyphenated
+ * (`ggml-large-v3.bin`) while the DTW presets are dotted (`large.v3`,
+ * `large.v3.turbo`). `--dtw large-v3` makes whisper-cli abort with
+ * "unknown DTW preset 'large-v3'", surfacing as "Transcription failed". The
+ * tiny/base/small/medium (+`.en`) families have no hyphen, so `-`→`.` is a no-op
+ * for them and correct for the large family.
+ */
+export function dtwPresetForModel(model: string): string {
+  return model.replace(/-/g, ".");
+}
+
+/**
  * Transcribe an audio or video file and save transcript.json to the output directory.
  */
+// fallow-ignore-next-line complexity
 export async function transcribe(
   inputPath: string,
   outputDir: string,
@@ -264,7 +296,7 @@ export async function transcribe(
     "--output-file",
     outputBase,
     "--dtw",
-    effectiveModel,
+    dtwPresetForModel(effectiveModel),
     "--suppress-nst",
   ];
   if (detectedLanguage) {

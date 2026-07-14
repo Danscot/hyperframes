@@ -1,11 +1,16 @@
 import { existsSync, statSync } from "node:fs";
 import { resolve, basename } from "node:path";
 import { errorBox } from "../ui/format.js";
+import { trackCommandFailure } from "../telemetry/events.js";
 
 export interface ProjectDir {
   dir: string;
   name: string;
   indexPath: string;
+}
+
+export interface ResolveProjectOptions {
+  requireIndex?: boolean;
 }
 
 export class InvalidProjectError extends Error {
@@ -22,7 +27,10 @@ export class InvalidProjectError extends Error {
   }
 }
 
-export function resolveProjectOrThrow(dirArg: string | undefined): ProjectDir {
+export function resolveProjectOrThrow(
+  dirArg: string | undefined,
+  options: ResolveProjectOptions = {},
+): ProjectDir {
   const trimmed = dirArg?.trim();
   if (trimmed === "#") {
     throw new InvalidProjectError(
@@ -39,7 +47,7 @@ export function resolveProjectOrThrow(dirArg: string | undefined): ProjectDir {
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
     throw new InvalidProjectError("Not a directory: " + dir);
   }
-  if (!existsSync(indexPath)) {
+  if (options.requireIndex !== false && !existsSync(indexPath)) {
     throw new InvalidProjectError(
       "No composition found in " + dir,
       "No index.html file found.",
@@ -50,11 +58,19 @@ export function resolveProjectOrThrow(dirArg: string | undefined): ProjectDir {
   return { dir, name, indexPath };
 }
 
-export function resolveProject(dirArg: string | undefined): ProjectDir {
+export function resolveProject(
+  dirArg: string | undefined,
+  options: ResolveProjectOptions = {},
+): ProjectDir {
   try {
-    return resolveProjectOrThrow(dirArg);
+    return resolveProjectOrThrow(dirArg, options);
   } catch (err) {
     if (err instanceof InvalidProjectError) {
+      // Self-exit (not a throw) so the cli.ts wrapper never sees it — report
+      // inline. argv[2] is the running command (info / inspect / render / ...).
+      // This is the dominant failure for read-only commands like `info` run
+      // outside a project; the redaction in trackCliError strips the dir path.
+      trackCommandFailure(process.argv[2] ?? "unknown", err);
       errorBox(err.title, err.hint, err.suggestion);
       process.exit(1);
     }

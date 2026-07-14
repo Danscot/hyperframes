@@ -7,7 +7,7 @@ Variables let you declare named, typed slots in a composition and fill them at r
 
 ## Declaring Variables
 
-Add `data-composition-variables` to the `<html>` root of any composition. Its value is a JSON array of variable declarations — one object per variable:
+Add `data-composition-variables` to a composition's declaration root. For a full-document composition that's the `<html>` element; for a template / fragment sub-composition (which has no `<html>` shell of its own) it's the composition root element — the `[data-composition-id]` div. Its value is a JSON array of variable declarations — one object per variable:
 
 ```html compositions/card.html
 <html data-composition-variables='[
@@ -78,6 +78,48 @@ The same pattern covers the three media element types:
 
 Pass assets as URL references your composition resolves at render time; don't inline base64. URL-shaped assets travel cleanly through both the local renderer and the Lambda surface — see [Templates on Lambda](/deploy/templates-on-lambda#working-with-large-variables) for the 256 KiB execution-input cap on distributed renders.
 
+### Parameterizing media color grading
+
+Media color grading can also read exact variable references inside
+`data-color-grading`. Use `$name` or `${name}` as the entire value for a field;
+the runtime resolves it from the current composition's variables before applying
+the shader grading, finishing details, blur/pixelate effects, and optional LUT:
+
+```html compositions/hero.html
+<html data-composition-variables='[
+  {"id":"gradingPreset","type":"enum","label":"Preset","default":"natural-lift",
+   "options":[{"value":"natural-lift","label":"Natural Lift"},{"value":"warm-daylight","label":"Warm Daylight"}]},
+  {"id":"gradingIntensity","type":"number","label":"Preset strength","default":0.75,"min":0,"max":1,"step":0.05},
+  {"id":"gradingExposure","type":"number","label":"Exposure","default":0,"min":-2,"max":2,"step":0.05},
+  {"id":"gradingVibrance","type":"number","label":"Vibrance","default":0.08,"min":-1,"max":1,"step":0.01}
+]'>
+  <body>
+    <div data-composition-id="hero" data-width="1920" data-height="1080">
+      <video
+        id="hero-video"
+        src="assets/hero.mp4"
+        data-start="0"
+        data-track-index="0"
+        muted
+        playsinline
+        data-color-grading='{
+          "preset":"$gradingPreset",
+          "intensity":"$gradingIntensity",
+          "adjust":{"exposure":"${gradingExposure}","vibrance":"$gradingVibrance"},
+          "details":{"vignette":0.15,"vignetteFeather":0.72,"grain":0.08,"grainSize":0.25},
+          "effects":{"blur":0.1},
+          "colorSpace":"rec709"
+        }'
+      ></video>
+    </div>
+  </body>
+</html>
+```
+
+When the same composition is embedded multiple times, each host's
+`data-variable-values` can produce different grading without copying or rewriting
+the media element's `data-color-grading` JSON.
+
 ### Swapping media: do you need to vary duration too?
 
 A common follow-up: if a variable swaps a `<video>` to a different clip, does `data-duration` need to change too? Usually no. `data-duration` is optional on `<video>` and `<audio>` — leave it off and the renderer ffprobes the source and uses its natural length:
@@ -103,7 +145,11 @@ If you need to clamp or pin the clip to a specific length per render — for exa
 </script>
 ```
 
-The probe phase reads `data-duration` from the live DOM after your script runs, so an attribute written programmatically behaves identically to one baked into the source HTML.
+The probe phase reads a **clip's** `data-duration` from the live DOM after your script runs, so an attribute written programmatically onto a clip or media element behaves identically to one baked into the source HTML.
+
+<Warning>
+This live-DOM re-read applies to clip and media elements, **not** to the **root composition's own `data-duration`** (its total render length / frame count). The renderer reads the root `data-duration` once at compile time, before your scripts run, exactly like `data-width` / `data-height`. If the root element carries a static `data-duration`, a script (or a variable) that rewrites it afterward is ignored, and the render uses the compile-time value. To make total render length vary per render, author the root `data-duration` directly (one value per output) rather than trying to drive it from a script. See [What can't be a variable](#what-cant-be-a-variable).
+</Warning>
 
 ## What can't be a variable
 
@@ -111,12 +157,13 @@ A small set of inputs are read once from the source HTML or from the CLI / SDK, 
 
 | What | Mechanism (not a variable) |
 |------|----------------------------|
-| Composition dimensions | `data-width` / `data-height` on the composition element — parsed from the source HTML at compile time, not from the live DOM |
+| Composition dimensions | `data-width` / `data-height` on the composition element, parsed from the source HTML at compile time, not from the live DOM |
+| Root composition total duration | `data-duration` on the **root** composition element (the total render length / frame count), parsed from the source HTML at compile time. A static root `data-duration` is locked before scripts run, so neither a script nor a variable can change the render length. (A clip's own `data-duration` is different: it is re-read from the live DOM, as shown above.) |
 | Frame rate | `--fps` flag on `hyperframes render`, or `config.fps` in the SDK |
 | Output format / codec / quality | `--format` / `--codec` / `--quality` flags, or the SDK equivalents |
 | A sibling or parent composition's variables | Variables are per-composition; use [`data-variable-values`](#per-instance-overrides-sub-compositions) on each sub-comp host element to pass overrides |
 
-The deeper rule: variables are runtime values your script applies to the DOM. They can drive anything the renderer reads from the live DOM after that script runs — text, colors, media `src`, even clip `data-duration` as shown above. They can't change inputs the renderer reads once at compile time (dimensions) or that live entirely outside the composition (CLI flags, encoder settings).
+The deeper rule: variables are runtime values your script applies to the DOM. They can drive anything the renderer reads from the live DOM after that script runs: text, colors, media `src`, even clip `data-duration` as shown above. They can't change inputs the renderer reads once at compile time (composition dimensions, and the root composition's total duration / render length) or that live entirely outside the composition (CLI flags, encoder settings).
 
 ## Reading Variables at Runtime
 
@@ -148,6 +195,51 @@ Inside any composition script, call `window.__hyperframes.getVariables()` to get
 ```
 
 `__hyperframes.getVariables()` is a shorthand for `window.__hyperframes.getVariables()` and works in both top-level and sub-composition scripts. The runtime automatically scopes sub-compositions so each instance sees its own resolved values.
+
+## Declarative Bindings (No Script Required)
+
+For the common cases — replaceable media, dynamic text, and CSS-driven styling — you don't need a script at all. The runtime resolves these bindings once at load, identically in preview and render:
+
+- **`data-var-src="id"`** — sets the element's `src` from the variable value (a URL string, or an image value's `{url}`). The authored `src` stays as the fallback when the variable resolves to nothing:
+
+  ```html
+  <img class="clip" data-start="0" data-duration="5"
+       data-var-src="heroImage" src="fallback.jpg" />
+  ```
+
+  <Note>
+  `data-var-src` is only honored on media elements (`img`, `video`, `audio`,
+  `source`) and only for safe URL protocols (`http(s):`, `blob:`, relative
+  paths, and `data:image/…`). A binding on a script-executing tag such as
+  `<iframe>`/`<script>`, or a value using `javascript:`/`data:text/html`, is
+  ignored — variable values may be attacker-influenced, so this prevents them
+  from becoming a script-injection sink. Scalar values applied as CSS custom
+  properties are likewise stripped of declaration-smuggling characters
+  (`; { } < >`).
+  </Note>
+
+- **`data-var-text="id"`** — sets the element's text content from a scalar variable:
+
+  ```html
+  <h1 class="clip" data-start="0" data-duration="5" data-var-text="title">Fallback title</h1>
+  ```
+
+- **CSS custom properties** — every scalar variable is applied as `--{id}` on its composition root (font values apply their family name), so plain CSS bindings respond to render/preview overrides:
+
+  ```css
+  .card-title { color: var(--accent); font-family: var(--brandFont), sans-serif; }
+  ```
+
+Bindings resolve against the element's owning composition, so sub-composition instances see their own per-instance values. The Studio Variables panel counts these bindings as usage. Use `getVariables()` in a script only when you need logic beyond direct substitution (loops, conditionals, derived values).
+
+<Note>
+**Content Security Policy.** The preview server injects override values via an
+inline `<script>window.__hfVariables=…</script>` tag. If you embed the preview
+behind a strict CSP (`script-src 'self'` with no `'unsafe-inline'`), that tag is
+blocked and the preview silently falls back to declared defaults — allow it with
+a nonce or hash. The declarative-binding runtime itself emits no inline scripts,
+and the final rendered output is unaffected.
+</Note>
 
 ## Per-instance Overrides (Sub-compositions)
 
@@ -218,7 +310,7 @@ Variable values are resolved by merging three sources, lowest to highest precede
 
 | Source | Precedence | Where declared |
 |--------|-----------|---------------|
-| Declared defaults | Lowest | `data-composition-variables` on `<html>` |
+| Declared defaults | Lowest | `data-composition-variables` on the declaration root (`<html>`, or the composition root div for template/fragment comps) |
 | Per-instance host overrides | Middle | `data-variable-values` on the sub-comp host element |
 | CLI `--variables` flag | Highest | `hyperframes render --variables '{...}'` |
 
@@ -253,7 +345,25 @@ const { variables } = extractCompositionMetadata(html);
 // variables is CompositionVariable[]
 ```
 
-This is the same API the Studio editing UI uses to build the variables panel for each composition.
+This is the same API the Studio Variables panel uses to build its editor for each composition.
+
+## Variables in Studio
+
+The Studio's **Variables** tab (right inspector panel) is a full UI over this
+system:
+
+- **Declare and edit** — add, edit, and remove declarations without touching the
+  HTML by hand; edits persist into `data-composition-variables` with undo support.
+- **Preview with values** — type-appropriate inputs write ephemeral overrides that
+  are injected into the preview as `window.__hfVariables`, exactly like render-time
+  injection, so what you preview is what `--variables` renders. A header pill shows
+  whether you're previewing defaults or custom values.
+- **Render with values** — renders started from the Renders tab carry the active
+  preview overrides.
+- **Handoff** — copy the effective values as JSON or as a ready-to-run
+  `hyperframes render --variables` command.
+- **Usage** — declarations no script reads are badged `unused`; ids read by scripts
+  but missing from the schema get a one-click Declare action.
 
 ## Next Steps
 

@@ -28,8 +28,10 @@ import {
 import { formatFfmpegError } from "../utils/runFfmpeg.js";
 import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
 import { getHdrEncoderColorParams } from "../utils/hdr.js";
+import { withEvenDimensionPad } from "../utils/evenDimensions.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { fpsToFfmpegArg, type Fps } from "@hyperframes/core";
+import { appendVp9CpuUsedArg } from "./vp9Options.js";
 
 // Re-export EncoderOptions so callers can reference the type via this module.
 export type { EncoderOptions } from "./chunkEncoder.types.js";
@@ -50,18 +52,27 @@ export interface FrameReorderBuffer {
   waitForFrame: (frame: number) => Promise<void>;
   advanceTo: (frame: number) => void;
   waitForAllDone: () => Promise<void>;
+  /**
+   * Reject every parked and future waiter with `err`. Required by the
+   * interleaved parallel drain: when one worker fails (e.g. drawElement
+   * self-verification), its frames will never be written — peers parked in
+   * waitForFrame would otherwise deadlock the whole capture (the worker pool
+   * awaits ALL workers before surfacing the failure).
+   */
+  abort: (err: Error) => void;
 }
 
 export function createFrameReorderBuffer(startFrame: number, endFrame: number): FrameReorderBuffer {
   let cursor = startFrame;
-  const pending = new Map<number, Array<() => void>>();
+  let aborted: Error | null = null;
+  const pending = new Map<number, Array<{ resolve: () => void; reject: (e: Error) => void }>>();
 
-  const enqueueAt = (frame: number, resolve: () => void): void => {
+  const enqueueAt = (frame: number, resolve: () => void, reject: (e: Error) => void): void => {
     const list = pending.get(frame);
     if (list === undefined) {
-      pending.set(frame, [resolve]);
+      pending.set(frame, [{ resolve, reject }]);
     } else {
-      list.push(resolve);
+      list.push({ resolve, reject });
     }
   };
 
@@ -69,16 +80,20 @@ export function createFrameReorderBuffer(startFrame: number, endFrame: number): 
     const list = pending.get(frame);
     if (list === undefined) return;
     pending.delete(frame);
-    for (const resolve of list) resolve();
+    for (const waiter of list) waiter.resolve();
   };
 
   const waitForFrame = (frame: number): Promise<void> =>
-    new Promise<void>((resolve) => {
+    new Promise<void>((resolve, reject) => {
+      if (aborted) {
+        reject(aborted);
+        return;
+      }
       if (frame === cursor) {
         resolve();
         return;
       }
-      enqueueAt(frame, resolve);
+      enqueueAt(frame, resolve, reject);
     });
 
   const advanceTo = (frame: number): void => {
@@ -87,15 +102,28 @@ export function createFrameReorderBuffer(startFrame: number, endFrame: number): 
   };
 
   const waitForAllDone = (): Promise<void> =>
-    new Promise<void>((resolve) => {
+    new Promise<void>((resolve, reject) => {
+      if (aborted) {
+        reject(aborted);
+        return;
+      }
       if (cursor >= endFrame) {
         resolve();
         return;
       }
-      enqueueAt(endFrame, resolve);
+      enqueueAt(endFrame, resolve, reject);
     });
 
-  return { waitForFrame, advanceTo, waitForAllDone };
+  const abort = (err: Error): void => {
+    if (aborted) return;
+    aborted = err;
+    for (const [frame, list] of pending) {
+      pending.delete(frame);
+      for (const waiter of list) waiter.reject(err);
+    }
+  };
+
+  return { waitForFrame, advanceTo, waitForAllDone, abort };
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +140,8 @@ export interface StreamingEncoderOptions {
   quality?: number;
   bitrate?: string;
   pixelFormat?: string;
+  /** libvpx-vp9 -cpu-used value. Defaults to the engine VP9 setting. */
+  vp9CpuUsed?: number;
   useGpu?: boolean;
   imageFormat?: "jpeg" | "png";
   hdr?: { transfer: import("../utils/hdr.js").HdrTransfer };
@@ -137,6 +167,13 @@ export interface StreamingEncoder {
   writeFrame: (buffer: Buffer) => Promise<boolean>;
   close: () => Promise<StreamingEncoderResult>;
   getExitStatus: () => "running" | "success" | "error";
+  /**
+   * The FFmpeg failure reason (exit code + tail of stderr), or `undefined`
+   * while the process is still running / exited cleanly. Lets a `writeFrame`
+   * that returned `false` because FFmpeg died surface WHY it died (bad args,
+   * unsupported codec, disk full) instead of a bare "encoder exited" message.
+   */
+  getExitError: () => string | undefined;
 }
 
 /**
@@ -159,6 +196,7 @@ export function buildStreamingArgs(
     quality = 23,
     bitrate,
     pixelFormat = "yuv420p",
+    vp9CpuUsed,
     useGpu = false,
     imageFormat = "jpeg",
   } = options;
@@ -300,6 +338,7 @@ export function buildStreamingArgs(
     args.push("-c:v", "libvpx-vp9", "-b:v", bitrate || "0", "-crf", String(quality));
     args.push("-deadline", preset === "ultrafast" ? "realtime" : "good");
     args.push("-row-mt", "1");
+    appendVp9CpuUsedArg(args, vp9CpuUsed);
     if (pixelFormat === "yuva420p") {
       args.push("-auto-alt-ref", "0");
       args.push("-metadata:s:v:0", "alpha_mode=1");
@@ -345,13 +384,32 @@ export function buildStreamingArgs(
     if (options.rawInputFormat) {
       // No filter needed — PQ data goes straight to encoder
     } else if (gpuEncoder === "vaapi") {
+      // vaapi already runs `format=nv12,hwupload`; the nv12 conversion aligns
+      // odd dimensions before upload, so only prepend the range conversion.
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
         args[vfIdx + 1] = `scale=in_range=pc:out_range=tv,${args[vfIdx + 1]}`;
       }
-    } else if (!shouldUseGpu) {
-      // Range conversion: Chrome screenshots are full-range RGB.
-      args.push("-vf", "scale=in_range=pc:out_range=tv");
+    } else if (shouldUseGpu) {
+      // nvenc/videotoolbox/qsv/amf feed software frames straight to the HW
+      // encoder with no `-vf`. They hit the same "height not divisible by 2"
+      // abort as libx264 on an odd-sized 4:2:0 canvas, so pad odd dimensions
+      // up to even on the software side before the encode.
+      const vf = withEvenDimensionPad("", pixelFormat, options.width, options.height);
+      if (vf) args.push("-vf", vf);
+    } else {
+      // Range conversion: Chrome screenshots are full-range RGB. Pad odd
+      // dimensions up to even so libx264/libx265 (4:2:0) don't abort with
+      // "height not divisible by 2" on an odd-sized composition canvas.
+      args.push(
+        "-vf",
+        withEvenDimensionPad(
+          "scale=in_range=pc:out_range=tv",
+          pixelFormat,
+          options.width,
+          options.height,
+        ),
+      );
     }
 
     // Fixed timescale for consistent A/V timing across platforms.
@@ -583,6 +641,11 @@ export async function spawnStreamingEncoder(
     },
 
     getExitStatus: () => exitStatus,
+
+    getExitError: () => {
+      if (exitStatus !== "error") return undefined;
+      return formatFfmpegError(exitCode, stderr);
+    },
   };
 
   return encoder;

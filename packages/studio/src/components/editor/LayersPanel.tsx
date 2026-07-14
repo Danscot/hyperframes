@@ -7,13 +7,15 @@ import {
 } from "./domEditing";
 import { useStudioPlaybackContext, useStudioShellContext } from "../../contexts/StudioContext";
 import { useDomEditContext } from "../../contexts/DomEditContext";
-import { usePlayerStore } from "../../player";
+import { usePlayerStore, liveTime } from "../../player";
 import {
   findMatchingTimelineElementId,
   resolveTimelineSelectionSeekTime,
 } from "../../utils/studioHelpers";
 import { Layers } from "../../icons/SystemIcons";
 import { useLayerDrag, isLayerDraggable, type LayerReorderEvent } from "./useLayerDrag";
+import { computeReorderZValues, getElementZIndex } from "../../player/lib/layerOrdering";
+import { deriveTimelineStoreKey } from "../../player/lib/timelineElementHelpers";
 
 const TAG_ICONS: Record<string, string> = {
   video: "Vi",
@@ -48,6 +50,34 @@ function isCompositionHost(el: HTMLElement): boolean {
   return el.hasAttribute("data-composition-src") || el.hasAttribute("data-composition-file");
 }
 
+/**
+ * A trailing-rAF + cooldown throttle: `invoke` runs `run` at most once per
+ * animation frame and no more often than `throttleMs`. `cancel` clears any
+ * pending frame (call on cleanup). Extracted so the throttle can be exercised
+ * directly in tests instead of being reconstructed there.
+ */
+export function createRafThrottle(
+  run: () => void,
+  throttleMs = 100,
+): { invoke: () => void; cancel: () => void } {
+  let rafId: number | null = null;
+  let lastFired = 0;
+  return {
+    invoke: () => {
+      const now = performance.now();
+      if (rafId !== null || now - lastFired < throttleMs) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        lastFired = performance.now();
+        run();
+      });
+    },
+    cancel: () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    },
+  };
+}
+
 interface CollapsedState {
   [key: string]: boolean;
 }
@@ -59,9 +89,11 @@ export const LayersPanel = memo(function LayersPanel() {
   const currentTime = usePlayerStore((s) => s.currentTime);
   const {
     domEditSelection,
+    activeGroupElement,
     applyDomSelection,
     updateDomEditHoverSelection,
     handleDomZIndexReorderCommit,
+    setActiveGroupElement,
   } = useDomEditContext();
 
   const [layers, setLayers] = useState<DomEditLayerItem[]>([]);
@@ -86,12 +118,16 @@ export const LayersPanel = memo(function LayersPanel() {
       doc.querySelector<HTMLElement>("[data-composition-id]") ?? doc.documentElement ?? null;
     if (!root) return;
 
+    // A preview reload detaches the drilled-into wrapper; exit drill-in if so.
+    if (activeGroupElement && !activeGroupElement.isConnected) setActiveGroupElement(null);
+
     const items = collectDomEditLayerItems(root, {
       activeCompositionPath: activeCompPath,
       isMasterView,
+      activeGroupElement,
     });
     setLayers(sortLayersByZIndex(items));
-  }, [previewIframeRef, activeCompPath, isMasterView]);
+  }, [previewIframeRef, activeCompPath, isMasterView, activeGroupElement, setActiveGroupElement]);
 
   useEffect(() => {
     collectLayers();
@@ -115,6 +151,20 @@ export const LayersPanel = memo(function LayersPanel() {
     }
   }, [compositionLoading, collectLayers]);
 
+  // Subscribe to liveTime so the panel refreshes during scrubbing.
+  // liveTime bypasses React state (no re-renders per frame), so a plain
+  // usePlayerStore(s => s.currentTime) subscription never fires while the
+  // RAF loop is running.  Throttle with a trailing rAF + 100 ms cooldown to
+  // avoid a collectLayers call on every animation frame.
+  useEffect(() => {
+    const throttle = createRafThrottle(collectLayers, 100);
+    const unsubscribe = liveTime.subscribe(throttle.invoke);
+    return () => {
+      unsubscribe();
+      throttle.cancel();
+    };
+  }, [collectLayers]);
+
   const resolveSelection = useCallback(
     (layer: DomEditLayerItem) => {
       // Re-find the element from the live DOM — layer.element may be stale
@@ -126,7 +176,7 @@ export const LayersPanel = memo(function LayersPanel() {
         if (doc) {
           const found =
             (layer.id ? doc.getElementById(layer.id) : null) ??
-            (layer.hfId ? doc.querySelector(`[data-hf-id="${layer.hfId}"]`) : null) ??
+            (layer.hfId ? doc.querySelector(`[data-hf-id="${CSS.escape(layer.hfId)}"]`) : null) ??
             doc.getElementById(layer.key);
           if (found instanceof HTMLElement) el = found;
         }
@@ -135,9 +185,10 @@ export const LayersPanel = memo(function LayersPanel() {
         activeCompositionPath: activeCompPath,
         isMasterView,
         preferClipAncestor: false,
+        activeGroupElement,
       });
     },
-    [activeCompPath, isMasterView, previewIframeRef],
+    [activeCompPath, isMasterView, previewIframeRef, activeGroupElement],
   );
 
   const seekToLayer = useCallback(
@@ -183,6 +234,19 @@ export const LayersPanel = memo(function LayersPanel() {
     [resolveSelection, applyDomSelection, seekToLayer],
   );
 
+  // Double-click a group row → drill into it; any other row → select it.
+  const handleLayerDoubleClick = useCallback(
+    async (layer: DomEditLayerItem) => {
+      const selection = await resolveSelection(layer);
+      if (selection?.element.hasAttribute("data-hf-group")) {
+        setActiveGroupElement(selection.element);
+      } else {
+        await handleSelectLayer(layer);
+      }
+    },
+    [resolveSelection, setActiveGroupElement, handleSelectLayer],
+  );
+
   const handleLayerHover = useCallback(
     async (layer: DomEditLayerItem | null) => {
       if (!layer) {
@@ -208,9 +272,7 @@ export const LayersPanel = memo(function LayersPanel() {
       reordered.splice(toIndex, 0, moved);
 
       const existingValues = siblingLayers.map((l) => getElementZIndex(l.element));
-      const sorted = [...existingValues].sort((a, b) => b - a);
-      const hasDupes = sorted.some((v, i) => i > 0 && v === sorted[i - 1]);
-      const zValues = hasDupes ? reordered.map((_, i) => reordered.length - i) : sorted;
+      const zValues = computeReorderZValues(existingValues, fromIndex, toIndex);
 
       const entries = reordered.map((layer, i) => ({
         element: layer.element,
@@ -219,9 +281,17 @@ export const LayersPanel = memo(function LayersPanel() {
         selector: layer.selector,
         selectorIndex: layer.selectorIndex,
         sourceFile: layer.sourceFile,
+        key: deriveTimelineStoreKey({
+          domId: layer.id,
+          selector: layer.selector,
+          selectorIndex: layer.selectorIndex,
+          sourceFile: layer.sourceFile,
+        }),
       }));
 
-      handleDomZIndexReorderCommit(entries);
+      // "layer-drag" keeps consecutive drops of the same sibling set coalescing
+      // into one undo step, without merging with a context-menu z action.
+      handleDomZIndexReorderCommit(entries, undefined, "layer-drag");
     },
     [handleDomZIndexReorderCommit],
   );
@@ -271,6 +341,18 @@ export const LayersPanel = memo(function LayersPanel() {
         onPointerUp={handleContainerPointerUp}
         onPointerCancel={handleContainerPointerUp}
       >
+        {activeGroupElement && (
+          <button
+            type="button"
+            onClick={() => setActiveGroupElement(null)}
+            className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px] text-panel-text-3 hover:bg-panel-hover/40 hover:text-panel-text-1"
+          >
+            <span aria-hidden="true">←</span>
+            <span className="truncate">
+              {activeGroupElement.getAttribute("data-hf-group") || "Group"}
+            </span>
+          </button>
+        )}
         {visibleLayers.map((layer, index) => {
           const selected = layer.key === selectedKey;
           const isDragged = layer.key === dragKey;
@@ -286,6 +368,7 @@ export const LayersPanel = memo(function LayersPanel() {
               role="button"
               tabIndex={0}
               onClick={() => !dragKey && handleSelectLayer(layer)}
+              onDoubleClick={() => !dragKey && handleLayerDoubleClick(layer)}
               onPointerDown={(e) => handleRowPointerDown(index, e)}
               onPointerEnter={() => !dragKey && handleLayerHover(layer)}
               onKeyDown={(e) => {
@@ -354,25 +437,6 @@ export const LayersPanel = memo(function LayersPanel() {
 });
 
 // ── Pure helpers ──────────────────────────────────────────────────────
-
-// fallow-ignore-next-line complexity
-function getElementZIndex(element: HTMLElement): number {
-  try {
-    const inline = element.style?.zIndex;
-    if (inline && inline !== "auto") {
-      const parsed = parseInt(inline, 10);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    const win = element.ownerDocument?.defaultView;
-    if (!win) return 0;
-    const value = win.getComputedStyle(element).zIndex;
-    if (value === "auto" || value === "") return 0;
-    const parsed = parseInt(value, 10);
-    return Number.isFinite(parsed) ? parsed : 0;
-  } catch {
-    return 0;
-  }
-}
 
 // fallow-ignore-next-line complexity
 export function sortLayersByZIndex(layers: DomEditLayerItem[]): DomEditLayerItem[] {

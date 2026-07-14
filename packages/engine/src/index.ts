@@ -40,10 +40,26 @@ export type {
   CaptureResult,
   CaptureBufferResult,
   CapturePerfSummary,
+  CaptureWarning,
+  CaptureWarningCode,
+  SubTimelineWaitOutcome,
 } from "./types.js";
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-export { resolveConfig, DEFAULT_CONFIG, type EngineConfig } from "./config.js";
+export {
+  resolveConfig,
+  DEFAULT_CONFIG,
+  scaleProtocolTimeoutForComposition,
+  shouldClampToScreenshotForConcreteGpu,
+  applyConcreteGpuScreenshotClamp,
+  type EngineConfig,
+} from "./config.js";
+export {
+  DEFAULT_VP9_CPU_USED,
+  MAX_VP9_CPU_USED,
+  MIN_VP9_CPU_USED,
+  normalizeVp9CpuUsed,
+} from "./services/vp9Options.js";
 export {
   getSystemTotalMb,
   isLowMemorySystem,
@@ -71,11 +87,20 @@ export {
   closeCaptureSession,
   captureFrame,
   captureFrameToBuffer,
+  captureFrameToBufferPipelined,
+  captureFramesBatchPipelined,
+  DrawElementVerificationError,
+  isDrawElementVerificationError,
+  recaptureDrawElementFrameForVerify,
+  completeDeferredDrawElementInit,
+  writeCapturedFrame,
   discardWarmupCapture,
   getCompositionDuration,
   getCapturePerfSummary,
   prepareCaptureSessionForReuse,
   type CaptureSession,
+  isTransientBrowserError,
+  isMemoryExhaustionError,
   type BeforeCaptureHook,
   type DiscardWarmupInnerCapture,
 } from "./services/frameCapture.js";
@@ -88,6 +113,7 @@ export {
   injectVideoFramesBatch,
   syncVideoFrameVisibility,
   cdpSessionCache,
+  probeBeginFrameLiveness,
   initTransparentBackground,
   captureAlphaPng,
   applyDomLayerMask,
@@ -129,12 +155,16 @@ export {
   getFrameAtTime,
   createFrameLookupTable,
   FrameLookupTable,
+  analyzeClipMediaFit,
   type VideoElement,
   type ImageElement,
   type ExtractedFrames,
   type ExtractionOptions,
   type ExtractionResult,
   type ExtractionPhaseBreakdown,
+  type VideoFrameFormat,
+  VIDEO_FRAME_FORMATS,
+  isVideoFrameFormat,
 } from "./services/videoFrameExtractor.js";
 
 export { createVideoFrameInjector } from "./services/videoFrameInjector.js";
@@ -151,6 +181,7 @@ export type {
 export {
   calculateOptimalWorkers,
   distributeFrames,
+  distributeFramesInterleaved,
   executeParallelCapture,
   mergeWorkerFrames,
   getSystemResources,

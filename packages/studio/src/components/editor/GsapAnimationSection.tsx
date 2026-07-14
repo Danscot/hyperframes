@@ -1,37 +1,16 @@
 import { memo, useState } from "react";
-import type { ArcPathSegment, GsapAnimation } from "@hyperframes/core/gsap-parser";
+import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import { Film } from "../../icons/SystemIcons";
 import { Section } from "./propertyPanelPrimitives";
 import { ADD_METHODS, ADD_METHOD_LABELS, METHOD_TOOLTIPS } from "./gsapAnimationConstants";
 import { AnimationCard } from "./AnimationCard";
+import type { GsapAnimationEditCallbacks } from "./gsapAnimationCallbacks";
 
-interface GsapAnimationSectionProps {
+interface GsapAnimationSectionProps extends GsapAnimationEditCallbacks {
   animations: GsapAnimation[];
   multipleTimelines?: boolean;
   unsupportedTimelinePattern?: boolean;
-  onUpdateProperty: (animationId: string, property: string, value: number | string) => void;
-  onUpdateMeta: (
-    animationId: string,
-    updates: { duration?: number; ease?: string; position?: number },
-  ) => void;
-  onDeleteAnimation: (animationId: string) => void;
-  onAddProperty: (animationId: string, property: string) => void;
-  onRemoveProperty: (animationId: string, property: string) => void;
-  onUpdateFromProperty?: (animationId: string, property: string, value: number | string) => void;
-  onAddFromProperty?: (animationId: string, property: string) => void;
-  onRemoveFromProperty?: (animationId: string, property: string) => void;
   onAddAnimation: (method: "to" | "from" | "set" | "fromTo") => void;
-  onLivePreview?: (property: string, value: number | string) => void;
-  onLivePreviewEnd?: () => void;
-  onSetArcPath?: (
-    animationId: string,
-    config: { enabled: boolean; autoRotate?: boolean | number; segments?: ArcPathSegment[] },
-  ) => void;
-  onUpdateArcSegment?: (
-    animationId: string,
-    segmentIndex: number,
-    update: Partial<ArcPathSegment>,
-  ) => void;
 }
 
 export const GsapAnimationSection = memo(function GsapAnimationSection({
@@ -51,6 +30,9 @@ export const GsapAnimationSection = memo(function GsapAnimationSection({
   onLivePreviewEnd,
   onSetArcPath,
   onUpdateArcSegment,
+  onUpdateKeyframeEase,
+  onSetAllKeyframeEases,
+  onUnroll,
 }: GsapAnimationSectionProps) {
   const [addMenuOpen, setAddMenuOpen] = useState(false);
 
@@ -64,9 +46,9 @@ export const GsapAnimationSection = memo(function GsapAnimationSection({
       )}
       {unsupportedTimelinePattern && (
         <p className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-400">
-          This composition uses a timeline assignment pattern (window.__timelines[...]) that the
-          editor doesn&apos;t support. Use a variable declaration (const tl = gsap.timeline()) to
-          enable editing.
+          This timeline uses a computed key (window.__timelines[variable]) the editor can&apos;t
+          resolve statically. Use a string-literal key (window.__timelines[&quot;id&quot;]) or a
+          variable declaration (const tl = gsap.timeline()) to enable editing.
         </p>
       )}
       {multipleTimelines || unsupportedTimelinePattern ? null : (
@@ -88,6 +70,9 @@ export const GsapAnimationSection = memo(function GsapAnimationSection({
               onLivePreviewEnd={onLivePreviewEnd}
               onSetArcPath={onSetArcPath}
               onUpdateArcSegment={onUpdateArcSegment}
+              onUpdateKeyframeEase={onUpdateKeyframeEase}
+              onSetAllKeyframeEases={onSetAllKeyframeEases}
+              onUnroll={onUnroll}
             />
           ))}
 

@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication
 import { memo, useState, useCallback, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { useBlockCatalog } from "../../hooks/useBlockCatalog";
@@ -9,6 +10,7 @@ import {
 import { usePlayerStore } from "../../player";
 import { formatTime } from "../../player/lib/time";
 import { useStudioShellContext } from "../../contexts/StudioContext";
+import { TIMELINE_BLOCK_MIME } from "../../utils/timelineAssetDrop";
 export interface BlockPreviewInfo {
   videoUrl?: string;
   posterUrl?: string;
@@ -234,7 +236,7 @@ function buildAgentPrompt(
     captions: [
       `Using /hyperframes, add the "${title}" caption style (registry: ${name}) to my composition.`,
       `${description}`,
-      `Transcribe the audio with /hyperframes-media, then wire the transcript into this caption component. Match the font colors and animation timing to my composition's design tokens. Place it as an overlay above the main content with the highest z-index.`,
+      `Transcribe the audio with /media-use, then wire the transcript into this caption component. Match the font colors and animation timing to my composition's design tokens. Place it as an overlay above the main content with the highest z-index.`,
     ].join("\n\n"),
     vfx: [
       `Using /hyperframes, add the "${title}" VFX (registry: ${name}) as a full-screen overlay on my composition.`,
@@ -382,10 +384,16 @@ function BlockCard({
   return (
     <div
       className="group/card rounded-md overflow-hidden cursor-pointer transition-colors bg-neutral-900 hover:bg-neutral-800"
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData(TIMELINE_BLOCK_MIME, JSON.stringify({ name }));
+        e.dataTransfer.setData("text/plain", name);
+        handleLeave(); // cancel the hover-preview timer so it doesn't fire mid-drag
+      }}
       onPointerEnter={handleEnter}
       onPointerLeave={handleLeave}
     >
-      {/* Thumbnail */}
       <div className="aspect-video w-full overflow-hidden relative">
         {hovered && videoUrl ? (
           <video

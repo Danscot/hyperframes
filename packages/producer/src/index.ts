@@ -11,10 +11,15 @@ export {
   createRenderJob,
   executeRenderJob,
   RenderCancelledError,
+  RenderQualityError,
+  applyRenderWarningPolicy,
   type RenderConfig,
   type RenderConfigInput,
   type RenderJob,
   type RenderStatus,
+  type RenderOutcome,
+  type RenderStrictness,
+  type RenderWarning,
   type RenderPerfSummary,
   type ProgressCallback,
 } from "./services/renderOrchestrator.js";
@@ -26,6 +31,15 @@ export {
   type RenderObservationEvent,
   type RenderObservationStatus,
 } from "./services/render/observability.js";
+
+// ── HTML asset localization ─────────────────────────────────────────────────
+// Rewrite remote <img>/<video>/<audio>/@font-face to same-origin local paths
+// before capture. Shared by render and `validate` so both resolve assets alike.
+export {
+  localizeRemoteMediaSources,
+  localizeRemoteImageSources,
+  localizeRemoteFontFaces,
+} from "./services/htmlCompiler.js";
 
 // ── Frame capture (lower-level) ─────────────────────────────────────────────
 export {
@@ -77,6 +91,15 @@ export {
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 export { normalizeErrorMessage } from "./utils/errorMessage.js";
+// Font localization: fetch + embed @font-face rules for requested families
+// (including those declared only via a remote <link>) so a bundled composition
+// renders with the real font instead of a fallback, regardless of network
+// timing. The render pipeline runs this in its compile stage; the CLI audit
+// paths (snapshot/check) reuse it so their captures match the render.
+export {
+  injectDeterministicFontFaces,
+  type InjectDeterministicFontFacesOptions,
+} from "./services/deterministicFonts.js";
 export { quantizeTimeToFrame } from "./utils/parityContract.js";
 export { resolveRenderPaths, type RenderPaths } from "./utils/paths.js";
 

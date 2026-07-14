@@ -1,4 +1,4 @@
-// fallow-ignore-file unused-file
+// fallow-ignore-file unused-file complexity
 /**
  * HyperFrames early stub — injected at the very start of `<head>` before any
  * other scripts run. Compiled to an IIFE by scripts/build-hf-early-stub.ts.
@@ -127,6 +127,16 @@ const activeProxies: TimelineProxy[] = [];
 const pendingOperations: TimelineOperation[] = [];
 let batchScheduled = false;
 let publishCheckScheduled = false;
+/**
+ * Tween targets animated with 3D transform vars (rotationX / rotationY /
+ * transformPerspective). drawElementImage cannot paint 3D transforms — the
+ * engine's threeDProjection module re-projects these elements via WebGL and
+ * reads this list at init to find targets whose transform is still flat at
+ * t=0 (to()-style tweens never show up in a computed-style scan). Exposed as
+ * window.__hf3dTweenTargets. rotationZ/rotation stay 2D and are not
+ * recorded; a bare `z` without perspective has no visual effect.
+ */
+const threeDTweenTargets = new Set<unknown>();
 
 function requestBatchFrame(callback: FrameRequestCallback): number {
   const originalRequestAnimationFrame = window.__HF_VIRTUAL_TIME__?.originalRequestAnimationFrame;
@@ -158,6 +168,52 @@ function unwrapTimelineArg(arg: unknown): unknown {
   return arg;
 }
 
+/**
+ * Record tween targets (3D + all-targets) from a tween call's args so the
+ * engine's 3D projection and at-risk scans can see to()-style tweens whose
+ * computed style is still flat/opaque at t=0. Pure observer — tween args are
+ * NEVER modified on their way to GSAP.
+ *
+ * (The former fast-capture opacity → autoAlpha rewrite that lived here was
+ * removed: it existed for crbug 521861819 — fixed in Chrome 151, the pinned
+ * floor — and the rewrite itself measured ~28 dB of damage on comps whose
+ * fades it touched. drawElementImage now captures animated opacity correctly
+ * when the capture is synchronized via canvas.requestPaint(); see the
+ * engine's drawElementService.)
+ */
+function observeTweenCall(method: TimelineOperationMethod, args: unknown[]): void {
+  if (method !== "add") recordThreeDTweenTarget(args);
+}
+
+function varsHasThreeD(vars: unknown): boolean {
+  if (vars === null || typeof vars !== "object" || Array.isArray(vars)) return false;
+  const record = vars as Record<string, unknown>;
+  return "rotationX" in record || "rotationY" in record || "transformPerspective" in record;
+}
+
+/** Every tween target, regardless of vars — the 3D projection's quad
+ * textures are rasterized once at init, so any GSAP-animated element inside
+ * a quad's subtree makes that quad unprojectable (the engine falls back). */
+const allTweenTargets = new Set<unknown>();
+
+// fallow-ignore-next-line complexity
+function recordThreeDTweenTarget(args: unknown[]): void {
+  const target = args[0];
+  if (target === null || target === undefined) return;
+  const w = window as Window & {
+    __hf3dTweenTargets?: unknown[];
+    __hfAllTweenTargets?: unknown[];
+  };
+  if (!allTweenTargets.has(target)) {
+    allTweenTargets.add(target);
+    w.__hfAllTweenTargets = Array.from(allTweenTargets);
+  }
+  if (varsHasThreeD(args[1]) || varsHasThreeD(args[2])) {
+    threeDTweenTargets.add(target);
+    w.__hf3dTweenTargets = Array.from(threeDTweenTargets);
+  }
+}
+
 function applyTimelineOperation(entry: TimelineOperation): void {
   const real = entry.proxy.__hfReal;
   const fn = real[entry.method];
@@ -172,6 +228,7 @@ function enqueueTimelineOperation(
   method: TimelineOperationMethod,
   args: unknown[],
 ): TimelineProxy {
+  observeTweenCall(method, args);
   const entry = { proxy, method, args };
   proxy.__hfQueue.push(entry);
   pendingOperations.push(entry);
@@ -391,6 +448,17 @@ function wrapTimeline(real: GsapTimeline): TimelineProxy {
 if (typeof window !== "undefined") {
   if (!window.__hf) window.__hf = {};
   window.__hfTimelinesBuilding = false;
+  // Expose a synchronous flush so headless renderers can drain the queue
+  // instantly instead of waiting for rAF-based batch ticks. Also force-
+  // publishes the "timelines built" signal immediately (normally deferred
+  // via setTimeout(0)) — the caller guarantees page scripts have finished
+  // loading, so no more operations can arrive after the flush.
+  (window as Record<string, unknown>).__hfFlushSync = () => {
+    flushPendingOperations();
+    if (pendingOperations.length === 0 && window.__hfTimelinesBuilding) {
+      publishTimelinesBuilt();
+    }
+  };
 
   // Intercept window.gsap assignment via a property trap so we can wrap
   // `gsap.timeline()` before any user script calls it. GSAP is not yet
@@ -408,6 +476,26 @@ if (typeof window !== "undefined") {
         if (!g || typeof g.timeline !== "function") return;
         const origTimeline = g.timeline.bind(g) as (params?: unknown) => GsapTimeline;
         g.timeline = (params?: unknown): GsapTimeline => wrapTimeline(origTimeline(params));
+        // Tween-target tracking for top-level gsap.to/from/set/fromTo calls
+        // (compositions often use `gsap.set(el, { opacity: 0 })` for initial
+        // state — the timeline proxy never sees those).
+        for (const method of ["to", "from", "set"] as const) {
+          const orig = g[method];
+          if (typeof orig !== "function") continue;
+          const bound = (orig as (...a: unknown[]) => unknown).bind(g);
+          g[method] = (...args: unknown[]): unknown => {
+            observeTweenCall(method, args);
+            return bound(...args);
+          };
+        }
+        const origFromTo = g.fromTo;
+        if (typeof origFromTo === "function") {
+          const bound = (origFromTo as (...a: unknown[]) => unknown).bind(g);
+          g.fromTo = (...args: unknown[]): unknown => {
+            observeTweenCall("fromTo", args);
+            return bound(...args);
+          };
+        }
       },
     });
   } catch {

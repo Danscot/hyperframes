@@ -167,9 +167,14 @@ describe("buildDockerRunArgs", () => {
         browserGpu: false,
         hdrMode: "force-hdr",
         crf: 16,
+        vp9CpuUsed: 2,
         videoBitrate: undefined,
+        videoFrameFormat: "png",
         quiet: true,
+        debug: true,
+        bestEffort: false,
         entryFile: "compositions/intro.html",
+        experimentalFastCapture: true,
       },
     });
     // Each value must reach the container exactly once. If a future option
@@ -181,12 +186,51 @@ describe("buildDockerRunArgs", () => {
     expect(args).toContain("8");
     expect(args).toContain("--crf");
     expect(args).toContain("16");
+    expect(args).toContain("--vp9-cpu-used");
+    expect(args).toContain("2");
+    expect(args).toContain("--video-frame-format");
+    expect(args).toContain("png");
     expect(args).toContain("--quiet");
+    expect(args).toContain("--debug");
+    expect(args).toContain("--no-best-effort");
     expect(args).toContain("--gpu");
     expect(args).toContain("--no-browser-gpu");
     expect(args).toContain("--hdr");
     expect(args).toContain("--composition");
     expect(args).toContain("compositions/intro.html");
+    expect(args).toContain("--experimental-fast-capture");
+  });
+
+  it("forwards only an explicit strict-readiness opt-in", () => {
+    const compatible = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, bestEffort: true },
+    });
+    expect(compatible).not.toContain("--best-effort");
+    expect(compatible).not.toContain("--no-best-effort");
+
+    const strict = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, bestEffort: false },
+    });
+    expect(strict).toContain("--no-best-effort");
+  });
+
+  it("forwards --experimental-fast-capture only when enabled", () => {
+    const on = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, experimentalFastCapture: true },
+    });
+    expect(on).toContain("--experimental-fast-capture");
+
+    const off = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, experimentalFastCapture: false },
+    });
+    expect(off).not.toContain("--experimental-fast-capture");
+
+    const absent = buildDockerRunArgs({ ...FIXED_INPUT, options: BASE });
+    expect(absent).not.toContain("--experimental-fast-capture");
   });
 
   it("forwards --format png-sequence to the container", () => {
@@ -222,6 +266,27 @@ describe("buildDockerRunArgs", () => {
     expect(args).toContain("--video-bitrate");
     expect(args).toContain("10M");
     expect(args).not.toContain("--crf");
+  });
+
+  it("forwards --video-frame-format to the container when set to png", () => {
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, videoFrameFormat: "png" },
+    });
+    expect(args).toContain("--video-frame-format");
+    expect(args).toContain("png");
+  });
+
+  it("omits --video-frame-format when it is auto or unset", () => {
+    expect(buildDockerRunArgs({ ...FIXED_INPUT, options: BASE })).not.toContain(
+      "--video-frame-format",
+    );
+    expect(
+      buildDockerRunArgs({
+        ...FIXED_INPUT,
+        options: { ...BASE, videoFrameFormat: "auto" },
+      }),
+    ).not.toContain("--video-frame-format");
   });
 
   it("forwards --variables JSON to the container when set", () => {
@@ -323,6 +388,18 @@ describe("buildDockerRunArgs", () => {
       options: { ...BASE, pageSideCompositing: false },
     });
     expect(args).toContain("--no-page-side-compositing");
+  });
+
+  it("keeps Docker debug artifacts under the mounted output directory", () => {
+    const args = buildDockerRunArgs({
+      ...FIXED_INPUT,
+      options: { ...BASE, debug: true },
+    });
+    const envIdx = args.indexOf("PRODUCER_RENDERS_DIR=/output/renders");
+    const imageIdx = args.indexOf(FIXED_INPUT.imageTag);
+    expect(envIdx).toBeGreaterThan(-1);
+    expect(envIdx).toBeLessThan(imageIdx);
+    expect(args).toContain("--debug");
   });
 
   it("omits --no-page-side-compositing when pageSideCompositing is not explicitly false", () => {

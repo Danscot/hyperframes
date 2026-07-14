@@ -19,8 +19,19 @@ import {
   isRuntimeDurationAdapter,
 } from "./timeline-adapters.js";
 
+declare const __HYPERFRAMES_RUNTIME_CDN_URL__: string;
+
+export function runtimeCdnUrlForVersion(version: string): string {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`Invalid HyperFrames runtime version: ${version}`);
+  }
+  return `https://cdn.jsdelivr.net/npm/@hyperframes/core@${version}/dist/hyperframe.runtime.iife.js`;
+}
+
 const RUNTIME_CDN_URL =
-  "https://cdn.jsdelivr.net/npm/@hyperframes/core/dist/hyperframe.runtime.iife.js";
+  typeof __HYPERFRAMES_RUNTIME_CDN_URL__ === "string"
+    ? __HYPERFRAMES_RUNTIME_CDN_URL__
+    : runtimeCdnUrlForVersion("0.0.0-dev");
 
 export interface ProbeResult {
   duration: number;
@@ -36,7 +47,15 @@ export interface ProbeCallbacks {
   onRuntimeInjected?: () => void;
 }
 
-function readPositiveDimension(value: string | null): number | null {
+/**
+ * Parse a composition dimension, rejecting anything that isn't a positive
+ * finite number. Exported because the `width`/`height` attribute handlers in
+ * hyperframes-player.ts need the same guard: dimensions feed
+ * scaleIframeToFit's `w / compositionWidth` division, where NaN produces an
+ * invalid `scale(NaN)` transform and zero a division by zero — both render
+ * the player blank with no signal.
+ */
+export function readPositiveDimension(value: string | null): number | null {
   if (value === null) return null;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;

@@ -15,6 +15,7 @@ import {
   getSelectorIndex,
   getSourceFileForElement,
   isHtmlElement,
+  isElementVisibleThroughAncestors,
   normalizeTimelineCompositionSource,
   querySelectorAllSafely,
 } from "./domEditingDom";
@@ -22,21 +23,12 @@ import {
 // ─── Visibility ──────────────────────────────────────────────────────────────
 
 export function isElementComputedVisible(el: HTMLElement): boolean {
-  const win = el.ownerDocument.defaultView;
-  if (!win) return true;
-  let current: HTMLElement | null = el;
-  while (current) {
-    const computed = win.getComputedStyle(current);
-    if (computed.display === "none" || computed.visibility === "hidden") return false;
-    const opacity = Number.parseFloat(computed.opacity);
-    if (Number.isFinite(opacity) && opacity <= 0.01) return false;
-    current = current.parentElement;
-  }
-  return true;
+  return isElementVisibleThroughAncestors(el);
 }
 
 const VISUAL_LEAF_TAGS = new Set(["img", "video", "canvas", "svg", "audio"]);
 
+// fallow-ignore-next-line complexity
 function hasVisualPresence(el: HTMLElement): boolean {
   const win = el.ownerDocument.defaultView;
   if (!win) return false;
@@ -245,13 +237,17 @@ export function isLargeRasterDomEditSelection(
 
 // ─── Element finders ──────────────────────────────────────────────────────────
 
+type FindElementSelection = Pick<DomEditSelection, "id" | "hfId" | "selector" | "selectorIndex"> & {
+  sourceFile?: string;
+};
+
 export function findElementForSelection(
   doc: Document,
-  selection: Pick<DomEditSelection, "id" | "hfId" | "selector" | "selectorIndex" | "sourceFile">,
+  selection: FindElementSelection,
   activeCompositionPath: string | null = null,
 ): HTMLElement | null {
   if (selection.hfId) {
-    const byHfId = doc.querySelector(`[data-hf-id="${selection.hfId}"]`);
+    const byHfId = doc.querySelector(`[data-hf-id="${CSS.escape(selection.hfId)}"]`);
     if (isHtmlElement(byHfId)) return byHfId;
   }
 
@@ -268,6 +264,7 @@ export function findElementForSelection(
 
   if (!selection.selector) return null;
 
+  // fallow-ignore-next-line code-duplication
   if (selection.selector.startsWith(".") && selection.selectorIndex != null) {
     const matches = querySelectorAllSafely(doc, selection.selector).filter(
       (candidate): candidate is HTMLElement =>
@@ -279,6 +276,7 @@ export function findElementForSelection(
     return matches[selection.selectorIndex] ?? null;
   }
 
+  // fallow-ignore-next-line code-duplication
   const matches = querySelectorAllSafely(doc, selection.selector).filter(
     (candidate): candidate is HTMLElement =>
       isHtmlElement(candidate) &&

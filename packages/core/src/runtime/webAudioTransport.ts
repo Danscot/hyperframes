@@ -1,8 +1,59 @@
 import { swallow } from "./diagnostics";
+import { getDebugSurface } from "./globals.js";
 
 function normalizeRate(rate: number): number {
   if (!Number.isFinite(rate) || rate <= 0) return 1;
   return rate;
+}
+
+/**
+ * Breadcrumb for the per-element-mute handoff: the transport just claimed a track
+ * that was audibly playing through the HTMLMedia fallback. Quiet unless
+ * `__hfDebug` — a hook for diagnosing the race if it ever regresses.
+ */
+function logFallbackHandoff(el: HTMLMediaElement, priorMuted: boolean): void {
+  if (priorMuted || el.paused || !getDebugSurface().__hfDebug) return;
+  // eslint-disable-next-line no-console -- intentional debug surface
+  console.debug(
+    "[hyperframes] webAudioTransport claimed fallback-playing element:",
+    el.currentSrc || el.getAttribute("src") || "",
+  );
+}
+
+/**
+ * Start a buffer source, bounding it to the clip's authored window
+ * (`data-duration`) so a trimmed clip stops at its edge instead of running the
+ * buffer to the source file's natural end. `clipSourceLen` is the clip span in
+ * buffer seconds; the third `start()` arg is the portion to play from the
+ * offset. An infinite `clipDuration` plays unbounded (legacy behavior).
+ *
+ * Returns false when the playhead is already past the clip end (nothing to
+ * play); the caller should discard the source.
+ */
+function startBoundedSource(
+  node: AudioBufferSourceNode,
+  opts: {
+    elapsed: number;
+    mediaStart: number;
+    scheduledAt: number;
+    safeRate: number;
+    clipDuration: number;
+  },
+): boolean {
+  const { elapsed, mediaStart, scheduledAt, safeRate, clipDuration } = opts;
+  const hasBound = Number.isFinite(clipDuration) && clipDuration > 0;
+  const clipSourceLen = clipDuration * safeRate;
+  if (elapsed >= 0) {
+    const remaining = clipSourceLen - elapsed;
+    if (hasBound && remaining <= 0) return false;
+    if (hasBound) node.start(0, elapsed + mediaStart, remaining);
+    else node.start(0, elapsed + mediaStart);
+    return true;
+  }
+  const delay = -elapsed / safeRate;
+  if (hasBound) node.start(scheduledAt + delay, mediaStart, clipSourceLen);
+  else node.start(scheduledAt + delay, mediaStart);
+  return true;
 }
 
 export type ScheduledSource = {
@@ -13,6 +64,10 @@ export type ScheduledSource = {
   mediaStart: number;
   scheduledAt: number;
   priorMuted: boolean;
+  // The clip had a finite window, so start() was given a fixed duration in
+  // buffer-sample seconds. That bound can't be rescaled in place on a rate
+  // change — callers must stopAll()+reschedule (see hasBoundedActiveSources).
+  bounded: boolean;
 };
 
 export class WebAudioTransport {
@@ -56,14 +111,32 @@ export class WebAudioTransport {
     if (this._bufferCache.has(src)) return this._bufferCache.get(src)!;
     if (this._failedSrcs.has(src)) return null;
     if (!this._ctx) return null;
+
+    // Fetch the bytes. A network error or non-OK status (e.g. a 404 for an
+    // asset that simply has not been uploaded yet) is TRANSIENT — return null
+    // WITHOUT blacklisting, so the next play/seek generation retries once the
+    // asset becomes available. (Previously these were added to `_failedSrcs`,
+    // which is never cleared, permanently silencing a merely-late track.)
+    let arrayBuffer: ArrayBuffer;
     try {
-      const response = await fetch(src);
+      // `no-store`: a retry must actually re-request the asset — not replay a
+      // cached 404/stale response from the failed attempt that we chose not to
+      // blacklist.
+      const response = await fetch(src, { cache: "no-store" });
       if (!response.ok) {
-        this._failedSrcs.add(src);
         swallow("webAudioTransport.fetch", new Error(`${response.status} ${src}`));
         return null;
       }
-      const arrayBuffer = await response.arrayBuffer();
+      arrayBuffer = await response.arrayBuffer();
+    } catch (err) {
+      swallow("webAudioTransport.fetch", err);
+      return null;
+    }
+
+    // A decode failure means the bytes themselves are unusable (corrupt or an
+    // unsupported codec) — that IS permanent, so blacklist to avoid re-decoding
+    // the same bad payload on every generation.
+    try {
       const audioBuffer = await this._ctx.decodeAudioData(arrayBuffer);
       this._bufferCache.set(src, audioBuffer);
       return audioBuffer;
@@ -92,6 +165,7 @@ export class WebAudioTransport {
     volume: number,
     generation: number,
     rate = 1,
+    clipDuration = Number.POSITIVE_INFINITY,
   ): Promise<ScheduledSource | null> {
     if (!this._ctx || !this._masterGain) return null;
     if (generation !== this._playGeneration) return null;
@@ -119,15 +193,24 @@ export class WebAudioTransport {
       this._rateAnchorCtx = scheduledAt;
       this._rateAnchorComp = compositionTime;
 
-      if (elapsed >= 0) {
-        sourceNode.start(0, elapsed + mediaStart);
-      } else {
-        const delay = -elapsed / safeRate;
-        sourceNode.start(scheduledAt + delay, mediaStart);
+      if (
+        !startBoundedSource(sourceNode, {
+          elapsed,
+          mediaStart,
+          scheduledAt,
+          safeRate,
+          clipDuration,
+        })
+      ) {
+        // Playhead already past the clip end — discard the nodes we built.
+        sourceNode.disconnect();
+        gainNode.disconnect();
+        return null;
       }
 
       const priorMuted = el.muted;
       el.muted = true;
+      logFallbackHandoff(el, priorMuted);
 
       const scheduled: ScheduledSource = {
         el,
@@ -137,6 +220,7 @@ export class WebAudioTransport {
         mediaStart,
         scheduledAt,
         priorMuted,
+        bounded: Number.isFinite(clipDuration) && clipDuration > 0,
       };
       this._activeSources.push(scheduled);
       this._paused = false;
@@ -163,9 +247,9 @@ export class WebAudioTransport {
    * start in the future keep their original wallclock start time — callers
    * that need rate-correct future starts should `stopAll()` and reschedule.
    */
-  setRate(rate: number): void {
+  setRate(rate: number): boolean {
     const safeRate = normalizeRate(rate);
-    if (safeRate === this._rate) return;
+    if (safeRate === this._rate) return false;
     if (this._ctx && !this._paused) {
       this._rateAnchorComp = this.getTime();
       this._rateAnchorCtx = this._ctx.currentTime;
@@ -178,6 +262,14 @@ export class WebAudioTransport {
         swallow("webAudioTransport.setRate", err);
       }
     }
+    return true;
+  }
+
+  // A bounded source's wall-clock duration was baked into start()'s duration
+  // arg at its original rate; a later rate change can't rescale it in place, so
+  // the caller must stopAll()+reschedule to keep trimmed clips ending on time.
+  hasBoundedActiveSources(): boolean {
+    return this._activeSources.some((s) => s.bounded);
   }
 
   stopAll(): void {
@@ -223,9 +315,16 @@ export class WebAudioTransport {
     return this._activeSources.length > 0 && !this._paused;
   }
 
+  /** Whether the transport currently plays THIS element (the runtime mutes it to
+   *  avoid double audio; an unclaimed track stays audible). */
+  ownsElement(el: HTMLMediaElement): boolean {
+    return !this._paused && this._activeSources.some((s) => s.el === el);
+  }
+
   destroy(): void {
     this.stopAll();
     this._bufferCache.clear();
+    this._failedSrcs.clear();
     if (this._ctx) {
       try {
         void this._ctx.close();

@@ -76,6 +76,36 @@ interface ResolvedTransition {
 export const PAGE_COMPOSITOR_CANVAS_ID = "__hf-page-side-compositor";
 export const PAGE_COMPOSITOR_BUILD_CANARY = "__hf_page_compositor_v1__";
 
+export interface ClonePinStyle {
+  left: string;
+  top: string;
+  width: string;
+  height: string;
+}
+
+/**
+ * Style values to pin a cloned scene root to the box its source measured
+ * WHILE STILL LIVE in the document — never the composition's full pixel size.
+ * A live-document `getBoundingClientRect()` already resolves `inset:0` (and
+ * any authored explicit width/height) correctly against the real ancestor
+ * chain; reapplying that exact box to the clone fixes the 0x0 collapse a
+ * detached `inset:0` clone would otherwise have inside the staging canvas's
+ * layout subtree, without ever overriding an author's own sizing.
+ */
+export function clonePinStyleFor(rect: {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}): ClonePinStyle {
+  return {
+    left: `${rect.left}px`,
+    top: `${rect.top}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+  };
+}
+
 export function isPageSideCompositingSupported(): boolean {
   if (typeof window === "undefined" || typeof document === "undefined") return false;
   if (!isHtmlInCanvasCaptureSupported()) return false;
@@ -196,6 +226,16 @@ export function installPageSideCompositor(options: PageCompositorInstallOptions)
     return null;
   }
 
+  // Scene on screen at a non-transition time: after the last transition whose
+  // window has passed. Full transitions list so the index matches scene order.
+  function settledSceneIdAt(time: number): string | undefined {
+    let idx = 0;
+    for (const t of transitions) {
+      if (time >= t.time + (t.duration ?? defaultDuration)) idx += 1;
+    }
+    return scenes[Math.min(idx, scenes.length - 1)];
+  }
+
   let currentActive: ResolvedTransition | null = null;
   let currentProgress = 0;
 
@@ -222,10 +262,45 @@ export function installPageSideCompositor(options: PageCompositorInstallOptions)
       pWin.__hf_page_composite_pending = false;
       return false;
     }
+    // Measure each scene's rendered box WHILE STILL LIVE — a scene root sized
+    // only by `position:absolute; inset:0` resolves to 0x0 once cloned into
+    // the staging canvas's layout subtree (no containing-block dimensions
+    // there), and the transition textures blank out (wild report: explicit
+    // 1080x1920 anchors fixed both transitions). The live document already
+    // resolves inset:0 (and any authored explicit width/height) correctly
+    // against the real ancestor chain, so pinning the clone to THIS measured
+    // box fixes the collapse without ever overriding an author's own sizing.
+    const fromPin = clonePinStyleFor(fromEl.getBoundingClientRect());
+    const toPin = clonePinStyleFor(toEl.getBoundingClientRect());
+
     while (fromStaging.firstChild) fromStaging.removeChild(fromStaging.firstChild);
     while (toStaging.firstChild) toStaging.removeChild(toStaging.firstChild);
-    fromStaging.appendChild(fromEl.cloneNode(true));
-    toStaging.appendChild(toEl.cloneNode(true));
+    const fromClone = fromEl.cloneNode(true) as HTMLElement;
+    const toClone = toEl.cloneNode(true) as HTMLElement;
+    fromStaging.appendChild(fromClone);
+    toStaging.appendChild(toClone);
+
+    // cloneNode copies the GSAP opacity-fade (opacity:0 / hidden data-start), and
+    // Chrome won't paint hidden elements — drawElementImage then throws "No cached
+    // paint record" and the shader degrades to a hard cut. The shader blends from
+    // full-opacity textures via u_progress, so force the clones visible. Cf.
+    // forceSceneVisibleInClone (html2canvas path).
+    for (const [clone, pin] of [
+      [fromClone, fromPin],
+      [toClone, toPin],
+    ] as const) {
+      clone.style.opacity = "1";
+      clone.style.visibility = "visible";
+      clone.style.position = "absolute";
+      clone.style.left = pin.left;
+      clone.style.top = pin.top;
+      clone.style.width = pin.width;
+      clone.style.height = pin.height;
+      clone.querySelectorAll<HTMLElement>("[data-start]").forEach((el) => {
+        el.style.opacity = "1";
+        el.style.visibility = "visible";
+      });
+    }
 
     // Decode any data-URI images in clones so the browser has current
     // bitmaps before the micro-screenshot forces a paint pass.
@@ -326,6 +401,14 @@ export function installPageSideCompositor(options: PageCompositorInstallOptions)
         pWin.__hf_page_composite_pending = false;
         while (fromStaging.firstChild) fromStaging.removeChild(fromStaging.firstChild);
         while (toStaging.firstChild) toStaging.removeChild(toStaging.firstChild);
+        // Live-page screenshot parity with the layered path's forceVisible: the
+        // core clip runtime hides the final scene a beat before the comp ends, so
+        // un-hide the settled scene (others stay at opacity 0).
+        const settledId = settledSceneIdAt(time);
+        const settled = settledId ? document.getElementById(settledId) : null;
+        if (settled instanceof HTMLElement && settled.style.visibility === "hidden") {
+          settled.style.visibility = "visible";
+        }
         return result;
       }
       currentActive = active;

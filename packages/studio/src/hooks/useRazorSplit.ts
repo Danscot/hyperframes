@@ -3,11 +3,12 @@ import type { TimelineElement } from "../player";
 import { usePlayerStore } from "../player";
 import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
 import { getTimelineElementLabel, collectHtmlIds } from "../utils/studioHelpers";
+import { trackStudioRazorSplit } from "../telemetry/events";
 import {
-  canSplitElement,
+  canSplitElementAt,
+  selectSplittableElements,
   buildPatchTarget,
   readFileContent,
-  isSplitTimeWithinBounds,
 } from "../utils/timelineElementSplit";
 import type { RecordEditInput } from "./timelineEditingHelpers";
 
@@ -19,6 +20,14 @@ interface UseRazorSplitOptions {
   recordEdit: (input: RecordEditInput) => Promise<void>;
   domEditSaveTimestampRef: React.MutableRefObject<number>;
   reloadPreview: () => void;
+  /**
+   * Resync the in-memory SDK session after the server-side split write (the
+   * split-element / split-gsap endpoints write the file directly, so the SDK's
+   * linkedom doc is now stale). This reload is read-only; the split endpoint owns
+   * the final on-disk bytes and history baseline. Every other server-side-write
+   * timeline path (move / resize / delete / drop / visibility) also resyncs.
+   */
+  forceReloadSdkSession?: () => void;
   isRecordingRef?: React.RefObject<boolean>;
 }
 
@@ -37,13 +46,21 @@ async function splitHtmlElement(
   patchTarget: NonNullable<ReturnType<typeof buildPatchTarget>>,
   splitTime: number,
   newId: string,
+  elementStart: number,
+  elementDuration: number,
 ): Promise<{ ok: boolean; changed?: boolean; content?: string }> {
   const response = await fetch(
     `/api/projects/${projectId}/file-mutations/split-element/${encodeURIComponent(targetPath)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target: patchTarget, splitTime, newId }),
+      body: JSON.stringify({
+        target: patchTarget,
+        splitTime,
+        newId,
+        elementStart,
+        elementDuration,
+      }),
     },
   );
   if (!response.ok) throw new Error("Split request failed");
@@ -92,6 +109,62 @@ async function splitGsapAnimations(
   };
 }
 
+function getOriginalContent(originals: ReadonlyMap<string, string>, path: string): string {
+  const original = originals.get(path);
+  if (original === undefined) {
+    throw new Error(`Missing original contents for ${path}`);
+  }
+  return original;
+}
+
+async function restoreFilesToOriginal(
+  originals: ReadonlyMap<string, string>,
+  paths: Iterable<string>,
+  writeProjectFile: (path: string, content: string) => Promise<void>,
+): Promise<void> {
+  for (const path of paths) {
+    await writeProjectFile(path, getOriginalContent(originals, path));
+  }
+}
+
+async function readOriginalFiles(
+  pid: string,
+  elements: TimelineElement[],
+  activeCompPath: string | null,
+): Promise<Map<string, string>> {
+  const originals = new Map<string, string>();
+  for (const element of elements) {
+    const path = element.sourceFile || activeCompPath || "index.html";
+    if (!originals.has(path)) {
+      originals.set(path, await readFileContent(pid, path));
+    }
+  }
+  return originals;
+}
+
+async function splitElementsAtTime(
+  pid: string,
+  elements: TimelineElement[],
+  splitTime: number,
+  activeCompPath: string | null,
+  originals: ReadonlyMap<string, string>,
+  snapshots: Map<string, { before: string; after: string }>,
+  writeProjectFile: (path: string, content: string) => Promise<void>,
+): Promise<number> {
+  let count = 0;
+  for (const element of elements) {
+    const result = await executeSplit(pid, element, splitTime, activeCompPath, writeProjectFile);
+    if (!result.changed) continue;
+    snapshots.set(result.targetPath, {
+      before: getOriginalContent(originals, result.targetPath),
+      after: result.patchedContent,
+    });
+    await writeProjectFile(result.targetPath, result.patchedContent);
+    count++;
+  }
+  return count;
+}
+
 // fallow-ignore-next-line complexity
 async function executeSplit(
   pid: string,
@@ -113,7 +186,25 @@ async function executeSplit(
   const originalContent = await readFileContent(pid, targetPath);
   const newId = generateSplitId(collectHtmlIds(originalContent), element.domId || "clip");
 
-  const splitResult = await splitHtmlElement(pid, targetPath, patchTarget, splitTime, newId);
+  // An expanded sub-comp child arrives in MASTER-timeline coordinates — both its
+  // `start` and the incoming `splitTime` are offset by the host's master start
+  // (expandedParentStart) — but its `sourceFile` is the sub-comp, whose clips are
+  // authored in LOCAL time. Rebase both onto local time before the server patches
+  // the file, exactly as TimelinePane.handleSplitElement does for non-razor edits.
+  // Root-level clips (no expandedParentStart) are already local, so pass through.
+  const basis = element.expandedParentStart;
+  const localSplitTime = basis === undefined ? splitTime : Math.max(0, splitTime - basis);
+  const localElementStart = basis === undefined ? element.start : element.start - basis;
+
+  const splitResult = await splitHtmlElement(
+    pid,
+    targetPath,
+    patchTarget,
+    localSplitTime,
+    newId,
+    localElementStart,
+    element.duration,
+  );
   if (!splitResult.ok) throw new Error("Failed to split clip.");
   if (!splitResult.changed) {
     return { targetPath, originalContent, patchedContent: originalContent, changed: false };
@@ -130,8 +221,8 @@ async function executeSplit(
         targetPath,
         element.domId,
         newId,
-        splitTime,
-        element.start,
+        localSplitTime,
+        localElementStart,
         element.duration,
       );
       if (gsapResult.content) patchedContent = gsapResult.content;
@@ -155,6 +246,7 @@ export function useRazorSplit({
   recordEdit,
   domEditSaveTimestampRef,
   reloadPreview,
+  forceReloadSdkSession,
   isRecordingRef,
 }: UseRazorSplitOptions) {
   const projectIdRef = useRef(projectId);
@@ -169,11 +261,7 @@ export function useRazorSplit({
       }
 
       const pid = projectIdRef.current;
-      if (!pid || !canSplitElement(element)) return;
-
-      if (!isSplitTimeWithinBounds(splitTime, element.start, element.duration)) {
-        return;
-      }
+      if (!pid || !canSplitElementAt(element, splitTime)) return;
 
       try {
         const { targetPath, originalContent, patchedContent, changed, skippedSelectors } =
@@ -195,7 +283,11 @@ export function useRazorSplit({
           recordEdit,
         });
 
+        // Server writes bypass the SDK session, so reopen it before refreshing
+        // the preview. The split response already owns the final persisted bytes.
+        forceReloadSdkSession?.();
         reloadPreview();
+        trackStudioRazorSplit({ mode: "single", count: 1 });
         showToast(`Split ${getTimelineElementLabel(element)} at ${splitTime.toFixed(2)}s`, "info");
         if (skippedSelectors?.length) {
           showToast(
@@ -215,6 +307,7 @@ export function useRazorSplit({
       writeProjectFile,
       domEditSaveTimestampRef,
       reloadPreview,
+      forceReloadSdkSession,
       isRecordingRef,
     ],
   );
@@ -230,55 +323,45 @@ export function useRazorSplit({
       const pid = projectIdRef.current;
       if (!pid) return;
       const { elements } = usePlayerStore.getState();
-      const splittable = elements.filter(
-        (el) => canSplitElement(el) && splitTime > el.start && splitTime < el.start + el.duration,
-      );
+      const splittable = selectSplittableElements(elements, splitTime);
       if (splittable.length === 0) return;
 
+      let originals = new Map<string, string>();
+      const finalSnapshots = new Map<string, { before: string; after: string }>();
       try {
-        const originals = new Map<string, string>();
-        for (const el of splittable) {
-          const path = el.sourceFile || activeCompPath || "index.html";
-          if (!originals.has(path)) {
-            originals.set(path, await readFileContent(pid, path));
-          }
-        }
-
-        let splitCount = 0;
-        const finalContent = new Map<string, string>();
-
-        for (const element of splittable) {
-          const result = await executeSplit(
-            pid,
-            element,
-            splitTime,
-            activeCompPath,
-            writeProjectFile,
-          );
-          if (result.changed) {
-            finalContent.set(result.targetPath, result.patchedContent);
-            await writeProjectFile(result.targetPath, result.patchedContent);
-            splitCount++;
-          }
-        }
-
+        originals = await readOriginalFiles(pid, splittable, activeCompPath);
+        const splitCount = await splitElementsAtTime(
+          pid,
+          splittable,
+          splitTime,
+          activeCompPath,
+          originals,
+          finalSnapshots,
+          writeProjectFile,
+        );
         if (splitCount === 0) return;
 
         domEditSaveTimestampRef.current = Date.now();
         await recordEdit({
           label: `Split ${splitCount} clips at ${splitTime.toFixed(2)}s`,
           kind: "timeline",
-          files: Object.fromEntries(
-            [...finalContent].map(([path, after]) => [
-              path,
-              { before: originals.get(path) ?? "", after },
-            ]),
-          ),
+          files: Object.fromEntries(finalSnapshots),
         });
 
+        // Resync the stale SDK doc after the batched server write (see the
+        // single-split path above for why this precedes the reload).
+        forceReloadSdkSession?.();
         reloadPreview();
+        trackStudioRazorSplit({ mode: "all", count: splitCount });
         showToast(`Split ${splitCount} clips at ${splitTime.toFixed(2)}s`, "info");
       } catch (error) {
+        // Best-effort rollback — a failing restore write must not swallow the
+        // original error's toast, which is what tells the user the split failed.
+        try {
+          await restoreFilesToOriginal(originals, finalSnapshots.keys(), writeProjectFile);
+        } catch {
+          /* leave disk as-is; the original failure is reported below */
+        }
         const message = error instanceof Error ? error.message : "Failed to split clips";
         showToast(message, "error");
       }
@@ -290,6 +373,7 @@ export function useRazorSplit({
       writeProjectFile,
       domEditSaveTimestampRef,
       reloadPreview,
+      forceReloadSdkSession,
       isRecordingRef,
     ],
   );

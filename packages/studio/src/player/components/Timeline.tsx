@@ -1,30 +1,34 @@
-import { useRef, useMemo, useCallback, useState, useEffect, memo, type ReactNode } from "react";
+import { useRef, useMemo, useCallback, useState, useEffect, memo } from "react";
+import { useMusicBeatAnalysis } from "../../hooks/useMusicBeatAnalysis";
+import { isMusicTrack } from "../../utils/timelineInspector";
+import { remapBeatAnalysisToComposition } from "../../utils/beatEditActions";
 import { usePlayerStore, type TimelineElement } from "../store/playerStore";
+import { useExpandedTimelineElements } from "../hooks/useExpandedTimelineElements";
 import { useMountEffect } from "../../hooks/useMountEffect";
-import { EditPopover } from "./EditModal";
-import { defaultTimelineTheme, type TimelineTheme } from "./timelineTheme";
+import { defaultTimelineTheme } from "./timelineTheme";
 import { useTimelineRangeSelection } from "./useTimelineRangeSelection";
 import { useTimelinePlayhead } from "./useTimelinePlayhead";
+import { useTimelineActiveClips } from "./useTimelineActiveClips";
 import { type TrackVisualStyle, getTrackStyle } from "./timelineIcons";
-import { getTimelinePixelsPerSecond } from "./timelineZoom";
 import { useTimelineZoom } from "./useTimelineZoom";
 import { useTimelineAssetDrop } from "./timelineDragDrop";
 import { TimelineEmptyState } from "./TimelineEmptyState";
 import { TimelineCanvas } from "./TimelineCanvas";
-import {
-  KeyframeDiamondContextMenu,
-  type KeyframeDiamondContextMenuState,
-} from "./KeyframeDiamondContextMenu";
+import { type KeyframeDiamondContextMenuState } from "./KeyframeDiamondContextMenu";
 import { useTimelineClipDrag } from "./useTimelineClipDrag";
-import { ClipContextMenu } from "./ClipContextMenu";
+import { TimelineOverlays } from "./TimelineOverlays";
+import { useTimelineEditPinning } from "./useTimelineEditPinning";
+import { useTimelineStackingSync } from "./useTimelineStackingSync";
+import { useTimelineGeometry } from "./useTimelineGeometry";
 import {
   GUTTER,
   generateTicks,
   getTimelineCanvasHeight,
   shouldShowTimelineShortcutHint,
 } from "./timelineLayout";
-import type { TimelineDropCallbacks } from "./timelineCallbacks";
-import { useTimelineEditContext } from "../../contexts/TimelineEditContext";
+import { STUDIO_PREVIEW_FPS } from "../lib/time";
+import { useResolvedTimelineEditCallbacks } from "./useResolvedTimelineEditCallbacks";
+import type { TimelineProps } from "./TimelineTypes";
 
 // Re-export pure utilities so existing imports from "./Timeline" still resolve.
 export {
@@ -41,19 +45,6 @@ export {
   getDefaultDroppedTrack,
 } from "./timelineLayout";
 
-interface TimelineProps extends TimelineDropCallbacks {
-  onSeek?: (time: number) => void;
-  onDrillDown?: (element: TimelineElement) => void;
-  renderClipContent?: (
-    element: TimelineElement,
-    style: { clip: string; label: string },
-  ) => ReactNode;
-  renderClipOverlay?: (element: TimelineElement) => ReactNode;
-  onDeleteElement?: (element: TimelineElement) => Promise<void> | void;
-  onSelectElement?: (element: TimelineElement | null) => void;
-  theme?: Partial<TimelineTheme>;
-}
-
 export const Timeline = memo(function Timeline({
   onSeek,
   onDrillDown,
@@ -63,25 +54,52 @@ export const Timeline = memo(function Timeline({
   onAssetDrop,
   onBlockDrop,
   onDeleteElement: _onDeleteElement,
+  onMoveElement: onMoveElementOverride,
+  onMoveElements: onMoveElementsOverride,
+  onResizeElement: onResizeElementOverride,
+  onResizeElements: onResizeElementsOverride,
+  onBlockedEditAttempt: onBlockedEditAttemptOverride,
+  onSplitElement: onSplitElementOverride,
   onSelectElement,
   theme: themeOverrides,
 }: TimelineProps = {}) {
   const {
     onMoveElement,
+    onMoveElements,
     onResizeElement,
+    onResizeElements,
     onBlockedEditAttempt,
     onSplitElement,
     onRazorSplitAll,
     onDeleteKeyframe,
     onDeleteAllKeyframes,
     onChangeKeyframeEase,
+    onMoveKeyframeToPlayhead,
     onMoveKeyframe,
-  } = useTimelineEditContext();
+  } = useResolvedTimelineEditCallbacks({
+    onMoveElement: onMoveElementOverride,
+    onMoveElements: onMoveElementsOverride,
+    onResizeElement: onResizeElementOverride,
+    onResizeElements: onResizeElementsOverride,
+    onBlockedEditAttempt: onBlockedEditAttemptOverride,
+    onSplitElement: onSplitElementOverride,
+  });
   const theme = useMemo(() => ({ ...defaultTimelineTheme, ...themeOverrides }), [themeOverrides]);
-  const elements = usePlayerStore((s) => s.elements);
+  useMusicBeatAnalysis();
+  const rawElements = usePlayerStore((s) => s.elements);
+  const expandedElements = useExpandedTimelineElements();
+  const beatAnalysis = usePlayerStore((s) => s.beatAnalysis);
+  const musicElement = usePlayerStore((s) => s.elements.find(isMusicTrack) ?? null);
+  const beatEdits = usePlayerStore((s) => s.beatEdits);
+  const adjustedBeatAnalysis = useMemo(
+    () => remapBeatAnalysisToComposition(beatAnalysis, musicElement, beatEdits),
+    [beatAnalysis, musicElement, beatEdits],
+  );
   const duration = usePlayerStore((s) => s.duration);
+  const timeDisplayMode = usePlayerStore((s) => s.timeDisplayMode);
   const timelineReady = usePlayerStore((s) => s.timelineReady);
   const selectedElementId = usePlayerStore((s) => s.selectedElementId);
+  const selectedElementIds = usePlayerStore((s) => s.selectedElementIds);
   const setSelectedElementId = usePlayerStore((s) => s.setSelectedElementId);
   const currentTime = usePlayerStore((s) => s.currentTime);
   const { zoomMode, manualZoomPercent, setZoomMode, setManualZoomPercent } = useTimelineZoom();
@@ -136,20 +154,29 @@ export const Timeline = memo(function Timeline({
     });
   }, [syncShortcutHintVisibility]);
 
-  const setContainerRef = useCallback(
+  const setContainerRef = useCallback((el: HTMLDivElement | null) => {
+    containerRef.current = el;
+  }, []);
+
+  // Last horizontal scroll offset, RESTORED across the post-edit iframe reload (which clamps into
+  // a scroll jump); with the pinned zoom this keeps the user parked at the same spot after edits.
+  const lastScrollLeftRef = useRef(0);
+  const setScrollRef = useCallback(
     (el: HTMLDivElement | null) => {
       if (roRef.current) {
         roRef.current.disconnect();
         roRef.current = null;
       }
-      containerRef.current = el;
+      scrollRef.current = el;
       if (!el) return;
-      setViewportWidth(el.clientWidth);
-      scheduleShortcutHintVisibilitySync();
-      roRef.current = new ResizeObserver(([entry]) => {
-        setViewportWidth(entry.contentRect.width);
+
+      const syncScrollViewport = () => {
+        setViewportWidth(el.clientWidth);
         scheduleShortcutHintVisibilitySync();
-      });
+      };
+
+      syncScrollViewport();
+      roRef.current = new ResizeObserver(syncScrollViewport);
       roRef.current.observe(el);
     },
     [scheduleShortcutHintVisibilitySync],
@@ -162,21 +189,21 @@ export const Timeline = memo(function Timeline({
 
   const effectiveDuration = useMemo(() => {
     const safeDur = Number.isFinite(duration) ? duration : 0;
-    if (elements.length === 0) return safeDur;
-    const maxEnd = Math.max(...elements.map((el) => el.start + el.duration));
+    if (rawElements.length === 0) return safeDur;
+    const maxEnd = Math.max(...rawElements.map((el) => el.start + el.duration));
     const result = Math.max(safeDur, maxEnd);
     return Number.isFinite(result) ? result : safeDur;
-  }, [elements, duration]);
+  }, [rawElements, duration]);
 
   const tracks = useMemo(() => {
-    const map = new Map<number, typeof elements>();
-    for (const el of elements) {
+    const map = new Map<number, typeof expandedElements>();
+    for (const el of expandedElements) {
       const list = map.get(el.track) ?? [];
       list.push(el);
       map.set(el.track, list);
     }
     return Array.from(map.entries()).sort(([a], [b]) => a - b);
-  }, [elements]);
+  }, [expandedElements]);
 
   const trackStyles = useMemo(() => {
     const map = new Map<number, TrackVisualStyle>();
@@ -189,13 +216,41 @@ export const Timeline = memo(function Timeline({
   const trackOrder = useMemo(() => tracks.map(([trackNum]) => trackNum), [tracks]);
   const trackOrderRef = useRef(trackOrder);
   trackOrderRef.current = trackOrder;
+  const expandedElementsRef = useRef(expandedElements);
+  expandedElementsRef.current = expandedElements;
 
   const ppsRef = useRef(100);
   const durationRef = useRef(effectiveDuration);
   durationRef.current = effectiveDuration;
+  // Declared here (used before the fitPps derivation below) so the edit-pin
+  // wrappers can close over it; `fitPpsRef.current` is refreshed each render.
+  const fitPpsRef = useRef(100);
 
-  // Stable ref so useTimelineClipDrag can clear rangeSelection without circular dep
-  const setRangeSelectionRef = useRef<((sel: null) => void) | null>(null);
+  const {
+    pinZoomBeforeEdit,
+    setRangeSelectionRef,
+    pinnedOnMoveElement,
+    pinnedOnMoveElements,
+    pinnedOnResizeElement,
+    pinnedOnResizeElements,
+    pinnedOnFileDrop,
+    pinnedOnAssetDrop,
+    pinnedOnBlockDrop,
+  } = useTimelineEditPinning({
+    ppsRef,
+    fitPpsRef,
+    onMoveElement,
+    onMoveElements,
+    onResizeElement,
+    onResizeElements,
+    onFileDrop,
+    onAssetDrop,
+    onBlockDrop,
+  });
+
+  const { readClipZIndex, applyStackingPatches, zSyncEnabled } = useTimelineStackingSync({
+    expandedElementsRef,
+  });
 
   const {
     draggedClip,
@@ -210,20 +265,30 @@ export const Timeline = memo(function Timeline({
     ppsRef,
     durationRef,
     trackOrderRef,
-    onMoveElement,
-    onResizeElement,
+    onMoveElement: pinnedOnMoveElement,
+    onMoveElements: pinnedOnMoveElements,
+    onResizeElement: pinnedOnResizeElement,
+    onResizeElements: pinnedOnResizeElements,
     onBlockedEditAttempt,
     setShowPopover,
     setRangeSelectionRef,
+    readZIndex: zSyncEnabled ? readClipZIndex : undefined,
+    onStackingPatches: zSyncEnabled ? applyStackingPatches : undefined,
   });
 
+  const { isDragOver, handleAssetDragOver, handleAssetDrop, clearDropPreview } =
+    useTimelineAssetDrop({
+      scrollRef,
+      ppsRef,
+      durationRef,
+      trackOrderRef,
+      onFileDrop: pinnedOnFileDrop,
+      onAssetDrop: pinnedOnAssetDrop,
+      onBlockDrop: pinnedOnBlockDrop,
+    });
+
   const displayTrackOrder = useMemo(() => {
-    if (
-      !draggedClip?.started ||
-      trackOrder.length === 0 ||
-      trackOrder.includes(draggedClip.previewTrack)
-    )
-      return trackOrder;
+    if (!draggedClip?.started || trackOrder.includes(draggedClip.previewTrack)) return trackOrder;
     return [...trackOrder, draggedClip.previewTrack].sort((a, b) => a - b);
   }, [draggedClip, trackOrder]);
 
@@ -233,25 +298,35 @@ export const Timeline = memo(function Timeline({
   const toggleSelectedKeyframe = usePlayerStore((s) => s.toggleSelectedKeyframe);
 
   const selectedElement = useMemo(
-    () => elements.find((element) => (element.key ?? element.id) === selectedElementId) ?? null,
-    [elements, selectedElementId],
+    () =>
+      expandedElements.find((element) => (element.key ?? element.id) === selectedElementId) ?? null,
+    [expandedElements, selectedElementId],
   );
   const selectedElementRef = useRef<TimelineElement | null>(selectedElement);
   selectedElementRef.current = selectedElement;
 
-  const fitPps =
-    viewportWidth > GUTTER && effectiveDuration > 0
-      ? (viewportWidth - GUTTER - 2) / effectiveDuration
-      : 100;
-  const pps = getTimelinePixelsPerSecond(fitPps, zoomMode, manualZoomPercent);
-  ppsRef.current = pps;
-  const trackContentWidth = Math.max(0, effectiveDuration * pps);
-  const zoomModeRef = useRef(zoomMode);
-  zoomModeRef.current = zoomMode;
-  const manualZoomPercentRef = useRef(manualZoomPercent);
-  manualZoomPercentRef.current = manualZoomPercent;
-  const fitPpsRef = useRef(fitPps);
-  fitPpsRef.current = fitPps;
+  const {
+    pps,
+    fitPps,
+    displayContentWidth,
+    displayDuration,
+    clipStateVersion,
+    zoomModeRef,
+    manualZoomPercentRef,
+  } = useTimelineGeometry({
+    viewportWidth,
+    effectiveDuration,
+    zoomMode,
+    manualZoomPercent,
+    ppsRef,
+    fitPpsRef,
+    draggedClip,
+    resizingClip,
+    expandedElements,
+    isDragging,
+    scrollRef,
+    lastScrollLeftRef,
+  });
 
   const { seekFromX, autoScrollDuringDrag, dragScrollRaf } = useTimelinePlayhead({
     playheadRef,
@@ -269,16 +344,23 @@ export const Timeline = memo(function Timeline({
     effectiveDuration,
     pps,
     timelineReady,
-    elementsLength: elements.length,
+    elementsLength: expandedElements.length,
     setZoomMode,
     setManualZoomPercent,
     onSeek,
+  });
+  useTimelineActiveClips({
+    scrollRef,
+    currentTime,
+    clipStateVersion,
   });
 
   const {
     rangeSelection,
     setRangeSelection,
     shiftClickClipRef,
+    marqueeRect,
+    isScrubbing,
     handlePointerDown,
     handlePointerMove,
     handlePointerUp,
@@ -293,6 +375,9 @@ export const Timeline = memo(function Timeline({
     dragScrollRaf,
     isDragging,
     setShowPopover,
+    elementsRef: expandedElementsRef,
+    trackOrderRef,
+    onSelectElement,
   });
   // Wire setRangeSelection into the stable ref consumed by useTimelineClipDrag
   setRangeSelectionRef.current = setRangeSelection;
@@ -309,16 +394,17 @@ export const Timeline = memo(function Timeline({
     }
   });
 
+  // Frame display mode labels ruler ticks as frame numbers — pass the fps so ticks snap to frames.
+  const tickFps = timeDisplayMode === "frame" ? STUDIO_PREVIEW_FPS : undefined;
   const { major, minor } = useMemo(
-    () => generateTicks(effectiveDuration, pps),
-    [effectiveDuration, pps],
+    () => generateTicks(displayDuration, pps, tickFps),
+    [displayDuration, pps, tickFps],
   );
-  const majorTickInterval =
-    major.length >= 2 ? Math.max(0.25, major[1] - major[0]) : effectiveDuration;
+  const majorTickInterval = major.length >= 2 ? major[1] - major[0] : effectiveDuration;
 
   useEffect(() => {
     syncShortcutHintVisibility();
-  }, [syncShortcutHintVisibility, timelineReady, elements.length, totalH]);
+  }, [syncShortcutHintVisibility, timelineReady, expandedElements.length, totalH]);
 
   const getPreviewElement = useCallback(
     (element: TimelineElement): TimelineElement => {
@@ -338,23 +424,13 @@ export const Timeline = memo(function Timeline({
     [resizingClip],
   );
 
-  const { isDragOver, setIsDragOver, handleAssetDragOver, handleAssetDrop } = useTimelineAssetDrop({
-    scrollRef,
-    ppsRef,
-    durationRef,
-    trackOrderRef,
-    onFileDrop,
-    onAssetDrop,
-    onBlockDrop,
-  });
-
-  if (!timelineReady || elements.length === 0) {
+  if (!timelineReady || expandedElements.length === 0) {
     return (
       <TimelineEmptyState
         isDragOver={isDragOver}
         onFileDrop={!!onFileDrop}
         onDragOver={handleAssetDragOver}
-        onDragLeave={() => setIsDragOver(false)}
+        onDragLeave={() => clearDropPreview()}
         onDrop={handleAssetDrop}
       />
     );
@@ -379,11 +455,15 @@ export const Timeline = memo(function Timeline({
       }}
     >
       <div
-        ref={scrollRef}
+        ref={setScrollRef}
         tabIndex={-1}
         className={`${zoomMode === "fit" ? "overflow-x-hidden" : "overflow-x-auto"} overflow-y-auto h-full outline-none`}
+        onScroll={(e) => {
+          // Remember the live offset so it can be restored across a post-edit reload.
+          lastScrollLeftRef.current = e.currentTarget.scrollLeft;
+        }}
         onDragOver={handleAssetDragOver}
-        onDragLeave={() => setIsDragOver(false)}
+        onDragLeave={() => clearDropPreview()}
         onDrop={handleAssetDrop}
         onPointerDown={(e) => {
           if (activeTool === "razor" && e.shiftKey && e.button === 0 && scrollRef.current) {
@@ -403,21 +483,23 @@ export const Timeline = memo(function Timeline({
           major={major}
           minor={minor}
           pps={pps}
-          trackContentWidth={trackContentWidth}
+          trackContentWidth={displayContentWidth}
           totalH={totalH}
           effectiveDuration={effectiveDuration}
           majorTickInterval={majorTickInterval}
-          shiftHeld={shiftHeld}
           rangeSelection={rangeSelection}
+          marqueeRect={marqueeRect}
           theme={theme}
           displayTrackOrder={displayTrackOrder}
           trackOrder={trackOrder}
           tracks={tracks}
           trackStyles={trackStyles}
           selectedElementId={selectedElementId}
+          selectedElementIds={selectedElementIds}
           hoveredClip={hoveredClip}
           draggedClip={draggedClip}
           resizingClip={resizingClip}
+          isScrubbing={isScrubbing}
           blockedClipRef={blockedClipRef}
           suppressClickRef={suppressClickRef}
           scrollRef={scrollRef}
@@ -439,11 +521,14 @@ export const Timeline = memo(function Timeline({
           keyframeCache={keyframeCache}
           selectedKeyframes={selectedKeyframes}
           currentTime={currentTime}
+          beatAnalysis={adjustedBeatAnalysis}
           onClickKeyframe={(el, pct) => {
             usePlayerStore.getState().clearSelectedKeyframes();
             const elKey = el.key ?? el.id;
             setSelectedElementId(elKey);
             onSelectElement?.(el);
+            // Select the clicked diamond (matches shift-click); cleared above so this single-selects.
+            toggleSelectedKeyframe(`${elKey}:${pct}`);
             const absTime = el.start + (pct / 100) * el.duration;
             onSeek?.(absTime);
             const kfData = keyframeCache?.get(elKey);
@@ -453,16 +538,12 @@ export const Timeline = memo(function Timeline({
           onShiftClickKeyframe={(elId, pct) => {
             toggleSelectedKeyframe(`${elId}:${pct}`);
           }}
-          onDragKeyframe={(el, oldPct, newPct) => {
-            onMoveKeyframe?.(el, oldPct, newPct);
-          }}
+          onMoveKeyframe={onMoveKeyframe}
           onContextMenuKeyframe={(e, elId, pct) => {
-            const el = elements.find((x) => (x.key ?? x.id) === elId);
+            const el = expandedElements.find((x) => (x.key ?? x.id) === elId);
             if (el) {
               setSelectedElementId(elId);
               onSelectElement?.(el);
-              const absTime = el.start + (pct / 100) * el.duration;
-              onSeek?.(absTime);
             }
             const kfData = keyframeCache.get(elId);
             const kf = kfData?.keyframes.find((k) => Math.abs(k.percentage - pct) < 0.2);
@@ -493,67 +574,27 @@ export const Timeline = memo(function Timeline({
           />
         )}
       </div>
-
-      {showShortcutHint && !showPopover && !rangeSelection && (
-        <div className="absolute bottom-2 right-3 pointer-events-none z-20">
-          <div
-            className="flex items-center gap-1.5 px-2 py-1 rounded-md border"
-            style={{ background: "rgba(17,23,35,0.84)", borderColor: theme.gutterBorder }}
-          >
-            <kbd
-              className="text-[9px] font-mono px-1 py-0.5 rounded"
-              style={{ color: theme.textSecondary, background: "rgba(255,255,255,0.06)" }}
-            >
-              Shift
-            </kbd>
-            <span className="text-[9px]" style={{ color: theme.textSecondary }}>
-              + drag/click to edit range
-            </span>
-          </div>
-        </div>
-      )}
-
-      {showPopover && rangeSelection && (
-        <EditPopover
-          rangeStart={rangeSelection.start}
-          rangeEnd={rangeSelection.end}
-          anchorX={rangeSelection.anchorX}
-          anchorY={rangeSelection.anchorY}
-          onClose={() => {
-            setShowPopover(false);
-            setRangeSelection(null);
-          }}
-        />
-      )}
-
-      {kfContextMenu && (
-        <KeyframeDiamondContextMenu
-          state={kfContextMenu}
-          onClose={() => setKfContextMenu(null)}
-          onDelete={(elId, pct) => onDeleteKeyframe?.(elId, pct)}
-          onDeleteAll={(elId) => onDeleteAllKeyframes?.(elId)}
-          onChangeEase={(elId, pct, ease) => onChangeKeyframeEase?.(elId, pct, ease)}
-          onCopyProperties={(elId, pct) => {
-            const kfData = keyframeCache.get(elId);
-            const kf = kfData?.keyframes.find((k) => k.percentage === pct);
-            if (kf) {
-              void navigator.clipboard.writeText(JSON.stringify(kf.properties, null, 2));
-            }
-          }}
-        />
-      )}
-
-      {clipContextMenu && (
-        <ClipContextMenu
-          x={clipContextMenu.x}
-          y={clipContextMenu.y}
-          element={clipContextMenu.element}
-          currentTime={currentTime}
-          onClose={() => setClipContextMenu(null)}
-          onSplit={(el, time) => onSplitElement?.(el, time)}
-          onDelete={(el) => _onDeleteElement?.(el)}
-        />
-      )}
+      <TimelineOverlays
+        theme={theme}
+        showShortcutHint={showShortcutHint}
+        showPopover={showPopover}
+        rangeSelection={rangeSelection}
+        setShowPopover={setShowPopover}
+        setRangeSelection={setRangeSelection}
+        kfContextMenu={kfContextMenu}
+        setKfContextMenu={setKfContextMenu}
+        onDeleteKeyframe={onDeleteKeyframe}
+        onDeleteAllKeyframes={onDeleteAllKeyframes}
+        onChangeKeyframeEase={onChangeKeyframeEase}
+        onMoveKeyframeToPlayhead={onMoveKeyframeToPlayhead}
+        keyframeCache={keyframeCache}
+        clipContextMenu={clipContextMenu}
+        setClipContextMenu={setClipContextMenu}
+        currentTime={currentTime}
+        onSplitElement={onSplitElement}
+        pinZoomBeforeEdit={pinZoomBeforeEdit}
+        onDeleteElement={_onDeleteElement}
+      />
     </div>
   );
 });

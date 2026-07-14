@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication complexity
 /**
  * probeStage — browser probe + recompile + media reconciliation.
  *
@@ -33,9 +34,12 @@ import {
   type CaptureOptions,
   type CaptureSession,
   type EngineConfig,
+  closeCaptureSession,
   createCaptureSession,
   getCompositionDuration,
   initializeSession,
+  isTransientBrowserError,
+  probeBeginFrameLiveness,
 } from "@hyperframes/engine";
 import { fpsToNumber } from "@hyperframes/core";
 import type { CompiledComposition } from "../../htmlCompiler.js";
@@ -93,6 +97,14 @@ export interface ProbeStageResult {
   totalFrames: number;
   /** Wall-clock ms for the entire probe phase (near-zero when `needsBrowser` was false). */
   browserProbeMs: number;
+  /**
+   * True when the BeginFrame liveness probe timed out on this host (SwiftShader
+   * stalls the first BeginFrame indefinitely for heavy-layer compositions —
+   * style-N caption comps). The probe session has already been relaunched in
+   * screenshot mode; the sequencer must flip its `captureForceScreenshot`
+   * local so downstream capture stages follow.
+   */
+  beginFrameStalled: boolean;
 }
 
 export function hasScriptedAudioVolumeAutomation(html: string, audioCount: number): boolean {
@@ -110,6 +122,17 @@ export function hasScriptedAudioVolumeAutomation(html: string, audioCount: numbe
       scriptBodies,
     )
   );
+}
+
+/**
+ * True when the compiled HTML has at least one `<video>` carrying the
+ * auto-injected `data-hf-auto-start` sentinel. Uses a DOM query, not a
+ * substring scan — `html.includes("data-hf-auto-start")` false-fires on any
+ * comment or prose that merely mentions the attribute (issue #1938).
+ */
+export function hasAutoStartVideos(html: string): boolean {
+  const { document } = parseHTML(html);
+  return document.querySelector("video[data-hf-auto-start]") !== null;
 }
 
 export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageResult> {
@@ -134,10 +157,11 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
 
   let fileServer: FileServerHandle | null = null;
   let probeSession: CaptureSession | null = null;
+  let beginFrameStalled = false;
   let lastBrowserConsole: string[] = [];
 
   const probeStart = Date.now();
-  const hasAutoStartVideos = compiled.html.includes("data-hf-auto-start");
+  const hasAutoStart = hasAutoStartVideos(compiled.html);
   const hasScriptedAudio = hasScriptedAudioVolumeAutomation(
     compiled.html,
     composition.audios.length,
@@ -145,7 +169,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
   const needsBrowser =
     composition.duration <= 0 ||
     compiled.unresolvedCompositions.length > 0 ||
-    hasAutoStartVideos ||
+    hasAutoStart ||
     hasScriptedAudio;
 
   if (needsBrowser) {
@@ -153,6 +177,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
     if (composition.duration <= 0) reasons.push("root duration unknown");
     if (compiled.unresolvedCompositions.length > 0)
       reasons.push(`${compiled.unresolvedCompositions.length} unresolved composition(s)`);
+    if (hasAutoStart) reasons.push("auto-start video(s)");
     if (hasScriptedAudio) reasons.push("scripted audio volume");
 
     log.info("Launching browser for composition probe...", {
@@ -164,6 +189,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
       compiledDir: join(workDir, "compiled"),
       port: 0,
       preHeadScripts: [VIRTUAL_TIME_SHIM],
+      fps: job.config.fps,
     });
     assertNotAborted();
 
@@ -175,35 +201,137 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
       quality: needsAlpha ? undefined : 80,
       deviceScaleFactor,
     };
-    log.info("Browser launched, creating capture session...");
-    probeSession = await createCaptureSession(
-      fileServer.url,
-      join(workDir, "probe"),
-      captureOpts,
-      null,
-      probeCfg,
-    );
-    log.info("Waiting for composition to initialize...");
-    const initStart = Date.now();
-    const heartbeat = setInterval(() => {
-      const elapsed = ((Date.now() - initStart) / 1000).toFixed(1);
-      log.info(`Still waiting for browser initialization... (${elapsed}s elapsed)`);
-    }, 30_000);
-    try {
-      await initializeSession(probeSession);
-    } finally {
-      clearInterval(heartbeat);
+
+    const PROBE_MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= PROBE_MAX_ATTEMPTS; attempt++) {
+      const attemptStart = Date.now();
+      try {
+        log.info("Creating capture session...", { attempt, maxAttempts: PROBE_MAX_ATTEMPTS });
+        probeSession = await createCaptureSession(
+          fileServer.url,
+          join(workDir, "probe"),
+          captureOpts,
+          null,
+          probeCfg,
+        );
+        log.info("Waiting for composition to initialize...", { attempt });
+        const heartbeat = setInterval(() => {
+          const elapsed = ((Date.now() - attemptStart) / 1000).toFixed(1);
+          log.info(`Still waiting for browser initialization... (${elapsed}s elapsed)`);
+        }, 30_000);
+        try {
+          await initializeSession(probeSession);
+        } finally {
+          clearInterval(heartbeat);
+        }
+      } catch (err) {
+        const isTransient = isTransientBrowserError(err);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log.warn("Browser probe attempt failed", {
+          attempt,
+          maxAttempts: PROBE_MAX_ATTEMPTS,
+          isTransient,
+          error: errMsg,
+          elapsedMs: Date.now() - attemptStart,
+        });
+
+        if (probeSession) {
+          try {
+            await closeCaptureSession(probeSession);
+          } catch (closeErr) {
+            log.warn("Failed to close crashed probe session", {
+              error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+            });
+          }
+          probeSession = null;
+        }
+
+        if (isTransient && attempt < PROBE_MAX_ATTEMPTS) {
+          log.info("Retrying with a fresh browser session...", {
+            attempt: attempt + 1,
+            maxAttempts: PROBE_MAX_ATTEMPTS,
+          });
+          assertNotAborted();
+          continue;
+        }
+        throw err;
+      }
+      log.info("Composition ready", {
+        attempt,
+        initMs: Date.now() - attemptStart,
+      });
+      break;
     }
-    log.info("Composition ready", {
-      initMs: Date.now() - initStart,
-    });
     assertNotAborted();
-    lastBrowserConsole = probeSession.browserConsoleBuffer;
+    // After the retry loop, probeSession is guaranteed non-null (the loop
+    // either breaks with a valid session or throws on the last attempt).
+    const session = probeSession!;
+    probeSession = session;
+    lastBrowserConsole = session.browserConsoleBuffer;
+
+    // BeginFrame liveness probe. On SwiftShader, heavy-layer compositions
+    // (multi-group nested opacity caption animations — style-N prod comps)
+    // stall the FIRST BeginFrame indefinitely (tested to 30 min). The
+    // auto-worker calibration catches this via its capped protocol timeout,
+    // but renders with explicit `--workers N` skip calibration and would
+    // hang for the full protocol timeout. One bounded BeginFrame here gives
+    // ground truth for every render that probes a browser: on stall,
+    // relaunch the probe session in screenshot mode and tell the sequencer
+    // (via `beginFrameStalled`) to route the whole render through
+    // screenshot capture — the path the baseline already uses for these
+    // comps. Healthy comps pay one extra composited frame (<1s on GPU, a
+    // few seconds on SwiftShader).
+    if (probeSession.launchCaptureMode === "beginframe") {
+      const probeTimeoutMs =
+        Number(process.env.PRODUCER_BEGINFRAME_PROBE_TIMEOUT_MS) > 0
+          ? Number(process.env.PRODUCER_BEGINFRAME_PROBE_TIMEOUT_MS)
+          : 30_000;
+      const livenessStart = Date.now();
+      // Tick inside the post-warmup cushion: warmup < probe < first capture
+      // keeps the session's BeginFrame frameTimeTicks monotonic.
+      const probeTick = Math.max(
+        0,
+        probeSession.beginFrameTimeTicks - 5 * probeSession.beginFrameIntervalMs,
+      );
+      const alive = await probeBeginFrameLiveness(
+        probeSession.page,
+        probeTimeoutMs,
+        probeTick,
+        probeSession.beginFrameIntervalMs,
+      );
+      assertNotAborted();
+      if (alive) {
+        log.info("BeginFrame liveness probe passed", {
+          probeMs: Date.now() - livenessStart,
+        });
+      } else {
+        beginFrameStalled = true;
+        log.warn(
+          "[Render] BeginFrame liveness probe timed out — this composition stalls " +
+            "BeginFrame on this host (SwiftShader heavy-layer pattern). Relaunching " +
+            "the probe browser in screenshot capture mode; the render will use " +
+            "screenshot capture throughout.",
+          { probeTimeoutMs },
+        );
+        lastBrowserConsole = probeSession.browserConsoleBuffer;
+        await closeCaptureSession(probeSession).catch(() => {});
+        probeSession = await createCaptureSession(
+          fileServer.url,
+          join(workDir, "probe-screenshot"),
+          captureOpts,
+          null,
+          { ...probeCfg, forceScreenshot: true },
+        );
+        await initializeSession(probeSession);
+        assertNotAborted();
+        lastBrowserConsole = probeSession.browserConsoleBuffer;
+      }
+    }
 
     // Discover root composition duration
     if (composition.duration <= 0) {
       log.info("Discovering composition duration...");
-      const discoveredDuration = await getCompositionDuration(probeSession);
+      const discoveredDuration = await getCompositionDuration(session);
       assertNotAborted();
       log.info("Probed composition duration from browser", {
         discoveredDuration,
@@ -219,7 +347,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
     // Resolve unresolved composition durations via window.__timelines
     if (compiled.unresolvedCompositions.length > 0) {
       const resolutions = await resolveCompositionDurations(
-        probeSession.page,
+        session.page,
         compiled.unresolvedCompositions,
       );
       assertNotAborted();
@@ -241,14 +369,17 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
 
     // Discover media elements from browser DOM (catches dynamically-set src)
     log.info("Discovering media assets from browser DOM...");
-    const browserMedia = await discoverMediaFromBrowser(probeSession.page);
+    const browserMedia = await discoverMediaFromBrowser(session.page);
     assertNotAborted();
     if (browserMedia.length > 0) {
       const existingVideoIds = new Set(composition.videos.map((v) => v.id));
       const existingAudioIds = new Set(composition.audios.map((a) => a.id));
 
+      pruneMutedBrowserMedia(composition, browserMedia, existingAudioIds);
+
       for (const el of browserMedia) {
         if (!el.src || el.src === "about:blank") continue;
+        if (el.muted && el.tagName === "audio") continue;
 
         // Convert absolute localhost URLs back to relative paths
         let src = el.src;
@@ -257,6 +388,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
         }
 
         if (el.tagName === "video") {
+          // fallow-ignore-next-line code-duplication
           if (existingVideoIds.has(el.id)) {
             // Reconcile to browser/runtime media metadata (runtime src can differ from static HTML).
             const existing = composition.videos.find((v) => v.id === el.id);
@@ -282,7 +414,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
               ) {
                 existing.mediaStart = el.mediaStart;
               }
-              if (el.hasAudio && !existing.hasAudio) {
+              if (el.hasAudio && !el.muted && !existing.hasAudio) {
                 existing.hasAudio = true;
               }
               if (el.loop && !existing.loop) {
@@ -298,11 +430,12 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
               end: el.end,
               mediaStart: el.mediaStart,
               loop: el.loop,
-              hasAudio: el.hasAudio,
+              hasAudio: el.hasAudio && !el.muted,
             });
             existingVideoIds.add(el.id);
           }
         } else if (el.tagName === "audio") {
+          // fallow-ignore-next-line code-duplication
           if (existingAudioIds.has(el.id)) {
             const existing = composition.audios.find((a) => a.id === el.id);
             if (existing) {
@@ -356,7 +489,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
         audioCount: composition.audios.length,
       });
       const automation = await discoverAudioVolumeAutomationFromTimeline(
-        probeSession.page,
+        session.page,
         composition.audios.map((audio) => audio.id),
         composition.duration,
         fpsToNumber(job.config.fps),
@@ -382,7 +515,7 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
         videoCount: composition.videos.length,
       });
       const visibilityWindows = await discoverVideoVisibilityFromTimeline(
-        probeSession.page,
+        session.page,
         composition.duration,
       );
       assertNotAborted();
@@ -477,5 +610,34 @@ export async function runProbeStage(input: ProbeStageInput): Promise<ProbeStageR
     duration,
     totalFrames,
     browserProbeMs,
+    beginFrameStalled,
   };
+}
+
+/**
+ * Preview/render parity for `muted` media: the runtime keeps muted elements
+ * silent, so the mixer must exclude their audio too (they used to be mixed at
+ * full volume). Muted video still renders frames but loses its audio track;
+ * muted audio drops out of the mix entirely. Pure over its inputs so the
+ * parity rule is testable without the probe-session harness.
+ */
+export function pruneMutedBrowserMedia(
+  composition: {
+    videos: { id: string; hasAudio?: boolean }[];
+    audios: { id: string }[];
+  },
+  browserMedia: { id: string; tagName: string; muted?: boolean }[],
+  existingAudioIds?: Set<string>,
+): void {
+  for (const el of browserMedia) {
+    if (!el.muted) continue;
+    if (el.tagName === "video") {
+      const existing = composition.videos.find((v) => v.id === el.id);
+      if (existing) existing.hasAudio = false;
+    } else {
+      const idx = composition.audios.findIndex((a) => a.id === el.id);
+      if (idx >= 0) composition.audios.splice(idx, 1);
+      existingAudioIds?.delete(el.id);
+    }
+  }
 }

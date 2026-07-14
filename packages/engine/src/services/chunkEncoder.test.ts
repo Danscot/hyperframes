@@ -18,6 +18,7 @@ afterEach(() => {
   }
   vi.resetModules();
   vi.doUnmock("child_process");
+  vi.doUnmock("../utils/ffprobe.js");
   vi.useRealTimers();
 });
 
@@ -88,6 +89,11 @@ function emitClose(proc: FakeProc, code: number): void {
   proc.emit("close", code);
 }
 
+async function flushMuxCodecResolution(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 describe("ENCODER_PRESETS", () => {
   it("has draft, standard, and high presets", () => {
     expect(ENCODER_PRESETS).toHaveProperty("draft");
@@ -148,6 +154,11 @@ describe("encodeFramesFromDir ffmpegEncodeTimeout", () => {
     expect(result.error).toContain("FFmpeg exited with code 143");
     expect(result.error).toContain("terminated by timeout");
     expect(result.error).toContain(encodeTimeoutMessage(1000));
+    // Regression: the timeout message used to just state what happened, leaving
+    // the user to independently discover FFMPEG_ENCODE_TIMEOUT_MS and
+    // PRODUCER_ENABLE_CHUNKED_ENCODE (both already existed) on their own.
+    expect(result.error).toContain("FFMPEG_ENCODE_TIMEOUT_MS");
+    expect(result.error).toContain("PRODUCER_ENABLE_CHUNKED_ENCODE");
   });
 
   it("keeps non-timeout ffmpeg failures unchanged", async () => {
@@ -352,6 +363,236 @@ describe("encodeFramesChunkedConcat ffmpegEncodeTimeout", () => {
     expect(result.success).toBe(true);
     expect(result.framesEncoded).toBe(2);
     expect(result.fileSize).toBe(0);
+  });
+});
+
+describe("muxVideoWithAudio audio codec handling", () => {
+  it("copies HyperFrames AAC sidecars into MP4 instead of re-encoding", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.mp4",
+      "/tmp/audio.aac",
+      "/tmp/output.mp4",
+      undefined,
+      undefined,
+      { num: 30, den: 1 },
+    );
+
+    await flushMuxCodecResolution();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual([
+      "-i",
+      "/tmp/video-only.mp4",
+      "-i",
+      "/tmp/audio.aac",
+      "-c:v",
+      "copy",
+      "-c:a",
+      "copy",
+      "-movflags",
+      "+faststart",
+      "-avoid_negative_ts",
+      "make_zero",
+      "-r",
+      "30",
+      "-y",
+      "/tmp/output.mp4",
+    ]);
+    expect(calls[0]!.args).not.toContain("-shortest");
+    expect(calls[0]!.args).not.toContain("-use_editlist");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({
+      success: true,
+      outputPath: "/tmp/output.mp4",
+    });
+  });
+
+  it("uses the caller-provided AAC codec contract instead of the sidecar extension", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.mp4",
+      "/tmp/audio-sidecar",
+      "/tmp/output.mp4",
+      undefined,
+      { audioCodec: "aac" },
+      { num: 30, den: 1 },
+    );
+
+    await flushMuxCodecResolution();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("-c:a");
+    expect(calls[0]!.args[calls[0]!.args.indexOf("-c:a") + 1]).toBe("copy");
+    expect(calls[0]!.args).not.toContain("-b:a");
+    expect(calls[0]!.args).toContain("+faststart");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({
+      success: true,
+      outputPath: "/tmp/output.mp4",
+    });
+  });
+
+  it("probes unknown-extension AAC sidecars before choosing the MP4 copy path", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    const extractAudioMetadata = vi.fn(async () => ({
+      durationSeconds: 1,
+      sampleRate: 48000,
+      channels: 2,
+      audioCodec: "aac",
+    }));
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    vi.doMock("../utils/ffprobe.js", () => ({ extractAudioMetadata }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.mp4",
+      "/tmp/audio-sidecar",
+      "/tmp/output.mp4",
+    );
+
+    await flushMuxCodecResolution();
+    expect(extractAudioMetadata).toHaveBeenCalledWith("/tmp/audio-sidecar");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("-c:a");
+    expect(calls[0]!.args[calls[0]!.args.indexOf("-c:a") + 1]).toBe("copy");
+    expect(calls[0]!.args).not.toContain("-b:a");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({
+      success: true,
+      outputPath: "/tmp/output.mp4",
+    });
+  });
+
+  it("keeps probed non-AAC unknown-extension sidecars on the MP4 transcode path", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    const extractAudioMetadata = vi.fn(async () => ({
+      durationSeconds: 1,
+      sampleRate: 48000,
+      channels: 2,
+      audioCodec: "mp3",
+    }));
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    vi.doMock("../utils/ffprobe.js", () => ({ extractAudioMetadata }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.mp4",
+      "/tmp/audio-sidecar",
+      "/tmp/output.mp4",
+    );
+
+    await flushMuxCodecResolution();
+    expect(extractAudioMetadata).toHaveBeenCalledWith("/tmp/audio-sidecar");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("-c:a");
+    expect(calls[0]!.args[calls[0]!.args.indexOf("-c:a") + 1]).toBe("aac");
+    expect(calls[0]!.args).toContain("-b:a");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({ success: true });
+  });
+
+  it("still transcodes non-AAC audio when muxing MP4", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.mp4",
+      "/tmp/audio.wav",
+      "/tmp/output.mp4",
+    );
+
+    await flushMuxCodecResolution();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("-c:a");
+    expect(calls[0]!.args[calls[0]!.args.indexOf("-c:a") + 1]).toBe("aac");
+    expect(calls[0]!.args).toContain("-b:a");
+    expect(calls[0]!.args).toContain("+faststart");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({ success: true });
+  });
+
+  it("copies HyperFrames AAC sidecars into MOV containers without MP4 faststart flags", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.mov",
+      "/tmp/audio.aac",
+      "/tmp/output.mov",
+    );
+
+    await flushMuxCodecResolution();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("-c:a");
+    expect(calls[0]!.args[calls[0]!.args.indexOf("-c:a") + 1]).toBe("copy");
+    expect(calls[0]!.args).not.toContain("-b:a");
+    expect(calls[0]!.args).not.toContain("+faststart");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({ success: true });
+  });
+
+  it("does not pass -shortest to ffmpeg (regression #1648)", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+
+    for (const ext of [".mp4", ".mov", ".webm"] as const) {
+      const muxPromise = muxVideoWithAudio(
+        `/tmp/video-only${ext}`,
+        "/tmp/audio.aac",
+        `/tmp/output${ext}`,
+        undefined,
+        undefined,
+        { num: 30, den: 1 },
+      );
+      if (ext !== ".webm") await flushMuxCodecResolution();
+      const call = calls[calls.length - 1]!;
+      expect(call.args).not.toContain("-shortest");
+      emitClose(call.proc, 0);
+      await muxPromise;
+    }
+  });
+
+  it("keeps WebM audio on the Opus transcode path", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { muxVideoWithAudio } = await import("./chunkEncoder.js");
+    const muxPromise = muxVideoWithAudio(
+      "/tmp/video-only.webm",
+      "/tmp/audio.aac",
+      "/tmp/output.webm",
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("-c:a");
+    expect(calls[0]!.args[calls[0]!.args.indexOf("-c:a") + 1]).toBe("libopus");
+    expect(calls[0]!.args).not.toContain("+faststart");
+
+    emitClose(calls[0]!.proc, 0);
+    await expect(muxPromise).resolves.toMatchObject({ success: true });
   });
 });
 
@@ -653,7 +894,17 @@ describe("buildEncoderArgs color space", () => {
     );
     const vfIdx = args.indexOf("-vf");
     expect(vfIdx).toBeGreaterThan(-1);
-    expect(args[vfIdx + 1]).toContain("scale=in_range=pc:out_range=tv");
+    expect(args[vfIdx + 1]).toBe("scale=in_range=pc:out_range=tv");
+  });
+
+  it("adds the pad after range conversion for odd CPU output dimensions", () => {
+    const args = buildEncoderArgs(
+      { ...baseOptions, height: 1081, codec: "h264", preset: "medium", quality: 23 },
+      inputArgs,
+      "out.mp4",
+    );
+    const vfIdx = args.indexOf("-vf");
+    expect(args[vfIdx + 1]).toBe("scale=in_range=pc:out_range=tv,pad=ceil(iw/2)*2:ceil(ih/2)*2");
   });
 
   it("prepends range conversion to VAAPI filter chain", () => {
@@ -668,16 +919,73 @@ describe("buildEncoderArgs color space", () => {
     expect(args[vfIdx + 1]).toBe("scale=in_range=pc:out_range=tv,format=nv12,hwupload");
   });
 
-  it("skips range conversion filter for non-VAAPI GPU encoding", () => {
+  it("pads odd dimensions (no range scale) for non-VAAPI GPU encoding", () => {
+    for (const gpu of ["nvenc", "videotoolbox", "qsv", "amf"] as const) {
+      const args = buildEncoderArgs(
+        {
+          ...baseOptions,
+          height: 1081,
+          codec: "h264",
+          preset: "medium",
+          quality: 23,
+          useGpu: true,
+        },
+        inputArgs,
+        "out.mp4",
+        gpu,
+      );
+      const vfIdx = args.indexOf("-vf");
+      // 4:2:0 HW encode still aborts on odd dims, so the pad must be present —
+      // but the range scale belongs to the SW path only.
+      expect(args[vfIdx + 1]).toBe("pad=ceil(iw/2)*2:ceil(ih/2)*2");
+      expect(args[vfIdx + 1]).not.toContain("scale=in_range");
+      // but still has color metadata
+      expect(args).toContain("-colorspace:v");
+    }
+  });
+
+  it("does not require the pad filter for even GPU output dimensions", () => {
     const args = buildEncoderArgs(
       { ...baseOptions, codec: "h264", preset: "medium", quality: 23, useGpu: true },
       inputArgs,
       "out.mp4",
+      "videotoolbox",
+    );
+    expect(args).not.toContain("-vf");
+  });
+
+  it("pads odd dimensions for 10-bit (yuv420p10le) GPU HDR encoding", () => {
+    const args = buildEncoderArgs(
+      {
+        ...baseOptions,
+        height: 1081,
+        codec: "h265",
+        preset: "medium",
+        quality: 23,
+        useGpu: true,
+        pixelFormat: "yuv420p10le",
+      },
+      inputArgs,
+      "out.mp4",
       "nvenc",
     );
+    expect(args[args.indexOf("-vf") + 1]).toBe("pad=ceil(iw/2)*2:ceil(ih/2)*2");
+  });
+
+  it("leaves alpha ProRes untouched (no even-dim pad)", () => {
+    const args = buildEncoderArgs(
+      {
+        ...baseOptions,
+        codec: "prores",
+        preset: "4",
+        quality: 23,
+        pixelFormat: "yuva444p10le",
+      },
+      inputArgs,
+      "out.mov",
+    );
     expect(args.indexOf("-vf")).toBe(-1);
-    // but still has color metadata
-    expect(args).toContain("-colorspace:v");
+    expect(args.join(" ")).not.toContain("pad=");
   });
 
   it("does not add color metadata for VP9", () => {
@@ -918,7 +1226,7 @@ describe("buildEncoderArgs lockGopForChunkConcat", () => {
     expect(args[args.indexOf("-g") + 1]).toBe("240");
     expect(args[args.indexOf("-keyint_min") + 1]).toBe("240");
     expect(args[args.indexOf("-auto-alt-ref") + 1]).toBe("0");
-    expect(args[args.indexOf("-cpu-used") + 1]).toBe("2");
+    expect(args[args.indexOf("-cpu-used") + 1]).toBe("4");
     expect(args[args.indexOf("-deadline") + 1]).toBe("good");
     expect(args.indexOf("-x264-params")).toBe(-1);
     expect(args.indexOf("-x265-params")).toBe(-1);
@@ -934,12 +1242,22 @@ describe("buildEncoderArgs lockGopForChunkConcat", () => {
     );
     expect(args).not.toContain("-g");
     expect(args).not.toContain("-keyint_min");
-    expect(args).not.toContain("-cpu-used");
+    expect(args[args.indexOf("-cpu-used") + 1]).toBe("4");
     // The non-locked, non-alpha VP9 path leaves `-auto-alt-ref` at the
     // libvpx default. Alpha branches still emit `-auto-alt-ref 0` for an
     // unrelated reason (alpha + alt-ref is unsupported), but that's a
     // separate test below.
     expect(args).not.toContain("-auto-alt-ref");
+  });
+
+  it("honors the resolved engine VP9 cpu-used override", () => {
+    const args = buildEncoderArgs(
+      { ...baseOptions, codec: "vp9", preset: "good", quality: 23, vp9CpuUsed: 6 },
+      inputArgs,
+      "out.webm",
+    );
+
+    expect(args[args.indexOf("-cpu-used") + 1]).toBe("6");
   });
 
   it("true with alpha pixel format keeps alpha metadata and emits -auto-alt-ref once", () => {

@@ -6,11 +6,14 @@
  * fallbacks for backward compatibility during migration.
  */
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getSystemTotalMb,
   isLowMemorySystem,
   LOW_MEMORY_TOTAL_MB_THRESHOLD,
 } from "./services/systemMemory.js";
+import { DEFAULT_VP9_CPU_USED, normalizeVp9CpuUsed } from "./services/vp9Options.js";
 
 /**
  * Full engine configuration. All fields are wired through the config
@@ -55,6 +58,50 @@ export interface EngineConfig {
   /** Force screenshot capture mode (skip BeginFrame even on Linux). */
   forceScreenshot: boolean;
   /**
+   * Static-frame dedup: reuse byte-identical frames instead of re-seeking +
+   * re-screenshotting (anchor-verified at init). Default ON; disable via
+   * `HF_STATIC_DEDUP` in {false,0,off}. Only arms in screenshot capture mode.
+   */
+  staticFrameDedup: boolean;
+  /**
+   * Use drawElementImage for frame capture (requires the CanvasDrawElement
+   * Chrome flag, added globally in buildChromeArgs). Default ON, clamped in
+   * `resolveConfig` to hosts where it can actually engage (macOS + hardware-GPU
+   * browser); compile/init gates and the runtime self-verification net route
+   * incompatible or damaged renders back to screenshot capture.
+   * Kill switch: `PRODUCER_EXPERIMENTAL_FAST_CAPTURE=false` (or the CLI
+   * `--experimental-fast-capture=false`).
+   */
+  useDrawElement: boolean;
+  /**
+   * Pipeline JPEG encode into an in-page OffscreenCanvas Worker for the
+   * drawElement fast-capture path (macOS hardware GPU only). The worker
+   * encodes frame N while the main thread seeks+paints frame N+1
+   * (~1.65–1.96× wall-time speedup). No-op unless `useDrawElement` is also
+   * true. Kill switch: `HF_DE_WORKER_ENCODE=false`.
+   */
+  enableDrawElementWorkerEncode: boolean;
+  /**
+   * INTERNAL. Set by resolveConfig when it disabled enablePageSideCompositing
+   * solely because drawElement was on. Lets the producer's compile-time gates
+   * restore page-side compositing without overriding an explicit caller/env
+   * opt-out. Not intended to be set by callers.
+   */
+  pageSideCompositingAutoDisabled?: boolean;
+  /**
+   * INTERNAL. Set to `true` by `resolveConfig` when the caller explicitly
+   * opted out of the software-GPU→screenshot clamp — either via env
+   * `PRODUCER_FORCE_SCREENSHOT=false` or programmatic
+   * `overrides.forceScreenshot === false`. The concrete-resolved-GPU helper
+   * (`shouldClampToScreenshotForConcreteGpu`) reads this so the
+   * `browserGpuMode:"auto"` → software probe path preserves the same
+   * escape hatch as literal `browserGpuMode:"software"` (the boolean
+   * `forceScreenshot === false` at that point is otherwise ambiguous —
+   * default vs explicit opt-out — because the config resolves before
+   * the runtime probe fires). Not intended to be set by callers.
+   */
+  forceScreenshotExplicitlyOptedOut?: boolean;
+  /**
    * Low-memory render profile. When `true`, the orchestrator collapses the
    * pipeline to its cheapest shape on memory-constrained hosts: it skips the
    * throwaway auto-worker calibration browser, pins capture to a single
@@ -95,6 +142,11 @@ export interface EngineConfig {
   enablePageSideCompositing: boolean;
 
   // ── Encoding ─────────────────────────────────────────────────────────
+  /**
+   * libvpx-vp9 speed/quality tradeoff. Higher values encode faster with a
+   * larger quality/size tradeoff. FFmpeg accepts integer values from -8 to 8.
+   */
+  vp9CpuUsed: number;
   enableChunkedEncode: boolean;
   chunkSizeFrames: number;
   enableStreamingEncode: boolean;
@@ -166,16 +218,19 @@ export interface EngineConfig {
   /**
    * Directory where the content-addressed extraction cache persists frame
    * bundles keyed on (path, mtime, size, mediaStart, duration, fps, format).
-   * Undefined disables caching — extraction runs into the render's workDir
-   * and cleanup removes it when the render ends, preserving the pre-cache
-   * behaviour.
+   * Defaults on under the OS temp directory:
+   * `<tmpdir>/hyperframes-extract-cache-<uid>`.
    *
-   * **Single-writer.** The cache is not safe for concurrent renders pointing
-   * at the same directory. A `.hf-complete` sentinel prevents another render
-   * from serving an entry that hasn't finished extracting, but individual
-   * frame files are written non-atomically — a second render reading during
-   * the write window can observe a truncated frame. Give each concurrent
-   * render pipeline its own `extractCacheDir`, or gate with an external mutex.
+   * New entries publish atomically: frames are extracted into a unique
+   * partial directory, the `.hf-complete` sentinel is written there, and the
+   * partial directory is renamed into the final key directory. Concurrent
+   * renders against the same cache are safe; at worst, two renders duplicate
+   * ffmpeg work and one rehydrates from the winner.
+   *
+   * Set `HYPERFRAMES_EXTRACT_CACHE_DIR` to a path to override the default, or
+   * to `off`, `none`, `false`, or `0` to disable caching for the process.
+   * When disabled, extraction runs into the render's workDir and cleanup
+   * removes it when the render ends, preserving the pre-cache behaviour.
    *
    * **Network filesystems.** `mtime` resolution on NFS/SMB mounts can be
    * coarser than expected (seconds rather than nanoseconds), which may
@@ -185,6 +240,15 @@ export interface EngineConfig {
    * Env fallback: `HYPERFRAMES_EXTRACT_CACHE_DIR`.
    */
   extractCacheDir?: string;
+  /**
+   * Soft disk budget for `extractCacheDir`, in bytes. The renderer runs a
+   * best-effort LRU sweep after extraction and evicts oldest sentineled
+   * entries until the cache is under this cap, while protecting young entries
+   * that may belong to live renders.
+   *
+   * Env fallback: `HYPERFRAMES_EXTRACT_CACHE_MAX_MB` (megabytes).
+   */
+  extractCacheMaxBytes: number;
 
   // ── Debug ────────────────────────────────────────────────────────────
   debug: boolean;
@@ -208,11 +272,15 @@ export const DEFAULT_CONFIG: EngineConfig = {
   browserTimeout: 120_000,
   protocolTimeout: 300_000,
   forceScreenshot: false,
+  staticFrameDedup: true,
+  useDrawElement: true,
+  enableDrawElementWorkerEncode: true,
   // Auto-detected per host in `resolveConfig`; defaults off for the raw
   // DEFAULT_CONFIG (used directly by tests and worker-sizing fallbacks).
   lowMemoryMode: false,
   enablePageSideCompositing: true,
 
+  vp9CpuUsed: DEFAULT_VP9_CPU_USED,
   enableChunkedEncode: false,
   chunkSizeFrames: 360,
   enableStreamingEncode: true,
@@ -235,8 +303,57 @@ export const DEFAULT_CONFIG: EngineConfig = {
 
   verifyRuntime: true,
 
+  extractCacheMaxBytes: 2 * 1024 ** 3,
+
   debug: false,
 };
+
+/**
+ * Reference canvas area for the baseline `protocolTimeout`: 1080p. A single CDP
+ * call (`Runtime.callFunctionOn` seek+paint, or `Page.captureScreenshot`)
+ * scales with the *output pixel area* it has to render/serialize — NOT with the
+ * frame count (that governs total wall-clock, capped separately by the ffmpeg
+ * streaming inactivity timeout). A fixed 300s ceiling intermittently kills
+ * legitimate slow-but-valid renders on large canvases with
+ * `Runtime.callFunctionOn timed out`, so we scale the per-call ceiling with
+ * area.
+ */
+const PROTOCOL_TIMEOUT_REFERENCE_PIXELS = 1920 * 1080;
+
+/**
+ * Absolute ceiling on the scaled protocol timeout (30 minutes). Bounds the
+ * blast radius: a genuinely wedged CDP call must still eventually fail rather
+ * than hang for an unbounded time on a pathologically large composition.
+ */
+const MAX_SCALED_PROTOCOL_TIMEOUT_MS = 1_800_000;
+
+/**
+ * Scale a base `protocolTimeout` up for oversized compositions.
+ *
+ * Scales by output pixel area (`width*height / reference`) — where width/height
+ * are the *device-scaled output* dimensions (the pixels a single CDP call
+ * actually renders/serializes), not the CSS composition size. Clamped to
+ * `[baseTimeout, max(baseTimeout, MAX_SCALED_PROTOCOL_TIMEOUT_MS)]`: never
+ * scales DOWN (a small composition — or a base already above the ceiling —
+ * keeps the configured base), and only ever raises. Pure function; exported
+ * for tests.
+ */
+export function scaleProtocolTimeoutForComposition(
+  baseTimeoutMs: number,
+  dims: { width: number; height: number },
+): number {
+  const { width, height } = dims;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return baseTimeoutMs;
+  }
+  const factor = (width * height) / PROTOCOL_TIMEOUT_REFERENCE_PIXELS;
+  if (factor <= 1) return baseTimeoutMs;
+  const scaled = Math.ceil(baseTimeoutMs * factor);
+  // Ceiling is `max(base, MAX)` so an explicit base above the ceiling is never
+  // lowered (preserves the "only ever raise" contract for all callers).
+  const ceiling = Math.max(baseTimeoutMs, MAX_SCALED_PROTOCOL_TIMEOUT_MS);
+  return Math.min(ceiling, Math.max(baseTimeoutMs, scaled));
+}
 
 function memoryAdaptiveCacheLimit(): number {
   const total = getSystemTotalMb();
@@ -270,6 +387,11 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     if (raw === undefined) return fallback;
     return raw === "true";
   };
+  const envVp9CpuUsed = (): number => {
+    const raw = env("PRODUCER_VP9_CPU_USED");
+    if (raw === undefined || raw === "") return DEFAULT_CONFIG.vp9CpuUsed;
+    return normalizeVp9CpuUsed(Number(raw));
+  };
   const envBrowserGpuMode = (): EngineConfig["browserGpuMode"] => {
     const raw = env("PRODUCER_BROWSER_GPU_MODE");
     if (raw === "hardware" || raw === "software" || raw === "auto") return raw;
@@ -281,6 +403,28 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     if (raw === "true" || raw === "on" || raw === "1") return true;
     if (raw === "false" || raw === "off" || raw === "0") return false;
     return isLowMemorySystem();
+  };
+  // Opt-OUT: default ON, disabled only by an explicit falsey value.
+  const resolveStaticFrameDedup = (): boolean => {
+    const raw = env("HF_STATIC_DEDUP")?.trim().toLowerCase();
+    return !(raw === "false" || raw === "off" || raw === "0");
+  };
+  const resolveExtractCacheDir = (): string | undefined => {
+    const raw = env("HYPERFRAMES_EXTRACT_CACHE_DIR");
+    if (raw === undefined) {
+      return join(tmpdir(), `hyperframes-extract-cache-${process.getuid?.() ?? "u"}`);
+    }
+    const trimmed = raw.trim();
+    const normalized = trimmed.toLowerCase();
+    if (
+      normalized === "off" ||
+      normalized === "none" ||
+      normalized === "false" ||
+      normalized === "0"
+    ) {
+      return undefined;
+    }
+    return raw;
   };
 
   // Env-var layer (backward compat)
@@ -307,12 +451,19 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       : undefined,
 
     forceScreenshot: envBool("PRODUCER_FORCE_SCREENSHOT", DEFAULT_CONFIG.forceScreenshot),
+    staticFrameDedup: resolveStaticFrameDedup(),
+    useDrawElement: envBool("PRODUCER_EXPERIMENTAL_FAST_CAPTURE", DEFAULT_CONFIG.useDrawElement),
+    enableDrawElementWorkerEncode: envBool(
+      "HF_DE_WORKER_ENCODE",
+      DEFAULT_CONFIG.enableDrawElementWorkerEncode,
+    ),
     lowMemoryMode: resolveLowMemoryMode(),
     enablePageSideCompositing: envBool(
       "HF_PAGE_SIDE_COMPOSITING",
       DEFAULT_CONFIG.enablePageSideCompositing,
     ),
 
+    vp9CpuUsed: envVp9CpuUsed(),
     enableChunkedEncode: envBool(
       "PRODUCER_ENABLE_CHUNKED_ENCODE",
       DEFAULT_CONFIG.enableChunkedEncode,
@@ -373,15 +524,168 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     verifyRuntime: env("PRODUCER_VERIFY_HYPERFRAME_RUNTIME") !== "false",
     runtimeManifestPath: env("PRODUCER_HYPERFRAME_MANIFEST_PATH"),
 
-    extractCacheDir: env("HYPERFRAMES_EXTRACT_CACHE_DIR"),
+    extractCacheDir: resolveExtractCacheDir(),
+    extractCacheMaxBytes:
+      envNum("HYPERFRAMES_EXTRACT_CACHE_MAX_MB", DEFAULT_CONFIG.extractCacheMaxBytes / 1024 ** 2) *
+      1024 ** 2,
   };
 
   // Remove undefined values so they don't override defaults
   const cleanEnv = Object.fromEntries(Object.entries(fromEnv).filter(([, v]) => v !== undefined));
 
-  return {
+  const merged = {
     ...DEFAULT_CONFIG,
     ...cleanEnv,
     ...overrides,
   };
+
+  // Default-on drawElement is clamped to hosts where it can actually engage
+  // (macOS with a non-software-GPU browser; SwiftShader drops transparent
+  // sub-layers — crbug 521434899). "auto" passes the clamp: the stock CLI
+  // resolves GPU mode to auto, which probes to hardware on real Macs — and if
+  // it resolves to software after all, the SwiftShader init-time gate still
+  // routes the session to the screenshot baseline. Without the clamp, the
+  // default would needlessly disable page-side shader compositing (below) on
+  // Linux/Docker hosts where DE never runs. An EXPLICIT opt-in (env or caller override)
+  // skips the clamp and keeps the old semantics — attempt DE, let the
+  // init-time gates route away — which debugging relies on.
+  const explicitDrawElementOptIn =
+    env("PRODUCER_EXPERIMENTAL_FAST_CAPTURE") === "true" || overrides?.useDrawElement === true;
+  if (
+    merged.useDrawElement &&
+    !explicitDrawElementOptIn &&
+    !(process.platform === "darwin" && merged.browserGpuMode !== "software")
+  ) {
+    merged.useDrawElement = false;
+  }
+  // The runtime self-verification net lives in the worker-encode drain — the
+  // serial drawElement path has only the blank guard. Default-on drawElement
+  // therefore requires worker-encode; disabling HF_DE_WORKER_ENCODE without an
+  // explicit drawElement opt-in falls back to the screenshot baseline rather
+  // than shipping unverified drawElement frames.
+  if (merged.useDrawElement && !explicitDrawElementOptIn && !merged.enableDrawElementWorkerEncode) {
+    merged.useDrawElement = false;
+  }
+
+  // Software GPU implies screenshot capture.
+  //
+  // Two existing platform gates already do most of the work: `browserManager`
+  // only launches BeginFrame on Linux + chrome-headless-shell + !forceScreenshot,
+  // and the DE clamp above turns off `useDrawElement` on non-(darwin +
+  // non-software) hosts. Setting `forceScreenshot` here layers defense-in-depth
+  // on top:
+  //
+  //   1. Linux + software (SwiftShader host): kicks the browser off BeginFrame,
+  //      which stalls the compositor on shader-heavy frames under CPU raster
+  //      (same motivation as the closed PR #822).
+  //   2. Observability truth: `renderOrchestrator`'s reported `captureMode`
+  //      field is derived from `cfg.forceScreenshot ? "screenshot" : "beginframe"`
+  //      — without this clamp it misreports `"beginframe"` for the actual
+  //      screenshot capture on darwin + software.
+  //   3. Future-proofing: any new BeginFrame or drawElement entry point that
+  //      forgets to gate on GPU mode still routes to screenshot here.
+  //
+  // Note this does NOT eliminate SwiftShader-on-darwin text-rasterization
+  // artifacts (an ANGLE-SwiftShader issue on macOS text — the fix there is to
+  // use `--browser-gpu`, which routes to `--use-angle=metal`). It only makes
+  // routing consistent + observability accurate.
+  //
+  // Explicit opt-out (env or programmatic override) is honored so BeginFrame-
+  // on-software debugging remains possible.
+  const explicitForceScreenshotOptOut =
+    env("PRODUCER_FORCE_SCREENSHOT") === "false" || overrides?.forceScreenshot === false;
+  // Persist provenance so the concrete-resolved-GPU helper can honor the
+  // programmatic opt-out too — at that point `forceScreenshot === false` is
+  // otherwise ambiguous between default and explicit opt-out.
+  if (explicitForceScreenshotOptOut) {
+    merged.forceScreenshotExplicitlyOptedOut = true;
+  }
+  if (
+    merged.browserGpuMode === "software" &&
+    !merged.forceScreenshot &&
+    !explicitForceScreenshotOptOut
+  ) {
+    merged.forceScreenshot = true;
+  }
+
+  // drawElement capture and page-side shader compositing are mutually
+  // incompatible capture strategies (drawElement reads paint records directly
+  // and bypasses the page-side prepare→composite→resolve protocol). When
+  // fast capture is on, force page-side compositing off so shader
+  // transitions fall back to the Node-side layered blend rather than silently
+  // dropping. This keeps the flag self-consistent and avoids a per-session
+  // incompatibility warning on every fast-capture render.
+  if (merged.useDrawElement && merged.enablePageSideCompositing) {
+    merged.enablePageSideCompositing = false;
+    // Record that THIS resolution (not the caller) turned page-side
+    // compositing off, so a later compile-time drawElement gate can restore
+    // it without clobbering an explicit enablePageSideCompositing:false from
+    // the programmatic API or HF_PAGE_SIDE_COMPOSITING=false.
+    merged.pageSideCompositingAutoDisabled = true;
+  }
+
+  return {
+    ...merged,
+    vp9CpuUsed: normalizeVp9CpuUsed(merged.vp9CpuUsed),
+  };
+}
+
+/**
+ * Runtime-resolved companion to the software-GPU screenshot clamp in
+ * `resolveConfig`. Returns `true` iff callers should treat this render as
+ * `forceScreenshot=true` even though the config's stored `forceScreenshot`
+ * is `false`. Fires when the concrete resolved GPU is software AND neither
+ * the env opt-out (`PRODUCER_FORCE_SCREENSHOT=false`) nor the programmatic
+ * opt-out (`overrides.forceScreenshot === false`, carried via
+ * `cfg.forceScreenshotExplicitlyOptedOut`) is set.
+ *
+ * `resolveConfig`'s clamp only sees `browserGpuMode` as a string, so
+ * `"auto"` that runtime-probes to software slips through. This helper
+ * closes that gap at the concrete-resolution points (`frameCapture` and
+ * `renderOrchestrator`). Same invariant, same escape hatches, one predicate.
+ *
+ * Callers should skip when the invariant is already satisfied
+ * (`currentForceScreenshot === true`) to avoid redundant work. Pass
+ * `cfg.forceScreenshotExplicitlyOptedOut` via `opts.programmaticOptOut` so
+ * the `browserGpuMode:"auto"` → software probe path honors the same
+ * programmatic escape hatch as literal `browserGpuMode:"software"`.
+ */
+export function shouldClampToScreenshotForConcreteGpu(
+  resolvedGpuMode: "software" | "hardware",
+  currentForceScreenshot: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { programmaticOptOut?: boolean } = {},
+): boolean {
+  if (currentForceScreenshot) return false;
+  if (resolvedGpuMode !== "software") return false;
+  if (opts.programmaticOptOut) return false;
+  return env["PRODUCER_FORCE_SCREENSHOT"] !== "false";
+}
+
+/**
+ * Caller-facing pair to `shouldClampToScreenshotForConcreteGpu`: computes the
+ * value the *authoritative* `forceScreenshot` local should hold after the
+ * concrete-resolved-GPU decision fires. Returns the (possibly-promoted) new
+ * boolean, so the caller can assign it back to its local — driving both
+ * routing AND telemetry from one source of truth.
+ *
+ * Reads the programmatic opt-out from `cfg.forceScreenshotExplicitlyOptedOut`
+ * (set by `resolveConfig` when EITHER env `PRODUCER_FORCE_SCREENSHOT=false`
+ * OR programmatic `overrides.forceScreenshot === false` was present).
+ *
+ * Idempotent: `applyConcreteGpuScreenshotClamp(true, ...)` returns `true`
+ * without consulting anything else.
+ */
+export function applyConcreteGpuScreenshotClamp(
+  currentForceScreenshot: boolean,
+  resolvedGpuMode: "software" | "hardware",
+  cfg: Pick<EngineConfig, "forceScreenshotExplicitlyOptedOut"> | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    currentForceScreenshot ||
+    shouldClampToScreenshotForConcreteGpu(resolvedGpuMode, currentForceScreenshot, env, {
+      programmaticOptOut: cfg?.forceScreenshotExplicitlyOptedOut ?? false,
+    })
+  );
 }

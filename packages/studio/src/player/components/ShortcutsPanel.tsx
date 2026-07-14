@@ -36,6 +36,8 @@ const SHORTCUT_SECTIONS = [
       { key: "⌘V", label: "Paste element" },
       { key: "⌘X", label: "Cut element" },
       { key: "S", label: "Split clip at playhead" },
+      { key: "⌘G", label: "Group elements" },
+      { key: "⌘⇧G", label: "Ungroup" },
       { key: "Del", label: "Delete selected element" },
     ],
   },
@@ -48,6 +50,21 @@ const SHORTCUT_SECTIONS = [
       { key: "⌥ Drag", label: "Record rotation" },
       { key: "⌘ Drag↕", label: "Record opacity" },
       { key: "⌘ Scroll", label: "Record scale" },
+    ],
+  },
+  {
+    title: "Canvas",
+    hints: [
+      { key: "Drag", label: "Move element / add keyframe" },
+      { key: "⌥ Drag", label: "Move entire animation path" },
+      { key: "⇧ Drag", label: "Uniform resize" },
+    ],
+  },
+  {
+    title: "Crop",
+    hints: [
+      { key: "Drag edge", label: "Crop a side" },
+      { key: "Drag center", label: "Reposition the crop" },
     ],
   },
   {

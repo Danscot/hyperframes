@@ -9,9 +9,11 @@
  * `timeout: 0` footguns at the rate of "one per missing branch".
  */
 
+import { readFileSync, type Stats } from "node:fs";
 import { resolve, sep } from "node:path";
-import { type Stats } from "node:fs";
+import { parseFps } from "@hyperframes/core";
 import { errorBox } from "../ui/format.js";
+import { readCompositionFps } from "./compositionFps.js";
 
 // ── --browser-timeout ──────────────────────────────────────────────────
 
@@ -115,6 +117,14 @@ export function resolveBrowserTimeoutMsArg(raw: string | undefined): number | un
   return result.value;
 }
 
+/** Navigation budget shared by snapshot/check/inspect browser diagnostics. */
+export function resolveDiagnosticNavigationTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const parsed = Number(env.PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+}
+
 // ── --composition ──────────────────────────────────────────────────────
 
 export type CompositionEntryParseError =
@@ -125,6 +135,15 @@ export type CompositionEntryParseError =
 export type CompositionEntryParseResult =
   | { ok: true; value: string | undefined }
   | { ok: false; error: CompositionEntryParseError };
+
+function normalizeCompositionEntryArg(raw: string | undefined): string | undefined {
+  const trimmed = raw?.trim().replace(/^\.\//, "") || undefined;
+  return !trimmed || trimmed === "." ? undefined : trimmed;
+}
+
+export function hasExplicitCompositionArg(raw: string | undefined): boolean {
+  return normalizeCompositionEntryArg(raw) !== undefined;
+}
 
 /**
  * Parse and validate `--composition <path>` into a project-relative
@@ -144,11 +163,11 @@ export function parseCompositionEntryArg(
   projectDir: string,
   stat: (path: string) => Stats,
 ): CompositionEntryParseResult {
-  const trimmed = raw?.trim().replace(/^\.\//, "") || undefined;
+  const trimmed = normalizeCompositionEntryArg(raw);
   // Normalize the project-root shorthands to "no entry override" so the
   // producer falls back to index.html instead of statSync-ing the dir
   // and later blowing up with EISDIR inside readFileSync().
-  if (!trimmed || trimmed === ".") return { ok: true, value: undefined };
+  if (!trimmed) return { ok: true, value: undefined };
 
   const absProjectDir = resolve(projectDir);
   const entryPath = resolve(absProjectDir, trimmed);
@@ -218,6 +237,32 @@ export function resolveCompositionEntryArg(
     process.exit(1);
   }
   return result.value;
+}
+
+// ── default fps ────────────────────────────────────────────────────────
+
+/**
+ * Resolve the fps argument that local `render` should parse: explicit --fps,
+ * else the actual composition entry file's root data-fps when valid, else
+ * undefined so the caller can apply its final "30" default.
+ */
+export function resolveDefaultFpsArg(
+  explicitFps: string | undefined,
+  projectDir: string,
+  indexPath: string,
+  entryFile: string | undefined,
+): string | undefined {
+  if (explicitFps != null) return explicitFps;
+  try {
+    const fpsSourcePath = entryFile ? resolve(projectDir, entryFile) : indexPath;
+    const declared = readCompositionFps(readFileSync(fpsSourcePath, "utf8"));
+    if (declared != null && parseFps(declared).ok) {
+      return declared;
+    }
+  } catch {
+    // Unreadable composition file — fall back to the default fps in render.ts.
+  }
+  return undefined;
 }
 
 export type GifLoopParseResult =

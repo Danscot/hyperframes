@@ -97,6 +97,7 @@ export async function testPortOnAllHosts(
 
 interface HyperframesConfigResponse {
   isHyperframes: boolean;
+  pid?: number;
   projectName: string;
   projectDir: string;
   serverBuildSignature?: string | null;
@@ -205,6 +206,13 @@ async function getProcessOnPort(port: number): Promise<string | null> {
 
 export interface ActiveServer {
   port: number;
+  /**
+   * Loopback host the server is reachable on, URL-ready (`127.0.0.1` or
+   * `[::1]`). Vite dev servers bind IPv6 (`::1`) while embedded servers bind
+   * IPv4; consumers must use this rather than assuming `127.0.0.1`. Defaults to
+   * `127.0.0.1` when unset (embedded scan path).
+   */
+  host?: string;
   projectName: string;
   projectDir: string;
   version: string;
@@ -271,7 +279,10 @@ export async function scanActiveServers(startPort = 3002): Promise<ActiveServer[
       ports.map(async (port) => {
         const config = await probePort(port);
         if (!config) return null;
-        const pid = await getProcessOnPort(port);
+        const pid =
+          Number.isInteger(config.pid) && Number(config.pid) > 0
+            ? String(config.pid)
+            : await getProcessOnPort(port);
         return {
           port,
           projectName: config.projectName,

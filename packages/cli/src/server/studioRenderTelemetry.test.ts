@@ -93,6 +93,8 @@ const fullPerf: RenderPerfSummary = {
     videoExtractMs: 200,
     audioProcessMs: 50,
     captureMs: 4000,
+    captureSetupMs: 750,
+    captureFrameMs: 3250,
     encodeMs: 500,
     assembleMs: 150,
   },
@@ -107,6 +109,10 @@ const fullPerf: RenderPerfSummary = {
     extractMs: 60,
     cacheHits: 3,
     cacheMisses: 4,
+    cachePublishFailures: 0,
+    cacheGcEvictions: 0,
+    cacheGcBytesFreed: 0,
+    cacheAgedPartialsCleared: 0,
   },
   tmpPeakBytes: 1024,
   captureAvgMs: 13,
@@ -132,6 +138,16 @@ describe("studioRenderTelemetry", () => {
       expect(payload.gpu).toBe(false);
     });
 
+    it("forwards the browser user's distinctId so the render funnel is joinable", () => {
+      emitStudioRenderComplete({ ...opts, distinctId: "browser-user-123" }, 5000, fullPerf);
+      expect(trackRenderComplete.mock.calls[0]![0].distinctId).toBe("browser-user-123");
+    });
+
+    it("leaves distinctId undefined for older clients that don't send one", () => {
+      emitStudioRenderComplete(opts, 5000, fullPerf);
+      expect(trackRenderComplete.mock.calls[0]![0].distinctId).toBeUndefined();
+    });
+
     it("maps every RenderPerfSummary field to the expected payload key", () => {
       emitStudioRenderComplete(opts, 5000, fullPerf);
       const p = trackRenderComplete.mock.calls[0]![0];
@@ -151,6 +167,8 @@ describe("studioRenderTelemetry", () => {
       expect(p.stageVideoExtractMs).toBe(200);
       expect(p.stageAudioProcessMs).toBe(50);
       expect(p.stageCaptureMs).toBe(4000);
+      expect(p.stageCaptureSetupMs).toBe(750);
+      expect(p.stageCaptureFrameMs).toBe(3250);
       expect(p.stageEncodeMs).toBe(500);
       expect(p.stageAssembleMs).toBe(150);
       // video-extract breakdown
@@ -262,6 +280,7 @@ describe("studioRenderTelemetry", () => {
         progress: 25,
         currentStage: "Starting frame capture",
         createdAt: new Date(),
+        warnings: [],
         errorDetails: {
           message: "Navigation timeout of 60000 ms exceeded",
           elapsedMs: 60_001,

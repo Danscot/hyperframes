@@ -47,15 +47,16 @@ await startServer({ port: 8080 });
 
 `RenderConfig` controls the render pipeline:
 
-| Option       | Default      | Description                                                                                                                          |
-| ------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `inputPath`  | —            | Path to the HTML composition                                                                                                         |
-| `outputPath` | —            | Output video file path (or directory, for `format: "png-sequence"`)                                                                  |
-| `width`      | 1920         | Frame width in pixels                                                                                                                |
-| `height`     | 1080         | Frame height in pixels                                                                                                               |
-| `fps`        | 30           | Frames per second (24, 30, or 60)                                                                                                    |
-| `quality`    | `"standard"` | Encoder preset (`"draft"`, `"standard"`, `"high"`)                                                                                   |
-| `format`     | `"mp4"`      | Output container — `"mp4"`, `"webm"`, `"mov"`, or `"png-sequence"`. See [Transparent Video Output](#transparent-video-output) below. |
+| Option             | Default      | Description                                                                                                                                              |
+| ------------------ | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `inputPath`        | —            | Path to the HTML composition                                                                                                                             |
+| `outputPath`       | —            | Output video file path (or directory, for `format: "png-sequence"`)                                                                                      |
+| `width`            | 1920         | Frame width in pixels                                                                                                                                    |
+| `height`           | 1080         | Frame height in pixels                                                                                                                                   |
+| `fps`              | 30           | Frames per second (24, 30, or 60)                                                                                                                        |
+| `quality`          | `"standard"` | Encoder preset (`"draft"`, `"standard"`, `"high"`)                                                                                                       |
+| `format`           | `"mp4"`      | Output container — `"mp4"`, `"webm"`, `"mov"`, or `"png-sequence"`. See [Transparent Video Output](#transparent-video-output) below.                     |
+| `videoFrameFormat` | `"auto"`     | Source video frame extraction format — `"auto"`, `"jpg"`, or `"png"`. Use `"png"` for UI recordings, screen captures, and color-sensitive source videos. |
 
 ## Transparent Video Output
 
@@ -89,7 +90,7 @@ await executeRenderJob(job);
 
 The producer captures Chrome screenshots with the page background forced transparent (`html, body, [data-composition-id] { background: transparent !important }`) and the CDP default background override set to RGBA 0,0,0,0. The captured PNGs carry a real alpha channel and that channel is preserved end-to-end:
 
-- VP9 (`webm`) is encoded with `-pix_fmt yuva420p`, `-auto-alt-ref 0`, and `alpha_mode=1` metadata.
+- VP9 (`webm`) is encoded with `-pix_fmt yuva420p`, `-auto-alt-ref 0`, `-cpu-used 4` by default, and `alpha_mode=1` metadata. Tune the speed/quality tradeoff with `PRODUCER_VP9_CPU_USED` (`-8` to `8`) or local CLI `--vp9-cpu-used`.
 - ProRes 4444 (`mov`) is encoded with `-pix_fmt yuva444p10le`.
 - PNG sequences are written without re-encoding (zero-padded `frame_NNNNNN.png`).
 

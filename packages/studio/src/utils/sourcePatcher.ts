@@ -90,6 +90,8 @@ export interface PatchOperation {
   type: "inline-style" | "attribute" | "text-content" | "html-attribute";
   property: string;
   value: string | null;
+  childSelector?: string;
+  childIndex?: number;
 }
 
 // Runtime validation for hfId lives in findTagByTarget → execDataAttrPattern (CSS attr-value
@@ -239,16 +241,6 @@ function execDataAttrPattern(html: string, attr: string, value: string): TagMatc
   const pattern = new RegExp(`(<[^>]*\\b${attr}=(["'])${escapeRegex(value)}\\2[^>]*)>`, "i");
   const match = pattern.exec(html);
   if (match?.index == null) return null;
-  // Defensive: a second exact match means a duplicate id/attr in the source
-  // (id drift). Don't silently patch the first while leaving the other stale —
-  // surface it. By the mint contract this should never fire.
-  const all = html.match(new RegExp(`<[^>]*\\b${attr}=(["'])${escapeRegex(value)}\\1[^>]*>`, "gi"));
-  if (all && all.length > 1) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `sourcePatcher: ${attr}="${value}" matched ${all.length} elements; patching the first. ids/attrs must be unique per document.`,
-    );
-  }
   return { tag: match[1], start: match.index, end: match.index + match[1].length };
 }
 
@@ -331,8 +323,9 @@ function patchAttributeByTarget(
 
   if (value === null) {
     // Remove the attribute if present
-    if (!attrPattern.test(tag)) return html;
-    const removePattern = new RegExp(`\\s+${escapeRegex(fullAttr)}=(["'])[^"']*\\1`);
+    const boolAttrPattern = new RegExp(`\\b${escapeRegex(fullAttr)}(?:=(["'])[^"']*\\1)?`);
+    if (!boolAttrPattern.test(tag)) return html;
+    const removePattern = new RegExp(`\\s+${escapeRegex(fullAttr)}(?:=(["'])[^"']*\\1)?`);
     const newTag = tag.replace(removePattern, "");
     return replaceTagAtMatch(html, match, newTag);
   }
@@ -365,8 +358,9 @@ function patchAttribute(
   const attrPattern = new RegExp(`\\b${escapeRegex(fullAttr)}=(["'])([^"']*)\\1`);
 
   if (value === null) {
-    if (!attrPattern.test(tag)) return html;
-    const removePattern = new RegExp(`\\s+${escapeRegex(fullAttr)}=(["'])[^"']*\\1`);
+    const boolAttrPattern = new RegExp(`\\b${escapeRegex(fullAttr)}(?:=(["'])[^"']*\\1)?`);
+    if (!boolAttrPattern.test(tag)) return html;
+    const removePattern = new RegExp(`\\s+${escapeRegex(fullAttr)}(?:=(["'])[^"']*\\1)?`);
     const newTag = tag.replace(removePattern, "");
     return html.replace(tag, newTag);
   }

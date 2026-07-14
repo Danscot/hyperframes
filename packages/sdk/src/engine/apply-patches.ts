@@ -10,18 +10,53 @@
 
 import type { JsonPatchOp, OverrideSet } from "../types.js";
 import type { ParsedDocument } from "./model.js";
-import { findById, findRoot, setElementStyles, setOwnText } from "./model.js";
-import { keyToPath } from "./patches.js";
+import {
+  findById,
+  findRoot,
+  declarationElement,
+  setElementStyles,
+  setOwnText,
+  setGsapScript,
+  setStyleSheet,
+} from "./model.js";
+import { keyToPath, stylePath } from "./patches.js";
+import {
+  writeVariableDefault,
+  clearVariableDefault,
+  writeVariableDeclaration,
+  removeVariableDeclarationEntry,
+} from "./variableModel.js";
+
+function isRawDeclarationEntry(value: unknown): value is { id: string } & Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as { id?: unknown }).id === "string"
+  );
+}
 
 // ─── Path parser ────────────────────────────────────────────────────────────
 
 interface ParsedPath {
-  type: "style" | "text" | "attribute" | "timing" | "hold" | "element" | "variable" | "metadata";
+  type:
+    | "style"
+    | "text"
+    | "attribute"
+    | "timing"
+    | "hold"
+    | "element"
+    | "variable"
+    | "variableDeclaration"
+    | "metadata"
+    | "script"
+    | "stylesheet";
   id?: string;
   prop?: string;
   field?: string;
 }
 
+// fallow-ignore-next-line complexity
 function parsePath(path: string): ParsedPath | null {
   const styleM = /^\/elements\/([^/]+)\/inlineStyles\/(.+)$/.exec(path);
   if (styleM) return { type: "style", id: styleM[1], prop: styleM[2] };
@@ -46,13 +81,37 @@ function parsePath(path: string): ParsedPath | null {
   const elemM = /^\/elements\/([^/]+)$/.exec(path);
   if (elemM) return { type: "element", id: elemM[1] };
 
+  const varDeclM = /^\/variableDeclarations\/(.+)$/.exec(path);
+  if (varDeclM) return { type: "variableDeclaration", id: varDeclM[1] };
+
   const varM = /^\/variables\/(.+)$/.exec(path);
   if (varM) return { type: "variable", id: varM[1] };
 
   const metaM = /^\/metadata\/(.+)$/.exec(path);
   if (metaM) return { type: "metadata", field: metaM[1] };
 
+  if (path === "/script/gsap") return { type: "script" };
+  if (path === "/style/css") return { type: "stylesheet" };
+
   return null;
+}
+
+// ─── Variable JSON model helper ───────────────────────────────────────────────
+
+/**
+ * Apply a variable patch to `data-composition-variables`. A remove op (null)
+ * deletes the declaration's `default` key, restoring its "no authored default"
+ * state — the exact inverse of a first-set that added a default to a
+ * default-less variable, so undo of such a set round-trips. A value op upserts
+ * the matching declaration's `default`. No-ops when the attr/decl is absent.
+ * Shares the model logic with mutate.ts via ./variableModel.ts.
+ */
+function applyVariableDefault(declEl: Element | null, id: string, newDefault: unknown): void {
+  if (newDefault === null) {
+    clearVariableDefault(declEl, id);
+  } else {
+    writeVariableDefault(declEl, id, newDefault);
+  }
 }
 
 // ─── Patch application ───────────────────────────────────────────────────────
@@ -65,14 +124,39 @@ function parsePath(path: string): ParsedPath | null {
  */
 export function applyOverrideSet(parsed: ParsedDocument, overrides: OverrideSet): void {
   const patches: JsonPatchOp[] = [];
-  for (const [key, value] of Object.entries(overrides)) {
+  const rootId = findRoot(parsed.document)?.getAttribute("data-hf-id") ?? null;
+  // Whole-declaration snapshots (varDecl.{id}) must replay BEFORE value keys
+  // (var.{id}): a declaration snapshot embeds the default at fold time, while
+  // var.{id} always carries the latest value — insertion order alone would let
+  // an older snapshot clobber a newer value.
+  const entries = Object.entries(overrides).sort(([a], [b]) => {
+    const aVar = a.startsWith("var.");
+    const bVar = b.startsWith("var.");
+    const aDecl = a.startsWith("varDecl.");
+    const bDecl = b.startsWith("varDecl.");
+    if (aVar && bDecl) return 1;
+    if (aDecl && bVar) return -1;
+    return 0; // stable — every other key keeps its insertion order
+  });
+  for (const [key, value] of entries) {
     const path = keyToPath(key);
     if (!path) continue;
     if (value === null) {
       patches.push({ op: "remove", path });
-      continue;
+    } else {
+      patches.push({ op: "replace", path, value });
     }
-    patches.push({ op: "replace", path, value });
+    // A scalar `var.{id}` override must also restore the `--{id}` CSS custom
+    // prop on the root. Current sessions persist a paired style override, but
+    // sets written before the model/CSS split only carry `var.{id}`; derive the
+    // CSS here so `var(--{id})` bindings rehydrate. Object (font/image) values
+    // are never CSS, so they are skipped.
+    if (rootId && key.startsWith("var.") && value !== null && typeof value !== "object") {
+      const cssPath = stylePath(rootId, `--${key.slice("var.".length)}`);
+      patches.push({ op: "replace", path: cssPath, value: String(value) });
+    } else if (rootId && key.startsWith("var.") && value === null) {
+      patches.push({ op: "remove", path: stylePath(rootId, `--${key.slice("var.".length)}`) });
+    }
   }
   applyPatchesToDocument(parsed, patches);
 }
@@ -130,6 +214,10 @@ function applyOne(parsed: ParsedDocument, patch: JsonPatchOp, p: ParsedPath): vo
       if (p.field === "start") {
         if (patch.op === "remove") el.removeAttribute("data-start");
         else el.setAttribute("data-start", String(patch.value));
+      } else if (p.field === "duration") {
+        // Patch value is the data-duration value — set directly.
+        if (patch.op === "remove") el.removeAttribute("data-duration");
+        else el.setAttribute("data-duration", String(patch.value));
       } else if (p.field === "end") {
         // Patch value is the absolute data-end time — set directly, no re-derivation.
         if (patch.op === "remove") el.removeAttribute("data-end");
@@ -173,14 +261,48 @@ function applyOne(parsed: ParsedDocument, patch: JsonPatchOp, p: ParsedPath): vo
       break;
     }
 
-    case "variable": {
-      const root = findRoot(parsed.document);
-      if (!root || !p.id) return;
-      const cssVar = `--${p.id}`;
+    case "variableDeclaration": {
+      if (!p.id) return;
       if (patch.op === "remove") {
-        setElementStyles(root, { [cssVar]: null });
+        removeVariableDeclarationEntry(declarationElement(parsed.document, parsed.wrapped), p.id);
+      } else if (isRawDeclarationEntry(patch.value)) {
+        // Replay is faithful, not strict: inverse patches capture raw entries
+        // (loose hand-authored declarations included) and undo must restore
+        // them verbatim — gating on isCompositionVariable here would make
+        // undo of a remove/update on a loose entry silently no-op.
+        writeVariableDeclaration(declarationElement(parsed.document, parsed.wrapped), patch.value);
+      }
+      break;
+    }
+
+    case "variable": {
+      if (!p.id) return;
+      // B1: update the JSON model (data-composition-variables) so
+      // getVariables() returns the correct value in both preview and render.
+      // CSS compat is handled by explicit style-path patches emitted by mutate.ts,
+      // so we do NOT write CSS here — the style case above handles those patches.
+      applyVariableDefault(
+        declarationElement(parsed.document, parsed.wrapped),
+        p.id,
+        patch.op === "remove" ? null : patch.value,
+      );
+      break;
+    }
+
+    case "script": {
+      if (patch.op === "remove") {
+        setGsapScript(parsed.document, "");
       } else {
-        setElementStyles(root, { [cssVar]: String(patch.value) });
+        setGsapScript(parsed.document, String(patch.value ?? ""));
+      }
+      break;
+    }
+
+    case "stylesheet": {
+      if (patch.op === "remove") {
+        setStyleSheet(parsed.document, "");
+      } else {
+        setStyleSheet(parsed.document, String(patch.value ?? ""));
       }
       break;
     }

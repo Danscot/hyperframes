@@ -87,6 +87,19 @@ export interface UseDomEditWiringParams {
     properties: Record<string, number | string>,
   ) => Promise<void>;
   removeKeyframe: (sel: DomEditSelection, animId: string, percentage: number) => void;
+  moveKeyframe: (
+    sel: DomEditSelection,
+    animId: string,
+    fromPercentage: number,
+    toPercentage: number,
+  ) => void;
+  resizeKeyframedTween: (
+    sel: DomEditSelection,
+    animId: string,
+    position: number,
+    duration: number,
+    pctRemap: Array<{ from: number; to: number }>,
+  ) => void;
   convertToKeyframes: (
     sel: DomEditSelection,
     animId: string,
@@ -98,6 +111,7 @@ export interface UseDomEditWiringParams {
 
 // fallow-ignore-next-line complexity
 export function useDomEditWiring({
+  // fallow-ignore-next-line code-duplication
   projectId,
   activeCompPath,
   domEditSelection,
@@ -130,6 +144,8 @@ export function useDomEditWiring({
   addKeyframe,
   addKeyframeBatch,
   removeKeyframe,
+  moveKeyframe,
+  resizeKeyframedTween,
   convertToKeyframes,
   removeAllKeyframes,
   handleDomManualEditsReset,
@@ -196,6 +212,9 @@ export function useDomEditWiring({
       ? { id: domEditSelection.id ?? null, selector: domEditSelection.selector ?? null }
       : null,
     gsapCacheVersion,
+    // Pass the preview iframe so class/selector tweens (e.g. `.dot`) resolve to
+    // the live element and surface in the inspector — not just by #id match.
+    previewIframeRef,
   );
 
   // ── Telemetry & fallback ──
@@ -220,6 +239,8 @@ export function useDomEditWiring({
     addKeyframe,
     addKeyframeBatch,
     removeKeyframe,
+    moveKeyframe,
+    resizeKeyframedTween,
     convertToKeyframes,
     removeAllKeyframes,
     handleDomManualEditsReset,
@@ -241,6 +262,7 @@ export function useDomEditWiring({
     applyStudioManualEditsToPreviewRef,
     openSourceForSelection,
     getSidebarTab,
+    gsapCacheVersion,
   });
 
   return {

@@ -8,7 +8,7 @@
 
 import { spawn } from "child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, extname } from "path";
 import { trackChildProcess } from "../utils/processTracker.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import {
@@ -18,10 +18,13 @@ import {
   mapPresetForGpuEncoder,
 } from "../utils/gpuEncoder.js";
 import { type HdrTransfer, getHdrEncoderColorParams } from "../utils/hdr.js";
+import { withEvenDimensionPad } from "../utils/evenDimensions.js";
 import { formatFfmpegError, runFfmpeg } from "../utils/runFfmpeg.js";
 import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
+import { extractAudioMetadata } from "../utils/ffprobe.js";
 import { type Fps, fpsToFfmpegArg } from "@hyperframes/core";
 import type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
+import { appendVp9CpuUsedArg } from "./vp9Options.js";
 
 export type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
 
@@ -41,7 +44,61 @@ export interface EncoderPreset {
 
 function appendEncodeTimeoutMessage(error: string, timedOut: boolean, timeoutMs: number): string {
   if (!timedOut) return error;
-  return `${error}\nFFmpeg killed after exceeding ffmpegEncodeTimeout (${timeoutMs} ms)`;
+  // Two independent reports of this exact timeout, both resolved by env vars
+  // that already exist but aren't named anywhere the user would see them at
+  // the point of failure — they had to go find FFMPEG_ENCODE_TIMEOUT_MS and
+  // PRODUCER_ENABLE_CHUNKED_ENCODE themselves. Name both here instead of
+  // just stating what happened.
+  return (
+    `${error}\nFFmpeg killed after exceeding ffmpegEncodeTimeout (${timeoutMs} ms). ` +
+    "Long or high-frame-count renders may need more time: set FFMPEG_ENCODE_TIMEOUT_MS " +
+    "to a higher value (ms), or set PRODUCER_ENABLE_CHUNKED_ENCODE=true to encode in " +
+    "smaller chunks instead of one long-running ffmpeg process."
+  );
+}
+
+function isAacSidecar(audioPath: string): boolean {
+  return extname(audioPath).toLowerCase() === ".aac";
+}
+
+const KNOWN_NON_AAC_AUDIO_EXTENSIONS = new Set([
+  ".flac",
+  ".mp3",
+  ".oga",
+  ".ogg",
+  ".opus",
+  ".wav",
+  ".webm",
+]);
+
+export interface MuxVideoWithAudioOptions extends Partial<
+  Pick<EngineConfig, "ffmpegProcessTimeout">
+> {
+  /**
+   * Codec of the sidecar audio when the caller already knows it. HyperFrames
+   * render paths pass the mixed AAC sidecar by contract, so muxing should not
+   * depend on the file extension alone.
+   */
+  audioCodec?: "aac";
+}
+
+async function shouldCopyAacSidecar(
+  audioPath: string,
+  options: MuxVideoWithAudioOptions | undefined,
+) {
+  if (options?.audioCodec === "aac" || isAacSidecar(audioPath)) return true;
+
+  const audioExtension = extname(audioPath).toLowerCase();
+  if (KNOWN_NON_AAC_AUDIO_EXTENSIONS.has(audioExtension)) return false;
+
+  try {
+    const metadata = await extractAudioMetadata(audioPath);
+    return metadata.audioCodec === "aac";
+  } catch {
+    // Preserve the pre-existing fallback for invalid or unprobeable sidecars:
+    // let the final ffmpeg transcode path surface the actionable mux error.
+    return false;
+  }
 }
 
 /**
@@ -99,6 +156,7 @@ export function buildEncoderArgs(
     quality = 23,
     bitrate,
     pixelFormat = "yuv420p",
+    vp9CpuUsed,
     useGpu = false,
   } = options;
 
@@ -269,14 +327,14 @@ export function buildEncoderArgs(
     args.push("-c:v", "libvpx-vp9", "-b:v", bitrate || "0", "-crf", String(quality));
     args.push("-deadline", preset === "ultrafast" ? "realtime" : "good");
     args.push("-row-mt", "1");
+    appendVp9CpuUsedArg(args, vp9CpuUsed);
 
     // `-auto-alt-ref 0` is mandatory for chunk concat-copy: libvpx-vp9's
     // alt-ref frames can reference frames in either direction inside a
     // GOP, so a chunk-boundary frame is not guaranteed to be the first
-    // displayable reference when alt-ref is on. `-cpu-used 2` pins the
-    // speed/quality tradeoff against libvpx-vp9 default drift across
-    // versions, so the planHash round-trips deterministically across
-    // worker images.
+    // displayable reference when alt-ref is on. The shared `vp9CpuUsed`
+    // option pins speed/quality against libvpx-vp9 default drift across
+    // versions for both chunked and streaming WebM encodes.
     const lockGopVp9 = options.lockGopForChunkConcat === true;
     if (lockGopVp9) {
       if (
@@ -289,16 +347,7 @@ export function buildEncoderArgs(
         );
       }
       const gop = Math.floor(options.gopSize);
-      args.push(
-        "-g",
-        String(gop),
-        "-keyint_min",
-        String(gop),
-        "-auto-alt-ref",
-        "0",
-        "-cpu-used",
-        "2",
-      );
+      args.push("-g", String(gop), "-keyint_min", String(gop), "-auto-alt-ref", "0");
     }
     if (pixelFormat === "yuva420p") {
       // Alpha + alt-ref is unsupported by libvpx-vp9. The closed-GOP
@@ -357,14 +406,33 @@ export function buildEncoderArgs(
 
     // Range conversion: Chrome's full-range RGB → limited/TV range.
     if (gpuEncoder === "vaapi") {
+      // vaapi already runs `format=nv12,hwupload`; the nv12 conversion aligns
+      // odd dimensions before upload, so only prepend the range conversion.
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
         args[vfIdx + 1] = `scale=in_range=pc:out_range=tv,${args[vfIdx + 1]}`;
       }
-    } else if (!shouldUseGpu) {
+    } else if (shouldUseGpu) {
+      // nvenc/videotoolbox/qsv/amf feed software frames straight to the HW
+      // encoder with no `-vf`. They hit the same "height not divisible by 2"
+      // abort as libx264 on an odd-sized 4:2:0 canvas, so pad odd dimensions
+      // up to even on the software side before the encode.
+      const vf = withEvenDimensionPad("", pixelFormat, options.width, options.height);
+      if (vf) args.push("-vf", vf);
+    } else {
       // Range conversion: Chrome screenshots are full-range RGB.
-      // The scale filter handles both 8-bit and 10-bit correctly.
-      args.push("-vf", "scale=in_range=pc:out_range=tv");
+      // The scale filter handles both 8-bit and 10-bit correctly. Pad odd
+      // dimensions up to even so libx264/libx265 (4:2:0) don't abort with
+      // "height not divisible by 2" on an odd-sized composition canvas.
+      args.push(
+        "-vf",
+        withEvenDimensionPad(
+          "scale=in_range=pc:out_range=tv",
+          pixelFormat,
+          options.width,
+          options.height,
+        ),
+      );
     }
 
     // Fixed timescale for consistent A/V timing across platforms.
@@ -690,7 +758,7 @@ export async function muxVideoWithAudio(
   audioPath: string,
   outputPath: string,
   signal?: AbortSignal,
-  config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
+  config?: MuxVideoWithAudioOptions,
   fps?: Fps,
 ): Promise<MuxResult> {
   const outputDir = dirname(outputPath);
@@ -698,14 +766,28 @@ export async function muxVideoWithAudio(
 
   const isWebm = outputPath.endsWith(".webm");
   const isMov = outputPath.endsWith(".mov");
+  const shouldCopyAudio = isWebm ? false : await shouldCopyAacSidecar(audioPath, config);
   const args = ["-i", videoPath, "-i", audioPath, "-c:v", "copy"];
 
   if (isWebm) {
     args.push("-c:a", "libopus", "-b:a", "128k");
   } else if (isMov) {
-    args.push("-c:a", "aac", "-b:a", "192k");
+    if (shouldCopyAudio) {
+      args.push("-c:a", "copy");
+    } else {
+      args.push("-c:a", "aac", "-b:a", "192k");
+    }
   } else {
-    args.push("-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart");
+    // processCompositionAudio (audioMixer.ts) performs the AAC encode and
+    // owns the single encoder-priming interval. Copying that sidecar into
+    // MP4 preserves the correct priming metadata; re-encoding it during mux
+    // creates another priming interval that ffmpeg writes as an empty leading
+    // video edit list, which QuickTime/Safari render as a black first frame.
+    if (shouldCopyAudio) {
+      args.push("-c:a", "copy", "-movflags", "+faststart");
+    } else {
+      args.push("-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart");
+    }
   }
   // PTS bases can diverge during mux and reintroduce negative DTS. See
   // buildEncoderArgs for the full reasoning on why that breaks playback.
@@ -716,7 +798,7 @@ export async function muxVideoWithAudio(
     // output container metadata. `-c:v copy` is retained; no re-encode.
     args.push("-r", fpsToFfmpegArg(fps));
   }
-  args.push("-shortest", "-y", outputPath);
+  args.push("-y", outputPath);
 
   const processTimeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
   const result = await runFfmpeg(args, { signal, timeout: processTimeout });

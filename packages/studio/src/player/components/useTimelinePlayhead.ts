@@ -1,5 +1,5 @@
-import { useRef, useCallback, useEffect } from "react";
-import { liveTime, usePlayerStore, type ZoomMode } from "../store/playerStore";
+import { useRef, useCallback, useEffect, useLayoutEffect } from "react";
+import { liveTime, type ZoomMode } from "../store/playerStore";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { getPinchTimelineZoomPercent } from "./timelineZoom";
 import {
@@ -54,6 +54,33 @@ export function useTimelinePlayhead({
 }: UseTimelinePlayheadInput) {
   const dragScrollRaf = useRef(0);
   const previousZoomModeRef = useRef<ZoomMode | null>(zoomMode);
+  // Center-anchored magnify: keep the time at the viewport center fixed when
+  // the zoom level (pps) changes via the toolbar / slider. The pinch handler
+  // anchors at the cursor instead, so it opts out via `skipCenterAnchorRef`.
+  const previousAnchorPpsRef = useRef(pps);
+  const skipCenterAnchorRef = useRef(false);
+
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    const prevPps = previousAnchorPpsRef.current;
+    previousAnchorPpsRef.current = pps;
+    // Always consume the skip flag, even when pps didn't change — otherwise a
+    // pinch that produced no pps change (already at the zoom clamp) would strand
+    // it true and the next toolbar zoom would wrongly skip center-anchoring.
+    const skip = skipCenterAnchorRef.current;
+    skipCenterAnchorRef.current = false;
+    if (!scroll || pps === prevPps || skip) return;
+    const nextScrollLeft = getTimelineScrollLeftForZoomAnchor({
+      pointerX: scroll.clientWidth / 2,
+      currentScrollLeft: scroll.scrollLeft,
+      gutter: GUTTER,
+      currentPixelsPerSecond: prevPps,
+      nextPixelsPerSecond: pps,
+      duration: durationRef.current,
+    });
+    const maxScrollLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+    scroll.scrollLeft = Math.max(0, Math.min(maxScrollLeft, nextScrollLeft));
+  }, [pps, scrollRef, durationRef]);
 
   const syncPlayheadPosition = useCallback(
     (time: number) => {
@@ -66,6 +93,12 @@ export function useTimelinePlayhead({
   useEffect(() => {
     syncPlayheadPosition(currentTime);
   }, [currentTime, pps, syncPlayheadPosition]);
+
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll || zoomMode !== "fit") return;
+    scroll.scrollLeft = 0;
+  }, [zoomMode, pps, scrollRef]);
 
   useEffect(() => {
     const scroll = scrollRef.current;
@@ -84,21 +117,9 @@ export function useTimelinePlayhead({
   useMountEffect(() => {
     const unsub = liveTime.subscribe((t) => {
       if (!playheadRef.current || durationRef.current <= 0) return;
-      const playheadX = getTimelinePlayheadLeft(t, ppsRef.current);
-      playheadRef.current.style.left = `${playheadX}px`;
-      const scroll = scrollRef.current;
-      if (
-        scroll &&
-        !isDragging.current &&
-        usePlayerStore.getState().isPlaying &&
-        shouldAutoScrollTimeline(zoomModeRef.current, scroll.scrollWidth, scroll.clientWidth)
-      ) {
-        const edgeMargin = scroll.clientWidth * 0.12;
-        if (playheadX > scroll.scrollLeft + scroll.clientWidth - edgeMargin)
-          scroll.scrollLeft = playheadX - scroll.clientWidth * 0.15;
-        else if (playheadX < scroll.scrollLeft + GUTTER)
-          scroll.scrollLeft = Math.max(0, playheadX - GUTTER);
-      }
+      // Playback deliberately does NOT scroll the viewport to chase the playhead —
+      // the user's scroll position is theirs; the playhead may run off-screen.
+      playheadRef.current.style.left = `${getTimelinePlayheadLeft(t, ppsRef.current)}px`;
     });
     return unsub;
   });
@@ -169,6 +190,8 @@ export function useTimelinePlayhead({
         nextPixelsPerSecond: nextPps,
         duration: durationRef.current,
       });
+      // Pinch anchors at the cursor (below), so skip the center-anchor effect.
+      skipCenterAnchorRef.current = true;
       setZoomMode("manual");
       setManualZoomPercent(nextZoomPercent);
       requestAnimationFrame(() => {

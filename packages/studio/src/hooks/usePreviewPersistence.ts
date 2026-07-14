@@ -8,7 +8,16 @@ import {
 import { STUDIO_MOTION_PATH } from "../components/editor/studioMotion";
 import type { EditHistoryKind } from "../utils/editHistory";
 import { createDomEditSaveQueue } from "../utils/domEditSaveQueue";
+import { flushStudioPendingEdits } from "../utils/studioPendingEdits";
 import { trackStudioEvent } from "../utils/studioTelemetry";
+import { applyUndoRestoreToPreview, type UndoRestoreFile } from "../utils/gsapSoftReload";
+import { usePlayerStore } from "../player";
+
+/** The restore payload the undo/redo preview-sync consumes (from the history store). */
+interface HistoryPreviewRestore {
+  paths?: string[];
+  files?: Record<string, UndoRestoreFile>;
+}
 
 // ── Types ──
 
@@ -77,6 +86,24 @@ function shouldReloadForStudioFileChange(
   return Date.now() - domEditSaveTimestampRef.current >= 4000;
 }
 
+// fallow-ignore-next-line complexity
+async function clearLegacyStudioMotionFile(
+  readOptionalProjectFile: (path: string) => Promise<string>,
+  writeProjectFile: (path: string, content: string) => Promise<void>,
+): Promise<void> {
+  const content = await readOptionalProjectFile(STUDIO_MOTION_PATH).catch(() => null);
+  if (!content) return;
+  try {
+    const parsed = JSON.parse(content) as { motions?: unknown[] };
+    if (!Array.isArray(parsed.motions) || parsed.motions.length === 0) return;
+  } catch {
+    return;
+  }
+  await writeProjectFile(STUDIO_MOTION_PATH, JSON.stringify({ version: 1, motions: [] })).catch(
+    () => {},
+  );
+}
+
 // ── Hook ──
 
 export function usePreviewPersistence({
@@ -86,13 +113,12 @@ export function usePreviewPersistence({
   writeProjectFile: _writeProjectFile,
   recordEdit: _recordEdit,
   previewIframeRef,
-  activeCompPathRef: _activeCompPathRef,
+  activeCompPathRef,
   domEditSaveTimestampRef,
   reloadPreview,
   pendingTimelineEditPathRef,
 }: UsePreviewPersistenceParams) {
   void _recordEdit;
-  void _activeCompPathRef;
 
   const [domEditSaveQueuePaused, setDomEditSaveQueuePaused] = useState<string | null>(null);
 
@@ -135,6 +161,7 @@ export function usePreviewPersistence({
   }, []);
 
   const waitForPendingDomEditSaves = useCallback(async () => {
+    await flushStudioPendingEdits();
     await domEditSaveQueueRef.current?.waitForIdle();
   }, []);
 
@@ -170,12 +197,23 @@ export function usePreviewPersistence({
   // ── Sync preview after undo/redo ──
 
   const syncHistoryPreviewAfterApply = useCallback(
-    async (_paths: string[] | undefined) => {
-      // Motion data is now stored in HTML attributes — any undo/redo that touches HTML
-      // files triggers a full reload which picks up the changes automatically.
-      reloadPreview();
+    async (restore: HistoryPreviewRestore) => {
+      // Prefer an in-place soft reload for a soft-reloadable restore (the change
+      // is confined to the active comp's element attributes / inline-style and/or
+      // its GSAP script) — a full iframe remount blanks the frame black and
+      // re-flashes the WebGL context. applyUndoRestoreToPreview syncs the reverted
+      // attributes onto the live DOM and re-runs the timeline at the SAME playhead,
+      // falling back to reloadPreview for anything structural (split/delete undo),
+      // multi-file, sub-comp, or a permanent soft-reload failure.
+      applyUndoRestoreToPreview(
+        previewIframeRef.current,
+        activeCompPathRef.current,
+        restore.files,
+        usePlayerStore.getState().currentTime,
+        reloadPreview,
+      );
     },
-    [reloadPreview],
+    [previewIframeRef, activeCompPathRef, reloadPreview],
   );
 
   // ── Migrate legacy studio-motion.json ──
@@ -185,20 +223,7 @@ export function usePreviewPersistence({
   // could still fire alongside the new seek-reapply runtime. Empty the file so
   // the legacy codepath no-ops.
   useMountEffect(() => {
-    _readOptionalProjectFile(STUDIO_MOTION_PATH)
-      .then((content) => {
-        if (!content) return;
-        try {
-          const parsed = JSON.parse(content) as { motions?: unknown[] };
-          if (!Array.isArray(parsed.motions) || parsed.motions.length === 0) return;
-        } catch {
-          return;
-        }
-        return _writeProjectFile(STUDIO_MOTION_PATH, JSON.stringify({ version: 1, motions: [] }));
-      })
-      .catch(() => {
-        /* best-effort migration — ignore failures */
-      });
+    void clearLegacyStudioMotionFile(_readOptionalProjectFile, _writeProjectFile);
   });
 
   // ── Listen for external file changes (HMR / SSE) ──
@@ -210,8 +235,10 @@ export function usePreviewPersistence({
           pendingTimelineEditPathRef,
           domEditSaveTimestampRef,
         )
-      )
+      ) {
+        // fallow-ignore-next-line code-duplication
         reloadPreview();
+      }
     };
     if (import.meta.hot) {
       import.meta.hot.on("hf:file-change", handler);

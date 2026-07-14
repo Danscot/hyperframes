@@ -22,9 +22,9 @@ export interface DockerRunArgsInput {
    * resolves to the host architecture via `resolveDockerPlatform()`. Pinning
    * to `linux/amd64` on an arm64 host (the legacy default) forces qemu
    * emulation of chrome-headless-shell, which segfaults or stalls on Apple
-   * Silicon — see issue #1193. Native `linux/arm64` falls back to the
-   * system chromium baked into the image at the cost of byte-for-byte
-   * parity with amd64 renders.
+   * Silicon — see issue #1193. Native `linux/arm64` uses Playwright's pinned
+   * arm64 chrome-headless-shell baked into the image at the cost of
+   * byte-for-byte parity with amd64 renders.
    */
   platform?: string;
   options: DockerRenderOptions;
@@ -46,13 +46,19 @@ export interface DockerRenderOptions {
   browserGpu: boolean;
   hdrMode: "auto" | "force-hdr" | "force-sdr";
   crf?: number;
+  vp9CpuUsed?: number;
   videoBitrate?: string;
+  videoFrameFormat?: "auto" | "jpg" | "png";
   quiet: boolean;
+  debug?: boolean;
+  bestEffort?: boolean;
   variables?: Record<string, unknown>;
   entryFile?: string;
   /** Output resolution preset (e.g. "landscape-4k"). Forwarded as `--resolution`. */
   outputResolution?: string;
   pageSideCompositing?: boolean;
+  /** EXPERIMENTAL. drawElementImage frame capture; forwarded as `--experimental-fast-capture`. */
+  experimentalFastCapture?: boolean;
   /**
    * Puppeteer page-navigation timeout, in milliseconds. Forwarded to the
    * in-container CLI as `--browser-timeout <seconds>` (the CLI takes
@@ -107,6 +113,10 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     `${projectDir}:/project:ro`,
     "-v",
     `${outputDir}:/output`,
+    // Keep debug artifacts on the mounted host output path. The producer roots
+    // `.debug` at dirname(PRODUCER_RENDERS_DIR), so `/output/renders` maps to
+    // `/output/.debug/<job id>` instead of a disposable container path.
+    ...(options.debug ? ["-e", "PRODUCER_RENDERS_DIR=/output/renders"] : []),
     imageTag,
     "/project",
     "--output",
@@ -120,8 +130,16 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     ...(options.gifLoop != null ? ["--gif-loop", String(options.gifLoop)] : []),
     ...(options.workers != null ? ["--workers", String(options.workers)] : []),
     ...(options.crf != null ? ["--crf", String(options.crf)] : []),
+    ...(options.vp9CpuUsed != null ? ["--vp9-cpu-used", String(options.vp9CpuUsed)] : []),
     ...(options.videoBitrate ? ["--video-bitrate", options.videoBitrate] : []),
+    ...(options.videoFrameFormat && options.videoFrameFormat !== "auto"
+      ? ["--video-frame-format", options.videoFrameFormat]
+      : []),
     ...(options.quiet ? ["--quiet"] : []),
+    ...(options.debug ? ["--debug"] : []),
+    // The in-container CLI is best-effort by default. Only forward the
+    // explicit strict opt-in so Docker and local renders cannot drift.
+    ...(options.bestEffort === false ? ["--no-best-effort"] : []),
     ...(options.gpu ? ["--gpu"] : []),
     ...(options.browserGpu ? [] : ["--no-browser-gpu"]),
     ...(options.hdrMode === "force-hdr" ? ["--hdr"] : []),
@@ -132,6 +150,7 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     ...(options.entryFile ? ["--composition", options.entryFile] : []),
     ...(options.outputResolution ? ["--resolution", options.outputResolution] : []),
     ...(options.pageSideCompositing === false ? ["--no-page-side-compositing"] : []),
+    ...(options.experimentalFastCapture ? ["--experimental-fast-capture"] : []),
     ...(options.pageNavigationTimeoutMs != null
       ? ["--browser-timeout", String(options.pageNavigationTimeoutMs / 1000)]
       : []),

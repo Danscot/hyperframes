@@ -348,47 +348,56 @@ export function Section({
   defaultCollapsed?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const collapseIcon = collapsed ? (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      className="flex-shrink-0 text-panel-text-5"
+    >
+      <path d="M6 2.5v7M2.5 6h7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  ) : (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 10 10"
+      fill="currentColor"
+      className="flex-shrink-0 text-panel-text-5"
+    >
+      <path d="M2 3l3 4 3-4z" />
+    </svg>
+  );
 
   return (
-    <section className="min-w-0 border-t border-panel-border">
-      <button
-        type="button"
-        onClick={() => setCollapsed((v) => !v)}
-        className="flex w-full items-center justify-between gap-2 px-4 py-2.5"
-      >
-        <h3 className="text-[12px] font-semibold text-panel-text-1">{title}</h3>
-        <div className="flex items-center gap-2">
-          {accessory}
-          {collapsed && (
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 12 12"
-              fill="none"
-              className="flex-shrink-0 text-panel-text-5"
-            >
-              <path
-                d="M6 2.5v7M2.5 6h7"
-                stroke="currentColor"
-                strokeWidth="1.2"
-                strokeLinecap="round"
-              />
-            </svg>
-          )}
-          {!collapsed && (
-            <svg
-              width="10"
-              height="10"
-              viewBox="0 0 10 10"
-              fill="currentColor"
-              className="flex-shrink-0 text-panel-text-5"
-            >
-              <path d="M2 3l3 4 3-4z" />
-            </svg>
-          )}
-        </div>
-      </button>
+    <section
+      className="min-w-0 border-t border-panel-border"
+      data-panel-section={slugifyPanelSectionTitle(title)}
+    >
+      <div className="flex w-full items-center gap-2 px-4 py-2.5">
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex min-w-0 flex-1 items-center justify-between gap-2 text-left"
+        >
+          <h3 className="text-[12px] font-semibold text-panel-text-1">{title}</h3>
+          {collapseIcon}
+        </button>
+        {accessory && <div className="flex flex-shrink-0 items-center">{accessory}</div>}
+      </div>
       {!collapsed && <div className="px-4 pb-3">{children}</div>}
     </section>
   );
+}
+
+// Stable hook for e2e/automation to locate a section without depending on the
+// display copy (h3 textContent matching breaks on wording tweaks or, if this
+// panel is ever localized, on translation).
+function slugifyPanelSectionTitle(title: string): string {
+  return title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
 }

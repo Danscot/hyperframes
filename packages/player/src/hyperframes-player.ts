@@ -1,8 +1,9 @@
-import { CompositionProbe, type ProbeResult } from "./composition-probe.js";
+import { CompositionProbe, type ProbeResult, readPositiveDimension } from "./composition-probe.js";
 import { isControlsClick, setupControls, setupPoster } from "./controls-setup.js";
 import { adoptShadowStyles, createCompositionIframe, scaleIframeToFit } from "./iframe-dom.js";
 import { DirectTimelineClock } from "./direct-timeline-clock.js";
 import { ParentMediaManager } from "./parent-media.js";
+import { isRealmHtmlMediaElement } from "./media-element-guards.js";
 import { handleRuntimeMessage } from "./runtime-message-handler.js";
 import {
   SHADER_CAPTURE_SCALE_ATTR,
@@ -17,6 +18,7 @@ import { createShaderLoader } from "./shader-loader-element.js";
 import { ShaderLoaderState } from "./shader-loader-state.js";
 import { PLAYER_STYLES } from "./styles.js";
 import { type DirectTimelineAdapter } from "./timeline-adapters.js";
+import { runtimeProtocolMetadata } from "@hyperframes/core/runtime/protocol";
 
 // Playback-rate bounds mirror the runtime clamp in
 // packages/core/src/runtime/init.ts (applyPlaybackRate) and media.ts so the
@@ -27,6 +29,22 @@ import { type DirectTimelineAdapter } from "./timeline-adapters.js";
 // production browsers.
 const MIN_PLAYBACK_RATE = 0.1;
 const MAX_PLAYBACK_RATE = 5;
+
+export type ColorGradingTarget =
+  | string
+  | {
+      id?: string | null;
+      hfId?: string | null;
+      selector?: string | null;
+      selectorIndex?: number | null;
+    };
+
+export type ColorGradingCompareState = {
+  enabled: boolean;
+  position?: number;
+  softness?: number;
+  lineWidth?: number;
+};
 
 function clampPlaybackRate(rate: number): number {
   if (!Number.isFinite(rate) || rate <= 0) return 1;
@@ -65,14 +83,20 @@ class HyperframesPlayer extends HTMLElement {
   private _currentTime = 0;
   private _duration = 0;
   private _paused = true;
+  /** True while the user is dragging the scrubber — makes seek() play audio at the
+   * playhead (audible scrub) instead of positioning it silently. */
+  private _scrubbing = false;
   private _lastUpdateMs = 0;
   private _volume = 1;
   private _compositionWidth = 1920;
   private _compositionHeight = 1080;
+  private _rescaleWarned = false;
   private _directTimelineAdapter: DirectTimelineAdapter | null = null;
   private _directTimelineClock: DirectTimelineClock;
   private _parentTickRaf: number | null = null;
   private _media: ParentMediaManager;
+  private _scenes: { id: string; start: number; duration: number }[] = [];
+  private _runtimeFps = 30;
 
   constructor() {
     super();
@@ -153,6 +177,8 @@ class HyperframesPlayer extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._sendControl("pause");
+    this._stopIframeMedia();
     this.resizeObserver.disconnect();
     window.removeEventListener("message", this._onMessage);
     this.iframe.removeEventListener("load", this._onIframeLoad);
@@ -163,6 +189,9 @@ class HyperframesPlayer extends HTMLElement {
     this.shaderLoader.destroy();
     this._media.destroy();
     this.controlsApi?.destroy();
+    this.controlsApi = null;
+    this._paused = true;
+    this._ready = false;
   }
 
   // fallow-ignore-next-line complexity
@@ -179,12 +208,16 @@ class HyperframesPlayer extends HTMLElement {
         if (val !== null) this.iframe.srcdoc = prepareSrcdocForElement(this, val);
         else this.iframe.removeAttribute("srcdoc");
         break;
+      // Reject NaN/zero/negative dimensions the same way the composition
+      // probe does (a typo like width="abc" or width="0" would otherwise
+      // reach scaleIframeToFit as scale(NaN) or a division by zero and
+      // blank the player); fall back to the defaults instead.
       case "width":
-        this._compositionWidth = parseInt(val || "1920", 10);
+        this._compositionWidth = readPositiveDimension(val) ?? 1920;
         this._rescale();
         break;
       case "height":
-        this._compositionHeight = parseInt(val || "1080", 10);
+        this._compositionHeight = readPositiveDimension(val) ?? 1080;
         this._rescale();
         break;
       case "controls":
@@ -241,6 +274,12 @@ class HyperframesPlayer extends HTMLElement {
     return this.iframe;
   }
 
+  /** Scene list from the last-received runtime timeline message. Empty until
+   *  the composition runtime fires its first "timeline" postMessage. */
+  get scenes(): { id: string; start: number; duration: number }[] {
+    return this._scenes;
+  }
+
   play() {
     this.posterEl?.remove();
     this.posterEl = null;
@@ -282,25 +321,63 @@ class HyperframesPlayer extends HTMLElement {
     this.dispatchEvent(new Event("pause"));
   }
 
+  stopMedia() {
+    this._sendControl("stop-media");
+    this._stopIframeMedia();
+    this._media.stopAdoptedMedia();
+  }
+
   seek(timeInSeconds: number) {
     if (!this._trySyncSeek(timeInSeconds) && !this._tryDirectTimelineSeek(timeInSeconds)) {
-      this._sendControl("seek", { frame: Math.round(timeInSeconds * 30) });
+      this._sendControl("seek", {
+        timeSeconds: timeInSeconds,
+        // Legacy runtimes read only `frame`. Protocol-v1 runtimes prefer
+        // `timeSeconds`, so carrying both keeps cross-origin embeds seekable
+        // while preserving seconds-first precision between current peers.
+        frame: Math.round(timeInSeconds * this._runtimeFps),
+      });
     }
     this._directTimelineClock.stop();
     this._stopParentTickClock();
     this._currentTime = timeInSeconds;
     if (this._media.audioOwner === "parent") {
-      // Pause BEFORE seek: leaving the proxy playing turns the next
-      // `mirrorTime` drift-correction tick into a perpetual seek→play→drift→seek
-      // stutter loop, where ~80ms of audio plays past the (now frozen) timeline,
-      // then mirrorTime yanks `currentTime` back to match it. Symmetric with
-      // `pause()` below.
-      this._media.pauseAll();
-      this._media.seekAll(timeInSeconds);
+      if (this._scrubbing) {
+        // Audible scrub: play the proxy audio at the playhead so the viewer hears
+        // the track as they drag. Each move re-seeks, restarting playback from the
+        // new position. onScrubEnd settles back to silence via a normal seek.
+        this._media.scrubAll(timeInSeconds);
+      } else {
+        // Pause BEFORE seek: leaving the proxy playing turns the next
+        // `mirrorTime` drift-correction tick into a perpetual seek→play→drift→seek
+        // stutter loop, where ~80ms of audio plays past the (now frozen) timeline,
+        // then mirrorTime yanks `currentTime` back to match it. Symmetric with
+        // `pause()` below.
+        this._media.pauseAll();
+        this._media.seekAll(timeInSeconds);
+      }
     }
     this._paused = true;
     this.controlsApi?.updatePlaying(false);
     this.controlsApi?.updateTime(this._currentTime, this._duration);
+  }
+
+  setColorGrading(target: ColorGradingTarget, grading: unknown) {
+    this._sendControl("set-color-grading", { target, grading });
+  }
+
+  clearColorGrading(target: ColorGradingTarget) {
+    this._sendControl("set-color-grading", { target, grading: null });
+  }
+
+  setColorGradingCompare(target: ColorGradingTarget, compare: ColorGradingCompareState) {
+    this._sendControl("set-color-grading-compare", { target, compare });
+  }
+
+  clearColorGradingCompare(target: ColorGradingTarget) {
+    this._sendControl("set-color-grading-compare", {
+      target,
+      compare: { enabled: false },
+    });
   }
 
   get currentTime() {
@@ -377,6 +454,10 @@ class HyperframesPlayer extends HTMLElement {
     return this.hasAttribute("audio-locked") || this._isLockedHostEnvironment();
   }
 
+  private _isSlideshowPlayer(): boolean {
+    return this.closest("hyperframes-slideshow") !== null;
+  }
+
   /** Apply a change to the `muted` attribute: re-assert under an audio lock,
    *  else mute/unmute the media, sync the controls, and fire `volumechange`. */
   private _handleMutedChange(val: string | null): void {
@@ -388,6 +469,7 @@ class HyperframesPlayer extends HTMLElement {
       return;
     }
     this._media.updateMuted(val !== null);
+    this._setIframeMediaMuted(val !== null);
     this._sendControl("set-muted", { muted: val !== null });
     this.controlsApi?.updateMuted(val !== null);
     this.dispatchEvent(new Event("volumechange"));
@@ -422,11 +504,46 @@ class HyperframesPlayer extends HTMLElement {
   private _sendControl(action: string, extra: Record<string, unknown> = {}) {
     try {
       this.iframe.contentWindow?.postMessage(
-        { source: "hf-parent", type: "control", action, ...extra },
+        {
+          ...extra,
+          source: "hf-parent",
+          type: "control",
+          action,
+          ...runtimeProtocolMetadata(this._runtimeFps),
+        },
         "*",
       );
     } catch {
       /* cross-origin */
+    }
+  }
+
+  /**
+   * Returns the iframe's contentDocument if same-origin and reachable,
+   * otherwise null. Accessing contentDocument can throw on cross-origin
+   * iframes — this swallows that as a clean null sentinel.
+   */
+  private _getSameOriginIframeDocument(): Document | null {
+    try {
+      return this.iframe.contentDocument;
+    } catch {
+      return null;
+    }
+  }
+
+  private _setIframeMediaMuted(muted: boolean): void {
+    const iframeDoc = this._getSameOriginIframeDocument();
+    if (!iframeDoc) return;
+    for (const el of iframeDoc.querySelectorAll("video, audio")) {
+      if (isRealmHtmlMediaElement(el)) el.muted = muted || el.defaultMuted;
+    }
+  }
+
+  private _stopIframeMedia(): void {
+    const iframeDoc = this._getSameOriginIframeDocument();
+    if (!iframeDoc) return;
+    for (const el of iframeDoc.querySelectorAll("video, audio")) {
+      if (isRealmHtmlMediaElement(el)) el.pause();
     }
   }
 
@@ -443,6 +560,12 @@ class HyperframesPlayer extends HTMLElement {
     this._sendControl("set-muted", { muted: this.muted });
     this._sendControl("set-volume", { volume: this._volume });
     this._sendControl("set-playback-rate", { playbackRate: this.playbackRate });
+    this._sendControl("set-native-media-sync-disabled", {
+      disabled: this._isSlideshowPlayer(),
+    });
+    this._sendControl("set-web-audio-media-disabled", {
+      disabled: this._isSlideshowPlayer(),
+    });
   }
 
   private _reloadShaderOptions(): void {
@@ -485,7 +608,10 @@ class HyperframesPlayer extends HTMLElement {
   // GSAP seek() preserves play state; player seek() contract lands paused.
   private _tryDirectTimelineSeek(t: number): boolean {
     return this._withDirectTimeline((tl) => {
-      tl.seek(t);
+      // suppressEvents=false: fire the timeline's onUpdate so compositions that
+      // drive scene visibility imperatively (via the root timeline's onUpdate,
+      // e.g. slideshow decks) repaint on a paused seek — not only while playing.
+      tl.seek(t, false);
       tl.pause();
     });
   }
@@ -547,6 +673,15 @@ class HyperframesPlayer extends HTMLElement {
       sendControl: (action, extra) => this._sendControl(action, extra),
       getIframeDoc: () => this.iframe.contentDocument,
       onRuntimeReady: () => this._replayBridgeState(),
+      onRuntimeTimelineReady: (duration) => this._onRuntimeTimelineReady(duration),
+      setRuntimeFps: (fps) => {
+        this._runtimeFps = fps;
+      },
+      shouldPromoteMediaAutoplayFallback: () => !this._isSlideshowPlayer(),
+      setScenes: (scenes) => {
+        this._scenes = scenes;
+        this.dispatchEvent(new CustomEvent("scenes", { detail: { scenes } }));
+      },
       updateControlsTime: (t, d) => this.controlsApi?.updateTime(t, d),
       updateControlsPlaying: (p) => this.controlsApi?.updatePlaying(p),
       dispatchEvent: (ev) => this.dispatchEvent(ev),
@@ -555,6 +690,27 @@ class HyperframesPlayer extends HTMLElement {
       getLoop: () => this.loop,
       media: this._media,
     });
+  }
+
+  private _onRuntimeTimelineReady(duration: number) {
+    if (this._ready) return;
+    this.probe.stop();
+    this._duration = duration;
+    this._directTimelineAdapter = null;
+    this._ready = true;
+    this.controlsApi?.updateTime(this._currentTime, duration);
+    this.dispatchEvent(new CustomEvent("ready", { detail: { duration } }));
+    // stage-size may not have arrived yet (race in the runtime's postTimeline
+    // resolving the root's data-width/data-height on first paint) — rescale
+    // here too so cross-origin compositions never stay unscaled/untransformed.
+    this._rescale();
+
+    const doc = this._getSameOriginIframeDocument();
+    if (doc) this._media.setupFromIframe(doc);
+
+    this._replayBridgeState();
+    this._setIframeMediaMuted(this.muted);
+    if (this.hasAttribute("autoplay")) this.play();
   }
 
   private _onProbeReady({ duration, adapter, compositionSize }: ProbeResult) {
@@ -574,14 +730,37 @@ class HyperframesPlayer extends HTMLElement {
     } catch {
       /* cross-origin */
     }
+    this._setIframeMediaMuted(this.muted);
     if (this.hasAttribute("autoplay")) this.play();
   }
 
   private _rescale() {
-    scaleIframeToFit(this, this.iframe, this._compositionWidth, this._compositionHeight);
+    const applied = scaleIframeToFit(
+      this,
+      this.iframe,
+      this._compositionWidth,
+      this._compositionHeight,
+    );
+    // A no-op before "ready" is expected (element not painted yet). A no-op
+    // once ready means the composition is stuck unscaled/untransformed —
+    // pinned to the iframe's default top-left position — with no evidence of
+    // why in the field. Surface it once (not on every ResizeObserver tick —
+    // a legitimately hidden/zero-sized player, e.g. a collapsed tab or
+    // off-screen carousel card, would otherwise spam the console forever).
+    if (!applied && this._ready && !this._rescaleWarned) {
+      this._rescaleWarned = true;
+      console.warn("[hyperframes-player] rescale no-op after ready — zero-size player element", {
+        src: this.getAttribute("src"),
+        offsetWidth: this.offsetWidth,
+        offsetHeight: this.offsetHeight,
+        compositionWidth: this._compositionWidth,
+        compositionHeight: this._compositionHeight,
+      });
+    }
   }
 
   private _onIframeLoad() {
+    this._ready = false;
     this._directTimelineAdapter = null;
     this._directTimelineClock.stop();
     this._stopParentTickClock();
@@ -601,6 +780,15 @@ class HyperframesPlayer extends HTMLElement {
         onPlay: () => this.play(),
         onPause: () => this.pause(),
         onSeek: (f) => this.seek(f * this._duration),
+        onScrubStart: () => {
+          this._scrubbing = true;
+        },
+        onScrubEnd: () => {
+          this._scrubbing = false;
+          // Settle: a normal (silent) seek pauses the proxy audio at the final
+          // scrub position, matching the paused playhead.
+          this.seek(this._currentTime);
+        },
         onSpeedChange: (s) => void (this.playbackRate = s),
         onMuteToggle: () => void (this.muted = !this.muted),
         onVolumeChange: (v) => void (this.volume = v),

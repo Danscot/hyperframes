@@ -18,7 +18,9 @@ import {
   getTimelineElementSelectorIndex,
   getTimelineElementDisplayLabel,
   buildTimelineElementIdentity,
+  readTimelineElementZIndex,
 } from "./timelineElementHelpers";
+import { postRuntimeControlMessage } from "./runtimeProtocol";
 
 // ---------------------------------------------------------------------------
 // Viewport / DOM normalisation
@@ -102,10 +104,7 @@ function postPreviewControl(
   action: string,
   payload: Record<string, unknown>,
 ): void {
-  iframe.contentWindow?.postMessage(
-    { source: "hf-parent", type: "control", action, ...payload },
-    "*",
-  );
+  postRuntimeControlMessage(iframe.contentWindow, action, payload);
 }
 
 export function shouldMutePreviewAudio(audioMuted: boolean, playbackRate: number): boolean {
@@ -121,9 +120,7 @@ export function setPreviewMediaMuted(iframe: HTMLIFrameElement | null, muted: bo
       return;
     }
     postPreviewControl(iframe, "set-muted", { muted });
-  } catch (err) {
-    console.warn("[useTimelinePlayer] Failed to set preview media mute state", err);
-  }
+  } catch {}
 }
 
 export function setPreviewPlaybackRate(
@@ -139,9 +136,7 @@ export function setPreviewPlaybackRate(
       return;
     }
     postPreviewControl(iframe, "set-playback-rate", { playbackRate: rate });
-  } catch (err) {
-    console.warn("[useTimelinePlayer] Failed to set preview playback rate", err);
-  }
+  } catch {}
 }
 
 /**
@@ -168,6 +163,95 @@ export function resolveIframe(el: Element | null): HTMLIFrameElement | null {
   if (!el) return null;
   if (el instanceof HTMLIFrameElement) return el;
   return el.shadowRoot?.querySelector("iframe") ?? el.querySelector("iframe") ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Audio scrubbing
+// ---------------------------------------------------------------------------
+// Plays a brief slice of the music track while the user drags the playhead,
+// like an NLE scrub. Repeated calls keep playback alive; it auto-pauses shortly
+// after scrubbing stops and restores the element's prior muted state.
+
+const SCRUB_VOLUME = 0.25;
+
+let scrubAudioEl: HTMLAudioElement | null = null;
+let scrubStopTimer: ReturnType<typeof setTimeout> | null = null;
+let scrubPrevMuted: boolean | null = null;
+let scrubPrevVolume: number | null = null;
+
+// Resolve the SAME element the store identified as music: prefer its id, then
+// the role attribute, and only fall back to the first <audio> (which could be a
+// voiceover, so the id hint matters).
+function resolveScrubAudioEl(doc: Document, musicId?: string | null): HTMLAudioElement | null {
+  if (musicId) {
+    const byId = doc.getElementById(musicId);
+    if (byId instanceof HTMLAudioElement) return byId;
+  }
+  return (
+    doc.querySelector<HTMLAudioElement>("audio[data-timeline-role='music']") ??
+    doc.querySelector<HTMLAudioElement>("audio")
+  );
+}
+
+function applyScrub(el: HTMLAudioElement, audioFileTime: number): void {
+  if (scrubAudioEl && scrubAudioEl !== el) stopScrubPreviewAudio();
+  if (scrubPrevMuted === null) scrubPrevMuted = el.muted;
+  if (scrubPrevVolume === null) scrubPrevVolume = el.volume;
+  scrubAudioEl = el;
+  try {
+    el.muted = false;
+    el.volume = SCRUB_VOLUME;
+    if (Math.abs(el.currentTime - audioFileTime) > 0.04) el.currentTime = audioFileTime;
+    if (el.paused) void el.play().catch(() => {});
+  } catch {
+    /* element not ready */
+  }
+  if (scrubStopTimer) clearTimeout(scrubStopTimer);
+  scrubStopTimer = setTimeout(stopScrubPreviewAudio, 140);
+}
+
+/**
+ * Scrub the preview music audio to `audioFileTime` (seconds into the source
+ * file). Pass `null` to stop. Safe to call rapidly during a playhead drag.
+ */
+export function scrubPreviewAudio(
+  iframe: HTMLIFrameElement | null,
+  audioFileTime: number | null,
+  musicId?: string | null,
+): void {
+  if (!iframe) return;
+  if (audioFileTime === null) {
+    stopScrubPreviewAudio();
+    return;
+  }
+  let doc: Document | null = null;
+  try {
+    doc = iframe.contentDocument;
+  } catch {
+    return;
+  }
+  if (!doc) return;
+  const el = resolveScrubAudioEl(doc, musicId);
+  if (el) applyScrub(el, audioFileTime);
+}
+
+export function stopScrubPreviewAudio(): void {
+  if (scrubStopTimer) {
+    clearTimeout(scrubStopTimer);
+    scrubStopTimer = null;
+  }
+  const el = scrubAudioEl;
+  scrubAudioEl = null;
+  if (!el) return;
+  try {
+    el.pause();
+    if (scrubPrevMuted !== null) el.muted = scrubPrevMuted;
+    if (scrubPrevVolume !== null) el.volume = scrubPrevVolume;
+  } catch {
+    /* ignore */
+  }
+  scrubPrevMuted = null;
+  scrubPrevVolume = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +290,8 @@ export function buildMissingCompositionElements(
     let start = parseFloat(startAttr);
     if (isNaN(start)) {
       const ref =
-        doc.getElementById(startAttr) || doc.querySelector(`[data-composition-id="${startAttr}"]`);
+        doc.getElementById(startAttr) ||
+        doc.querySelector(`[data-composition-id="${CSS.escape(startAttr)}"]`);
       if (ref) {
         const refStartAttr = ref.getAttribute("data-start") ?? "0";
         let refStart = parseFloat(refStartAttr);
@@ -214,7 +299,7 @@ export function buildMissingCompositionElements(
         if (isNaN(refStart)) {
           const refRef =
             doc.getElementById(refStartAttr) ||
-            doc.querySelector(`[data-composition-id="${refStartAttr}"]`);
+            doc.querySelector(`[data-composition-id="${CSS.escape(refStartAttr)}"]`);
           const rrStart = parseFloat(refRef?.getAttribute("data-start") ?? "0") || 0;
           const rrCompId = refRef?.getAttribute("data-composition-id");
           const rrDur =
@@ -258,6 +343,7 @@ export function buildMissingCompositionElements(
 
     const trackStr = el.getAttribute("data-track-index");
     const track = trackStr != null ? parseInt(trackStr, 10) : 0;
+    // fallow-ignore-next-line code-duplication
     const compSrc =
       el.getAttribute("data-composition-src") || el.getAttribute("data-composition-file");
     const selector = getTimelineElementSelector(el);
@@ -290,6 +376,7 @@ export function buildMissingCompositionElements(
       selector,
       selectorIndex,
       sourceFile,
+      zIndex: readTimelineElementZIndex(el),
     };
     if (compSrc) {
       entry.compositionSrc = compSrc;
@@ -311,7 +398,7 @@ export function buildMissingCompositionElements(
     // Find the matching DOM host by element id or composition id
     const host =
       doc.getElementById(existing.id) ??
-      doc.querySelector(`[data-composition-id="${existing.id}"]`);
+      doc.querySelector(`[data-composition-id="${CSS.escape(existing.id)}"]`);
     if (!host) return existing;
     const compSrc =
       host.getAttribute("data-composition-src") || host.getAttribute("data-composition-file");
