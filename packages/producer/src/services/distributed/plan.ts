@@ -128,6 +128,12 @@ export interface DistributedRenderConfig {
   videoFrameFormat?: VideoFrameFormat;
   /** Output resolution preset; engages Chrome `deviceScaleFactor` supersampling. */
   outputResolution?: CanvasResolution;
+  /**
+   * True when `outputResolution` was normalized from an aspect-agnostic alias
+   * (`1080p`, `hd`, `4k`, `uhd`) — the compile stage re-targets the preset
+   * to the composition's orientation.
+   */
+  outputResolutionAspectAgnostic?: boolean;
 
   /**
    * Frames per chunk. When explicitly set, that value is used and
@@ -200,6 +206,8 @@ export interface DistributedRenderConfig {
   cfr?: boolean;
 
   logger?: ProducerLogger;
+  /** JSON-safe engine snapshot carried across cloud/process boundaries. */
+  engineConfig?: EngineConfig;
   /** Optional engine config override (env vars are not read when provided). */
   producerConfig?: EngineConfig;
   /** Entry HTML file relative to `projectDir`. Defaults to `"index.html"`. */
@@ -749,7 +757,7 @@ export async function plan(
     }
   };
   const cfg: EngineConfig = {
-    ...(config.producerConfig ?? resolveConfig()),
+    ...(config.producerConfig ?? config.engineConfig ?? resolveConfig()),
     browserGpuMode: "software",
     forceScreenshot: false,
   };
@@ -762,13 +770,14 @@ export async function plan(
     bitrate: config.bitrate,
     videoFrameFormat: config.videoFrameFormat,
     outputResolution: config.outputResolution,
+    outputResolutionAspectAgnostic: config.outputResolutionAspectAgnostic,
     // HDR is banned in distributed mode. force-sdr keeps the
     // extract / encoder paths off the HDR branches entirely.
     hdrMode: config.hdrMode ?? "force-sdr",
     strictness: config.strictness,
     entryFile: config.entryFile ?? "index.html",
     logger: config.logger,
-    producerConfig: config.producerConfig,
+    producerConfig: cfg,
   });
   const entryFile = config.entryFile ?? "index.html";
   const htmlPath = join(projectDir, entryFile);

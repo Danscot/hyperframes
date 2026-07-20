@@ -214,6 +214,29 @@ describe("core rules", () => {
     expect(result.findings.find((f) => f.code === "root_missing_dimensions")).toBeUndefined();
   });
 
+  it("does not mistake a <tag>-shaped CSS comment inside <style> for the composition root", async () => {
+    // Regression: a CSS comment referencing an SVG tag name (e.g. `/* <g> wrapper */`)
+    // inside a <style> block reads as a real open tag to the flat TAG_PATTERN scan,
+    // manufacturing a phantom root before the real composition root and firing
+    // root_missing_composition_id/root_missing_dimensions/head_leaked_text on an
+    // otherwise valid sub-composition.
+    const html = `
+<html><body>
+  <style>
+    /* <g> wrapper for icon groups */
+    .icon { fill: currentColor; }
+  </style>
+  <svg id="root" data-composition-id="c1" data-width="1920" data-height="1080">
+    <g class="icon"></g>
+  </svg>
+  <script>window.__timelines = window.__timelines || {};</script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "root_missing_composition_id")).toBeUndefined();
+    expect(result.findings.find((f) => f.code === "root_missing_dimensions")).toBeUndefined();
+    expect(result.findings.find((f) => f.code === "head_leaked_text")).toBeUndefined();
+  });
+
   it("reports error when timeline registry is missing", async () => {
     const html = `
 <html><body>
@@ -778,6 +801,20 @@ body {
       expect(finding).toBeUndefined();
     });
 
+    it("matches timeline keys against browser-decoded composition ids", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="&#99;1" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "timeline_id_mismatch")).toBeUndefined();
+    });
+
     it("accepts object-literal timeline registration and extracts its keys", async () => {
       const html = `
 <html><body>
@@ -883,6 +920,72 @@ body {
     window.__timelines = window.__timelines || {};
     // const x = Math.random();
     // Date.now() is not used here
+    window.__timelines["c1"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "non_deterministic_code");
+      expect(finding).toBeUndefined();
+    });
+
+    it("detects gsap.utils.random() in script content", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to(".chip", { x: gsap.utils.random(-100, 100), duration: 1 }, 0);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "non_deterministic_code");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toContain("gsap.utils.random");
+    });
+
+    it("detects GSAP 'random(...)' string tween values", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to(".chip", { x: "random(-100, 100)", duration: 1 }, 0);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "non_deterministic_code");
+      expect(finding).toBeDefined();
+      expect(finding?.message).toContain('"random(...)"');
+    });
+
+    it("detects prefixed '+=random(...)' string tween values", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to(".chip", { x: "+=random(-10, 10)", duration: 1 }, 0);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "non_deterministic_code");
+      expect(finding).toBeDefined();
+    });
+
+    it("does NOT flag prose strings that merely mention random(", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const note = "avoid random(seed) helpers in render code";
     window.__timelines["c1"] = gsap.timeline({ paused: true });
   </script>
 </body></html>`;

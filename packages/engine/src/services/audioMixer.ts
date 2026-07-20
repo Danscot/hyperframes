@@ -61,6 +61,21 @@ const MAX_VOLUME_SEGMENTS = 32;
  */
 const VOLUME_SIMPLIFY_EPSILON = 0.005;
 
+// `-ac 2` uses FFmpeg's default mono-to-stereo rematrix, which attenuates a
+// mono source by 3 dB. Explicitly map front-center into both stereo channels;
+// native stereo sources have FL/FR and pass through unchanged.
+const STEREO_CHANNEL_FILTER = "pan=stereo|FL=FL+FC|FR=FR+FC";
+
+async function stereoOutputArgs(srcPath: string): Promise<string[]> {
+  try {
+    const { channels } = await extractAudioMetadata(srcPath);
+    if (channels === 1) return ["-af", STEREO_CHANNEL_FILTER];
+  } catch {
+    // Preserve the previous FFmpeg conversion path when metadata probing fails.
+  }
+  return ["-ac", "2"];
+}
+
 /**
  * Reduce a sorted keyframe list to a perceptually-equivalent piecewise-linear
  * envelope with a bounded segment count.
@@ -245,7 +260,8 @@ async function extractAudioFromVideo(
   const args: string[] = ["-i", videoPath];
   if (options?.startTime !== undefined) args.push("-ss", String(options.startTime));
   if (options?.duration !== undefined) args.push("-t", String(options.duration));
-  args.push("-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-y", outputPath);
+  const channelArgs = await stereoOutputArgs(videoPath);
+  args.push("-vn", "-acodec", "pcm_s16le", "-ar", "48000", ...channelArgs, "-y", outputPath);
 
   const result = await runFfmpeg(args, { signal, timeout: ffmpegProcessTimeout });
 
@@ -280,6 +296,7 @@ async function prepareAudioTrack(
   const ffmpegProcessTimeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
   const outputDir = dirname(outputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+  const channelArgs = await stereoOutputArgs(srcPath);
 
   const args = [
     "-ss",
@@ -292,8 +309,7 @@ async function prepareAudioTrack(
     "pcm_s16le",
     "-ar",
     "48000",
-    "-ac",
-    "2",
+    ...channelArgs,
     "-y",
     outputPath,
   ];
@@ -624,6 +640,25 @@ export async function processCompositionAudio(
       }
     }),
   );
+
+  // Never turn a per-track preparation failure into a successful partial mix.
+  // The producer only surfaces audio failures when `success` is false; mixing
+  // the remaining tracks made the omitted cue indistinguishable from a valid
+  // render unless someone manually audited that exact audio window.
+  if (errors.length > 0) {
+    try {
+      rmSync(workDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    return {
+      success: false,
+      outputPath,
+      durationMs: Date.now() - startMs,
+      tracksProcessed: tracks.length,
+      error: `Audio processing failed: ${errors.join(", ")}`,
+    };
+  }
 
   const mixResult = await mixAudioTracks(tracks, outputPath, totalDuration, signal, config);
 

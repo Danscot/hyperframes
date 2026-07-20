@@ -18,7 +18,7 @@ import {
   injectDurations,
   extractResolvedMedia,
   clampDurations,
-  shouldClampMediaDuration,
+  shouldClampResolvedMediaDuration,
   CSS_URL_RE,
   isNonRelativeUrl,
   type ResolvedDuration,
@@ -478,7 +478,8 @@ async function compileHtmlFile(
   let compiledHtml =
     resolutions.length > 0 ? injectDurations(staticCompiled, resolutions) : staticCompiled;
 
-  // Phase 2: Validate pre-resolved media — clamp data-duration to actual source duration (parallel ffprobe)
+  // Phase 2: Bound authored audio to playable source (parallel ffprobe).
+  // Explicit video slots may outlive their source and hold the final frame.
   const preResolved = extractResolvedMedia(compiledHtml);
   const clampResults = await Promise.all(
     preResolved
@@ -496,16 +497,17 @@ async function compileHtmlFile(
   );
   const clampList: ResolvedDuration[] = [];
   for (const r of clampResults) {
-    if (r.maxDuration > 0 && shouldClampMediaDuration(r.duration, r.maxDuration)) {
+    if (
+      r.maxDuration > 0 &&
+      shouldClampResolvedMediaDuration(r.tagName, r.duration, r.maxDuration)
+    ) {
       clampList.push({ id: r.id, duration: r.maxDuration });
       // This clip's `data-duration` is being silently shortened to its source.
       // Surface it so the author can confirm the longer slot wasn't intended.
-      // ponytail: top-level only — sub-composition clips still get clamped (and
-      // videos still hold the last frame); thread `log` through
-      // parseSubCompositions to warn for them too.
-      const kind = r.tagName === "audio" ? "Audio" : "Video";
+      // ponytail: top-level only — sub-composition audio still gets clamped;
+      // thread `log` through parseSubCompositions to warn for it too.
       log?.warn(
-        `[compile] ${kind} "${r.id}" (${r.src}) is ${r.maxDuration.toFixed(2)}s but its ` +
+        `[compile] Audio "${r.id}" (${r.src}) is ${r.maxDuration.toFixed(2)}s but its ` +
           `data-duration is ${r.duration.toFixed(2)}s — the slot is shortened to the media ` +
           `length. Set data-duration to ~${r.maxDuration.toFixed(2)}s, trim data-media-start, ` +
           `or use a longer/looping source if that isn't intended.`,
@@ -1906,7 +1908,9 @@ export async function compileForRender(
           );
         }
         if (metadata.isVFR) {
-          console.info(
+          // defaultLogger (stderr), not console.info (stdout) — matches the sibling
+          // warning above; a stdout line here corrupts `check --json` / `validate --json`.
+          defaultLogger.warn(
             `[Compiler] Video "${video.id}" is variable frame rate (VFR); ` +
               `the engine will normalize it to CFR before frame extraction. ` +
               `If rendering feels slow on this video, pre-encode once with: ${reencode}`,

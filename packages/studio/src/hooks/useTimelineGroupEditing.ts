@@ -1,13 +1,18 @@
 import { useCallback, type MutableRefObject, type RefObject } from "react";
 import type { Composition } from "@hyperframes/sdk";
 import type { TimelineElement } from "../player";
-import { sdkTimingBatchPersist } from "../utils/sdkCutover";
+import {
+  cutoverCommittedOrThrow,
+  sdkTimingBatchPersist,
+  type PublishSdkSession,
+} from "../utils/sdkCutover";
 import {
   buildTimelineMoveTimingPatch,
   buildTimelineResizeTimingPatch,
   extendRootDurationIfNeeded,
   formatTimelineAttributeNumber,
   patchIframeDomTiming,
+  playbackStartAttributeForElement,
   persistTimelineBatchEdit,
   type PersistTimelineBatchChange,
   type RecordEditInput,
@@ -20,6 +25,7 @@ import {
   shiftGsapPositions,
   syncPreviewContentDuration,
 } from "./timelineTimingSync";
+import { getStudioSaveErrorMessage } from "../utils/studioSaveDiagnostics";
 
 export interface TimelineGroupMoveChange {
   element: TimelineElement;
@@ -37,6 +43,8 @@ export interface TimelineGroupResizeChange {
 export interface TimelineGroupCommitOptions {
   beforeTiming?: Promise<void>;
   coalesceKey?: string;
+  /** Per-entry undo coalesce window override (ms) — see EditHistoryEntry.coalesceMs. */
+  coalesceMs?: number;
 }
 
 interface UseTimelineGroupEditingOptions {
@@ -51,8 +59,9 @@ interface UseTimelineGroupEditingOptions {
   recordEdit: (input: RecordEditInput) => Promise<void>;
   reloadPreview: () => void;
   sdkSession?: Composition | null;
+  publishSdkSession?: PublishSdkSession;
   showToast: (message: string, tone?: "error" | "info") => void;
-  writeProjectFile: (path: string, content: string) => Promise<void>;
+  writeProjectFile: (path: string, content: string, expectedContent?: string) => Promise<void>;
 }
 
 function targetPathFor(element: TimelineElement, activeCompPath: string | null): string {
@@ -106,6 +115,7 @@ export function useTimelineGroupEditing({
   recordEdit,
   reloadPreview,
   sdkSession,
+  publishSdkSession,
   showToast,
   writeProjectFile,
 }: UseTimelineGroupEditingOptions) {
@@ -137,6 +147,7 @@ export function useTimelineGroupEditing({
       label: string,
       batchChanges: PersistTimelineBatchChange[],
       coalesceKey: string,
+      coalesceMs?: number,
     ) => {
       await persistTimelineBatchEdit({
         projectId,
@@ -148,6 +159,7 @@ export function useTimelineGroupEditing({
         domEditSaveTimestampRef,
         pendingTimelineEditPathRef,
         coalesceKey,
+        coalesceMs,
       });
       forceReloadSdkSession?.();
     },
@@ -176,6 +188,7 @@ export function useTimelineGroupEditing({
       needsExtension: boolean;
       label: string;
       coalesceKey: string;
+      coalesceMs?: number;
     }): Promise<boolean> => {
       const sharedPath = allChangesSharePath(input.changes, activeCompPath);
       const canUseSdk =
@@ -184,7 +197,7 @@ export function useTimelineGroupEditing({
         input.eligible &&
         input.sdkChanges.every((change) => change !== null);
       if (!canUseSdk) return false;
-      return sdkTimingBatchPersist(
+      const result = await sdkTimingBatchPersist(
         input.sdkChanges.filter((change): change is NonNullable<typeof change> => change !== null),
         sharedPath,
         sdkSession,
@@ -195,14 +208,17 @@ export function useTimelineGroupEditing({
           domEditSaveTimestampRef,
           compositionPath: activeCompPath,
           readProjectFile: (path) => readFileContent(projectIdRef.current ?? "", path),
+          publishSession: publishSdkSession,
         },
-        { label: input.label, coalesceKey: input.coalesceKey },
+        { label: input.label, coalesceKey: input.coalesceKey, coalesceMs: input.coalesceMs },
       );
+      return cutoverCommittedOrThrow(result);
     },
     [
       activeCompPath,
       domEditSaveTimestampRef,
       projectIdRef,
+      publishSdkSession,
       recordEdit,
       reloadPreview,
       sdkSession,
@@ -220,8 +236,23 @@ export function useTimelineGroupEditing({
         if (change.track != null) {
           attrs.push(["data-track-index", formatTimelineAttributeNumber(change.track)]);
         }
-        patchIframeDomTiming(previewIframeRef.current, change.element, attrs);
+        patchIframeDomTiming(previewIframeRef.current, change.element, attrs, activeCompPath);
       }
+
+      // TRACK-ONLY batch: every change keeps its start (moves never carry a
+      // duration change), so nothing timing-related changed — the batch only
+      // rewrites data-track-index, which the renderer never reads (documented
+      // in core runtime/timeline.ts; track is a studio lane concept). The live
+      // DOM patch above + the gesture owner's optimistic store update cover the
+      // in-flight UI; after the complete lane + z transaction, that owner
+      // refreshes the preview so its runtime manifest converges to disk. There
+      // is still nothing to GSAP-shift here, so skip this fallback entirely.
+      // Running it anyway is what made the mirrored z-order lane move blink —
+      // a zero-delta batch yields no scriptText, and finishGroupTimingGsapFallback
+      // used to full-reload the iframe when there was no script to soft-swap
+      // (it now rebinds the runtime timing in place, but a track-only batch
+      // needs NO preview sync at all, so the skip stays).
+      const trackOnly = changes.every((change) => change.start === change.element.start);
 
       const maxEnd = Math.max(...changes.map((change) => change.start + change.element.duration));
       // Snapshot the duration BEFORE the optimistic updates below so a failed
@@ -229,11 +260,15 @@ export function useTimelineGroupEditing({
       const rollbackDuration = captureDurationRollback(previewIframeRef.current);
       // needsExtension gates the SDK path (setTiming can't grow the root duration),
       // so read the store BEFORE the readout sync below optimistically updates it.
+      // Track-only batches leave every clip end unchanged, so both this and the
+      // readout sync below are provable no-ops there — kept unconditional so the
+      // duration machinery stays on one code path.
       const needsExtension = extendRootDurationIfNeeded(maxEnd);
       // Optimistic duration readout: content-driven (grow AND shrink), read from
       // the just-patched live DOM. See syncPreviewContentDuration.
       syncPreviewContentDuration(previewIframeRef.current);
       const coalesceKey = options?.coalesceKey ?? moveCoalesceKey(changes);
+      const coalesceMs = options?.coalesceMs;
       return enqueueGroupOperation("Move timeline clips", async (projectId) => {
         await options?.beforeTiming;
         const handledBySdk = await trySdkBatchPersist({
@@ -243,6 +278,7 @@ export function useTimelineGroupEditing({
           needsExtension,
           label: "Move timeline clips",
           coalesceKey,
+          coalesceMs,
         });
         if (handledBySdk) return;
 
@@ -261,7 +297,12 @@ export function useTimelineGroupEditing({
               ),
           })),
           coalesceKey,
+          coalesceMs,
         );
+        // Track-only: no timing delta → no GSAP positions to shift and no
+        // reload (see the trackOnly doc above). Mixed batches (any start
+        // change) keep the full fallback below.
+        if (trackOnly) return;
         await finishGroupTimingGsapFallback({
           projectId,
           iframe: previewIframeRef.current,
@@ -284,6 +325,7 @@ export function useTimelineGroupEditing({
         // Failed persist: revert the optimistic duration readout + live root
         // alongside the gesture owner's store rollback.
         rollbackDuration();
+        showToast(getStudioSaveErrorMessage(error), "error");
         throw error;
       });
     },
@@ -295,6 +337,7 @@ export function useTimelineGroupEditing({
       recordEdit,
       reloadPreview,
       trySdkBatchPersist,
+      showToast,
     ],
   );
 
@@ -307,13 +350,10 @@ export function useTimelineGroupEditing({
           ["data-duration", formatTimelineAttributeNumber(change.duration)],
         ];
         if (change.playbackStart != null) {
-          const liveAttr =
-            change.element.playbackStartAttr === "playback-start"
-              ? "data-playback-start"
-              : "data-media-start";
+          const liveAttr = playbackStartAttributeForElement(change.element);
           liveAttrs.push([liveAttr, formatTimelineAttributeNumber(change.playbackStart)]);
         }
-        patchIframeDomTiming(previewIframeRef.current, change.element, liveAttrs);
+        patchIframeDomTiming(previewIframeRef.current, change.element, liveAttrs, activeCompPath);
       }
 
       const maxEnd = Math.max(...changes.map((change) => change.start + change.duration));
@@ -327,6 +367,7 @@ export function useTimelineGroupEditing({
       // the just-patched live DOM. See syncPreviewContentDuration.
       syncPreviewContentDuration(previewIframeRef.current);
       const coalesceKey = options?.coalesceKey ?? resizeCoalesceKey(changes);
+      const coalesceMs = options?.coalesceMs;
       return enqueueGroupOperation("Resize timeline clips", async (projectId) => {
         await options?.beforeTiming;
         const handledBySdk = await trySdkBatchPersist({
@@ -339,6 +380,7 @@ export function useTimelineGroupEditing({
           needsExtension,
           label: "Resize timeline clips",
           coalesceKey,
+          coalesceMs,
         });
         if (handledBySdk) return;
 
@@ -355,6 +397,7 @@ export function useTimelineGroupEditing({
               }),
           })),
           coalesceKey,
+          coalesceMs,
         );
         await finishGroupTimingGsapFallback({
           projectId,
@@ -387,6 +430,7 @@ export function useTimelineGroupEditing({
         // Failed persist: revert the optimistic duration readout + live root
         // alongside the gesture owner's store rollback.
         rollbackDuration();
+        showToast(getStudioSaveErrorMessage(error), "error");
         throw error;
       });
     },
@@ -398,6 +442,7 @@ export function useTimelineGroupEditing({
       recordEdit,
       reloadPreview,
       trySdkBatchPersist,
+      showToast,
     ],
   );
 

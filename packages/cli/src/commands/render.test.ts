@@ -72,12 +72,40 @@ const preflightState = vi.hoisted(() => ({
   },
 }));
 
+const ffmpegEncoderState = vi.hoisted(() => ({
+  mode: "software" as "software" | "gpu",
+  error: null as Error | null,
+}));
+const orphanCleanupState = vi.hoisted(() => ({
+  calls: 0,
+  killed: 0,
+}));
+
 vi.mock("../utils/producer.js", () => ({
   loadProducer: vi.fn(async () => ({
     resolveConfig: vi.fn((overrides: Record<string, unknown>) => {
       producerState.resolveConfigCalls.push(overrides);
       return { ...overrides, resolved: true };
     }),
+    createRenderRequest: vi.fn(
+      (input: {
+        projectDir: string;
+        outputPath: string;
+        engineConfig: unknown;
+        options: object;
+      }) => ({
+        version: 1,
+        projectDir: input.projectDir,
+        outputPath: input.outputPath,
+        options: { ...input.options, engineConfig: input.engineConfig },
+      }),
+    ),
+    renderConfigFromRequest: vi.fn(
+      (request: { options: Record<string, unknown> }, runtime: { logger?: unknown }) => {
+        const { engineConfig, ...options } = request.options;
+        return { ...options, producerConfig: engineConfig, logger: runtime.logger };
+      },
+    ),
     createRenderJob: vi.fn((config: Record<string, unknown>) => {
       producerState.createdJobs.push(config);
       return { config, progress: 100, outcome: "completed", warnings: [] };
@@ -120,12 +148,23 @@ vi.mock("../telemetry/events.js", () => ({
 }));
 
 vi.mock("../browser/ffmpeg.js", () => ({
+  detectH264EncoderMode: vi.fn(() => {
+    if (ffmpegEncoderState.error) throw ffmpegEncoderState.error;
+    return ffmpegEncoderState.mode;
+  }),
   findFFmpeg: vi.fn(() => "/usr/bin/ffmpeg"),
   getFFmpegInstallHint: vi.fn(() => "brew install ffmpeg"),
 }));
 
 vi.mock("../browser/preflight.js", () => ({
   runEnvironmentChecks: vi.fn(async () => preflightState.result),
+}));
+
+vi.mock("../utils/orphanCleanup.js", () => ({
+  killOrphanedProcesses: vi.fn(() => {
+    orphanCleanupState.calls += 1;
+    return orphanCleanupState.killed;
+  }),
 }));
 
 describe("renderLocal browser GPU config", () => {
@@ -173,6 +212,10 @@ describe("renderLocal browser GPU config", () => {
     configState.writeConfigCalls = [];
     trackingState.shouldTrack = true;
     trackingState.renderObservations = [];
+    ffmpegEncoderState.mode = "software";
+    ffmpegEncoderState.error = null;
+    orphanCleanupState.calls = 0;
+    orphanCleanupState.killed = 0;
     resetTrialState();
     savedEnv.clear();
     savedEnv.set("HYPERFRAMES_FFMPEG_PATH", process.env.HYPERFRAMES_FFMPEG_PATH);
@@ -183,6 +226,22 @@ describe("renderLocal browser GPU config", () => {
     delete process.env.HYPERFRAMES_FFPROBE_PATH;
     delete process.env.PRODUCER_HEADLESS_SHELL_PATH;
     delete process.env.HF_DE_PARALLEL_ROUTER;
+  });
+
+  it("cleans orphaned browser trees before starting a local render", async () => {
+    orphanCleanupState.killed = 1;
+
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "standard",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "auto",
+      quiet: true,
+    });
+
+    expect(orphanCleanupState.calls).toBe(1);
   });
 
   afterEach(() => {
@@ -321,6 +380,58 @@ describe("renderLocal browser GPU config", () => {
     expect(process.env.HYPERFRAMES_FFMPEG_PATH).toBe("/usr/bin/ffmpeg");
     expect(process.env.HYPERFRAMES_FFPROBE_PATH).toBe("/usr/bin/ffprobe");
     expect(process.env.PRODUCER_HEADLESS_SHELL_PATH).toBe("/mock/chrome");
+  });
+
+  it("falls back to hardware encoding when FFmpeg omits libx264", async () => {
+    ffmpegEncoderState.mode = "gpu";
+
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "high",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "force-sdr",
+      quiet: true,
+    });
+
+    expect(producerState.createdJobs[0]?.useGpu).toBe(true);
+  });
+
+  it("lets the encoder surface its own error when capability detection fails", async () => {
+    ffmpegEncoderState.error = new Error("encoder probe timed out");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "high",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "force-sdr",
+      quiet: true,
+    });
+
+    expect(producerState.createdJobs[0]?.useGpu).toBe(false);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("encoder probe timed out"));
+  });
+
+  it("diagnoses advisory encoder probe failures unless quiet", async () => {
+    ffmpegEncoderState.error = new Error("encoder probe timed out");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await renderLocal("/tmp/project", "/tmp/out.mp4", {
+      fps: { num: 30, den: 1 },
+      quality: "high",
+      format: "mp4",
+      gpu: false,
+      browserGpuMode: "software",
+      hdrMode: "force-sdr",
+      quiet: false,
+    });
+
+    expect(producerState.createdJobs[0]?.useGpu).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("encoder probe timed out"));
   });
 
   it("resolves browser GPU from CLI flags, Docker mode, and env fallback", () => {
@@ -1077,6 +1188,122 @@ describe("checkRenderResolutionPreflight", () => {
     expect(
       await checkRenderResolutionPreflight("<html><body></body></html>", "landscape", noModes),
     ).toBeUndefined();
+  });
+
+  // Aspect-agnostic aliases (`--resolution 1080p` / `hd` / `4k` / `uhd`) name a
+  // resolution tier without pinning an orientation. When the flag is
+  // aspect-agnostic the pre-flight must NOT block on an aspect-ratio mismatch —
+  // the compile stage adapts the preset to the composition's orientation
+  // downstream (see `outputResolutionAspectAgnostic` on RenderConfig).
+  // Field signal ts=1784176662 (darwin/arm64, CLI 0.7.59):
+  //   "--resolution 1080p rejects a 1080x1920 portrait comp"
+  describe("aspect-agnostic (--resolution 1080p / hd / 4k / uhd)", () => {
+    const agnostic = { ...noModes, aspectAgnostic: true } as const;
+
+    it("clears a landscape preset on a portrait composition (the field-signal scenario)", async () => {
+      // The bug: --resolution 1080p normalized to `landscape` (1920×1080),
+      // then errored on a 1080×1920 portrait comp with "Output resolution
+      // incompatible." With aspectAgnostic=true the pre-flight steps aside
+      // and the compile stage re-maps landscape → portrait.
+      expect(
+        await checkRenderResolutionPreflight(portraitHtml, "landscape", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("clears a landscape-4k preset on a portrait composition (4K tier)", async () => {
+      // `--resolution 4k` → normalized `landscape-4k`. Portrait comp is fine
+      // when aspect-agnostic.
+      expect(
+        await checkRenderResolutionPreflight(portraitHtml, "landscape-4k", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("clears a landscape preset on a square composition", async () => {
+      // aspect > 1 → landscape, aspect = 1 → square. Both self-heal.
+      expect(
+        await checkRenderResolutionPreflight(comp(1080, 1080), "landscape", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("still flags alpha + aspect-agnostic (orientation isn't the issue)", async () => {
+      // alpha-incompatible is orthogonal to aspect: the alpha capture path
+      // can't apply deviceScaleFactor regardless of orientation. The
+      // aspect-agnostic downgrade must NOT swallow this.
+      const result = await checkRenderResolutionPreflight(portraitHtml, "landscape", {
+        aspectAgnostic: true,
+        alphaRequested: true,
+        hdrRequested: false,
+      });
+      expect(result?.kind).toBe("alpha-incompatible");
+    });
+
+    it("still flags HDR + aspect-agnostic", async () => {
+      const result = await checkRenderResolutionPreflight(landscapeHtml, "landscape", {
+        aspectAgnostic: true,
+        alphaRequested: false,
+        hdrRequested: true,
+      });
+      expect(result?.kind).toBe("hdr-incompatible");
+    });
+
+    it("still flags downsampling + aspect-agnostic (same-orientation, smaller preset)", async () => {
+      // 3840×2160 comp with `--resolution 1080p` → `landscape` (1920×1080).
+      // Same orientation, but tier smaller than comp — user asked for a
+      // downsample. That's a real incompatibility, not an orientation swap.
+      const result = await checkRenderResolutionPreflight(comp(3840, 2160), "landscape", agnostic);
+      expect(result?.kind).toBe("downsampling");
+    });
+
+    it("does NOT auto-clear when the flag was explicit (orientation-locked preset stays strict)", async () => {
+      // The negative case: `--resolution landscape` on a portrait comp — the
+      // user explicitly asked for landscape orientation, and the mismatch is
+      // a genuine mistake. Pre-flight must still block with the actionable
+      // "did you mean --resolution portrait?" suggestion.
+      const result = await checkRenderResolutionPreflight(portraitHtml, "landscape", noModes);
+      expect(result?.kind).toBe("aspect-mismatch");
+      expect(result?.message).toContain("--resolution portrait");
+    });
+
+    // Rames Δ2 on PR #2529: the earlier "downgrade aspect-mismatch to
+    // undefined" preflight cleared *un-remapped* mismatches, so two input
+    // classes below regressed from an early actionable error to a late throw
+    // deep in `resolveDeviceScaleFactor` (browser + ffmpeg already up).
+    // The fix computes the *effective* preset via `suggestMatchingPreset`
+    // (mirroring the compile stage) and re-checks against that, so only
+    // genuinely-fixable mismatches clear early.
+
+    it("blocks IG 4:5 (non-preset aspect) early with an aspect-aware message", async () => {
+      // 1080×1350 is a 4:5 portrait — no canonical preset shares that aspect,
+      // so `suggestMatchingPreset` returns undefined and `adaptAspectAgnosticResolution`
+      // keeps the original preset. Before the fix, aspect-agnostic downgraded
+      // the mismatch here to undefined; now the preflight surfaces it early.
+      const result = await checkRenderResolutionPreflight(comp(1080, 1350), "landscape", agnostic);
+      expect(result?.kind).toBe("aspect-mismatch");
+      // No sibling preset to suggest → message falls back to the "pick a preset
+      // whose orientation matches" hint (see `buildAspectMismatch` in
+      // `@hyperframes/parsers/outputResolutionCompatibility`).
+      expect(result?.message).toMatch(/preset whose orientation matches|omit --resolution/i);
+    });
+
+    it("blocks a portrait-4K comp + `1080p` downsample early (orientation-flip masks the tier gap)", async () => {
+      // 2160×3840 (portrait 4K) + `--resolution 1080p` — the compile stage
+      // remaps `landscape` → `portrait` (1080×1920), and *then* the preset
+      // is smaller than the composition. The un-remapped preflight let this
+      // slip through as an aspect-mismatch downgrade; the remap-then-check
+      // catches the real failure — downsampling — early.
+      const result = await checkRenderResolutionPreflight(comp(2160, 3840), "landscape", agnostic);
+      expect(result?.kind).toBe("downsampling");
+    });
+
+    it("blocks a portrait 720p comp + `1080p` non-integer upscale early (orientation-flip masks the fractional DPR)", async () => {
+      // 720×1280 (portrait 720p) + `--resolution 1080p` — remap `landscape`
+      // → `portrait` (1080×1920). widthRatio = 1080 / 720 = 1.5, which
+      // `resolveDeviceScaleFactor` rejects. Surfacing it in preflight beats
+      // failing after Chrome + ffmpeg spin up. Same class as Miga's
+      // important note on PR #2529.
+      const result = await checkRenderResolutionPreflight(comp(720, 1280), "landscape", agnostic);
+      expect(result?.kind).toBe("non-integer-scale");
+    });
   });
 });
 

@@ -35,6 +35,10 @@ export const examples: Example[] = [
   ["Deterministic render via Docker", "hyperframes render --docker --output deterministic.mp4"],
   ["Parallel rendering with 6 workers", "hyperframes render --workers 6 --output fast.mp4"],
   ["Opt out of browser GPU render", "hyperframes render --no-browser-gpu --output cpu.mp4"],
+  [
+    "Relocate frame cache off C: (Windows) or another small partition",
+    "hyperframes render --frames-cache-dir D:/hf-cache --output out.mp4",
+  ],
   ["HDR output (auto-detected)", "hyperframes render --output hdr-output.mp4"],
   [
     "Override composition variables (parametrized render)",
@@ -76,10 +80,20 @@ import { VERSION } from "../version.js";
 import { isDevMode } from "../utils/env.js";
 import { buildDockerRunArgs, resolveDockerPlatform } from "../utils/dockerRunArgs.js";
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
+import { formatRenderOutputTimestamp } from "@hyperframes/core";
 import { runEnvironmentChecks } from "../browser/preflight.js";
+import { detectH264EncoderMode } from "../browser/ffmpeg.js";
 import { chromeLaunchRemediation } from "../browser/linuxDeps.js";
+import { macosOldChromeCrashRemediation } from "../browser/macosOldChromeCrash.js";
+import { killOrphanedProcesses } from "../utils/orphanCleanup.js";
+import {
+  markRenderSucceeded,
+  runPostRenderStep,
+  runPostRenderStepAsync,
+} from "../utils/render-success-state.js";
 import type { ProducerLogger, RenderJob } from "@hyperframes/producer";
 import {
+  EXTRACT_CACHE_DIR_DISABLED_ALIASES,
   MAX_VP9_CPU_USED,
   MIN_VP9_CPU_USED,
   isVideoFrameFormat,
@@ -87,7 +101,9 @@ import {
 } from "@hyperframes/engine";
 import {
   normalizeResolutionFlag,
+  isAspectAgnosticResolutionAlias,
   checkOutputResolutionCompatibility,
+  suggestMatchingPreset,
   parseFps,
   fpsToNumber,
   fpsToFfmpegArg,
@@ -386,6 +402,18 @@ export default defineCommand({
       // guard below leaves PRODUCER_EXPERIMENTAL_FAST_CAPTURE untouched and the
       // env fallback survives (matches the --low-memory-mode idiom).
     },
+    "frames-cache-dir": {
+      type: "string",
+      description:
+        "Directory for the content-addressed extracted-frame cache. " +
+        "Use to relocate the cache off the system drive when the OS temp " +
+        "directory lives on a small partition (e.g. Windows C: exhaustion " +
+        `during long renders). Pass ${EXTRACT_CACHE_DIR_DISABLED_ALIASES.map((a) => `"${a}"`).join(" / ")} to ` +
+        "disable caching entirely (frames extract into the render's workDir " +
+        "and are cleaned up when the render ends). Default: " +
+        "<tmpdir>/hyperframes-extract-cache-<uid>. " +
+        "Env: HYPERFRAMES_EXTRACT_CACHE_DIR.",
+    },
   },
   // `run` is the citty handler for `hyperframes render` — sequential flag
   // validation + render dispatch. Inherited CRITICAL on main (CRAP 1290);
@@ -478,6 +506,15 @@ export default defineCommand({
 
     // ── Validate resolution ────────────────────────────────────────────────
     let outputResolution: CanvasResolution | undefined;
+    // Aspect-agnostic aliases (`--resolution 1080p` / `hd` / `4k` / `uhd`) name
+    // a resolution *tier* without pinning an orientation. Historically they
+    // all normalize to a `landscape` preset, which rejects portrait/square
+    // compositions at `resolveDeviceScaleFactor` time. Track the raw-input
+    // shape so the compile stage can re-map the preset to the composition's
+    // orientation (see `outputResolutionAspectAgnostic` on RenderConfig).
+    // Explicit orientation-bearing aliases (`1080p-portrait`, `4k-square`, …)
+    // and canonical presets (`landscape`, `portrait`, …) stay strict.
+    let outputResolutionAspectAgnostic = false;
     if (args.resolution !== undefined) {
       outputResolution = normalizeResolutionFlag(args.resolution);
       if (!outputResolution) {
@@ -488,6 +525,7 @@ export default defineCommand({
         );
         process.exit(1);
       }
+      outputResolutionAspectAgnostic = isAspectAgnosticResolutionAlias(args.resolution);
       // Reject the --resolution + --hdr combination at the CLI layer so the
       // user sees the friendly errorBox before any work directories or
       // ffmpeg processes spin up. The orchestrator also enforces this via
@@ -559,6 +597,19 @@ export default defineCommand({
         : "false";
     }
 
+    // ── Override: extracted-frame cache directory ────────────────────────
+    // Sugar for HYPERFRAMES_EXTRACT_CACHE_DIR. Set BEFORE resolveConfig() so
+    // the env resolver picks up the CLI-supplied value. Disabling aliases
+    // (off/none/false/0) pass through verbatim — the engine helper canonicalizes.
+    // Positive paths are resolved to absolute so CWD changes downstream can't
+    // stale them.
+    if (typeof args["frames-cache-dir"] === "string" && args["frames-cache-dir"].trim() !== "") {
+      const raw = args["frames-cache-dir"].trim();
+      const normalized = raw.toLowerCase();
+      const isDisableAlias = EXTRACT_CACHE_DIR_DISABLED_ALIASES.includes(normalized);
+      process.env.HYPERFRAMES_EXTRACT_CACHE_DIR = isDisableAlias ? raw : resolve(raw);
+    }
+
     // ── Validate max-concurrent-renders ─────────────────────────────────
     if (args["max-concurrent-renders"] != null) {
       const parsed = parseInt(args["max-concurrent-renders"], 10);
@@ -608,16 +659,14 @@ export default defineCommand({
     // ── Resolve output path ───────────────────────────────────────────────
     const rendersDir = resolve("renders");
     const ext = FORMAT_EXT[format] ?? ".mp4";
-    // fallow-ignore-next-line code-duplication
     const now = new Date();
-    const datePart = now.toISOString().slice(0, 10);
-    const timePart = now.toTimeString().slice(0, 8).replace(/:/g, "-");
+    const timestamp = formatRenderOutputTimestamp(now);
     const batchOutputTemplate = args.output
       ? args.output
-      : join(rendersDir, `${project.name}_${datePart}_${timePart}_{index}${ext}`);
+      : join(rendersDir, `${project.name}_${timestamp}_{index}${ext}`);
     const outputPath = args.output
       ? resolve(args.output)
-      : join(rendersDir, `${project.name}_${datePart}_${timePart}${ext}`);
+      : join(rendersDir, `${project.name}_${timestamp}${ext}`);
 
     // Ensure output directory exists
     if (!batchPath) mkdirSync(dirname(outputPath), { recursive: true });
@@ -859,6 +908,7 @@ export default defineCommand({
           {
             alphaRequested: format === "webm" || format === "mov" || format === "png-sequence",
             hdrRequested: args.hdr ?? false,
+            aspectAgnostic: outputResolutionAspectAgnostic,
           },
         );
       } catch {
@@ -905,6 +955,8 @@ export default defineCommand({
         browserPath,
         entryFile,
         outputResolution,
+        outputResolutionAspectAgnostic,
+        outputResolutionRaw: args.resolution,
         pageNavigationTimeoutMs,
         protocolTimeout,
         playerReadyTimeout,
@@ -972,6 +1024,8 @@ export default defineCommand({
         variables,
         entryFile,
         outputResolution,
+        outputResolutionAspectAgnostic,
+        outputResolutionRaw: args.resolution,
         pageSideCompositing: args["page-side-compositing"] !== false,
         experimentalFastCapture: args["experimental-fast-capture"] === true,
         pageNavigationTimeoutMs,
@@ -1001,6 +1055,8 @@ export default defineCommand({
         variables,
         entryFile,
         outputResolution,
+        outputResolutionAspectAgnostic,
+        outputResolutionRaw: args.resolution,
         pageNavigationTimeoutMs,
         protocolTimeout,
         playerReadyTimeout,
@@ -1055,6 +1111,20 @@ interface RenderOptions {
   exitAfterComplete?: boolean;
   /** Output resolution preset; see `resolveDeviceScaleFactor` for constraints. */
   outputResolution?: CanvasResolution;
+  /**
+   * True when `outputResolution` came from an aspect-agnostic alias
+   * (`--resolution 1080p` / `hd` / `4k` / `uhd`). The compile stage adapts
+   * the preset to the composition's orientation instead of rejecting
+   * portrait/square comps as an aspect-ratio mismatch.
+   */
+  outputResolutionAspectAgnostic?: boolean;
+  /**
+   * Raw `--resolution` string as typed by the user. Preserved so Docker mode
+   * can forward the pre-normalized flag to the in-container CLI, which
+   * re-runs the aspect-agnostic detection on its own side — otherwise we'd
+   * lose the "1080p was ambiguous" signal at the process boundary.
+   */
+  outputResolutionRaw?: string;
   pageSideCompositing?: boolean;
   /** EXPERIMENTAL. drawElementImage frame capture (--experimental-fast-capture). */
   experimentalFastCapture?: boolean;
@@ -1164,21 +1234,51 @@ async function readCompositionDimensions(
  * Extracted (and exported) so the CLI wiring around `process.exit` stays a
  * thin adapter and the branch logic is unit-testable. See render-reliability
  * workstream P1-3.
+ *
+ * `aspectAgnostic` reflects whether `outputResolution` was normalized from an
+ * aspect-agnostic alias like `--resolution 1080p` / `hd` / `4k` / `uhd`.
+ * When true, an aspect-ratio mismatch is *not* an error at the CLI layer:
+ * the compile stage will re-map the preset to the composition's orientation
+ * (a portrait 1080×1920 composition with `--resolution 1080p` renders at
+ * 1080×1920, not 1920×1080). Alpha / HDR / downsampling / non-integer-scale
+ * checks still block, because those failures are not orientation-fixable.
  */
 export async function checkRenderResolutionPreflight(
   compositionHtml: string,
   outputResolution: CanvasResolution | undefined,
-  modes: { alphaRequested: boolean; hdrRequested: boolean },
+  modes: { alphaRequested: boolean; hdrRequested: boolean; aspectAgnostic?: boolean },
 ): Promise<{ message: string; kind: OutputResolutionIssueKind } | undefined> {
   if (!outputResolution) return undefined;
   const dims = await readCompositionDimensions(compositionHtml);
   // Couldn't determine the composition's actual dimensions — defer to the
   // pipeline's own defense-in-depth check rather than guess.
   if (!dims) return undefined;
+  // Aspect-agnostic aliases (`--resolution 1080p` / `hd` / `4k` / `uhd`)
+  // don't nail an orientation — the compile stage remaps them to the
+  // composition's orientation via `adaptAspectAgnosticResolution` +
+  // `suggestMatchingPreset`. Mirror that remap here BEFORE running the
+  // compatibility check so the early rejection reflects the *effective*
+  // preset the pipeline will actually use.
+  //
+  // Doing this pre-check (rather than post-hoc "downgrade aspect-mismatch")
+  // is what makes the following cases fail early with an aspect-aware
+  // message instead of throwing deep in the compile stage after Chrome +
+  // ffmpeg have already spun up (Rames Δ2 on PR #2529):
+  //
+  //   - Non-preset aspect (e.g. IG 4:5 1080×1350): no sibling preset
+  //     matches → `suggestMatchingPreset` returns `undefined` → we keep the
+  //     original preset and surface the aspect-mismatch normally.
+  //   - Orientation-flip + tier-too-small (portrait-4K comp 2160×3840 +
+  //     `--resolution 1080p`): remaps `landscape` → `portrait` (1080×1920),
+  //     re-check catches the downsample early with a clear message.
+  const effective =
+    modes.aspectAgnostic === true
+      ? (suggestMatchingPreset(dims.width, dims.height, outputResolution) ?? outputResolution)
+      : outputResolution;
   const compat = checkOutputResolutionCompatibility({
     compositionWidth: dims.width,
     compositionHeight: dims.height,
-    outputResolution,
+    outputResolution: effective,
     alphaRequested: modes.alphaRequested,
     hdrRequested: modes.hdrRequested,
   });
@@ -1380,12 +1480,22 @@ async function renderDocker(
       quiet: options.quiet,
       variables: options.variables,
       entryFile: options.entryFile,
-      outputResolution: options.outputResolution,
+      // Forward the RAW `--resolution` flag (falling back to the canonical
+      // preset name when raw wasn't captured, e.g. programmatic callers).
+      // The in-container CLI re-runs `normalizeResolutionFlag` +
+      // `isAspectAgnosticResolutionAlias`, so aspect-agnostic aliases
+      // (`1080p`, `hd`, `4k`, `uhd`) retain their orientation-adaptive
+      // behavior inside Docker; passing the normalized `landscape` preset
+      // would silently lose that signal at the process boundary and
+      // reject portrait/square comps.
+      outputResolution: options.outputResolutionRaw ?? options.outputResolution,
       pageSideCompositing: options.pageSideCompositing,
       debug: options.debug,
       bestEffort: options.bestEffort,
       experimentalFastCapture: options.experimentalFastCapture,
       pageNavigationTimeoutMs: options.pageNavigationTimeoutMs,
+      protocolTimeoutMs: options.protocolTimeout,
+      playerReadyTimeoutMs: options.playerReadyTimeout,
     },
   });
 
@@ -1412,23 +1522,35 @@ async function renderDocker(
 
   const elapsed = Date.now() - startTime;
 
+  // Docker child exited 0 → the containerized producer already validated
+  // AND committed the artifact. Mirror renderLocal's post-success guarantee
+  // so any late throw here (telemetry flush, feedback prompt) cannot flip
+  // the exit code.
+  markRenderSucceeded();
+
   // Track metrics (no job object available from Docker — use a minimal stub)
-  trackRenderComplete({
-    durationMs: elapsed,
-    fps: fpsToNumber(options.fps),
-    quality: options.quality,
-    workers: options.workers,
-    docker: true,
-    gpu: options.gpu,
-    authoringSkill: options.authoringSkill,
-    ...getMemorySnapshot(),
-  });
+  runPostRenderStep("trackRenderComplete", () =>
+    trackRenderComplete({
+      durationMs: elapsed,
+      fps: fpsToNumber(options.fps),
+      quality: options.quality,
+      workers: options.workers,
+      docker: true,
+      gpu: options.gpu,
+      authoringSkill: options.authoringSkill,
+      ...getMemorySnapshot(),
+    }),
+  );
 
   // ponytail: Docker runs the producer in a child process, so no perfSummary is
   // threaded back here; the summary shows render time only (never a wrong video
   // length). Probe the output with ffprobe if a duration figure is wanted here.
-  printRenderComplete(outputPath, elapsed, options.quiet);
-  warnIfWebmAlphaDropped(outputPath, options.format, options.quiet);
+  runPostRenderStep("printRenderComplete", () =>
+    printRenderComplete(outputPath, elapsed, options.quiet),
+  );
+  runPostRenderStep("warnIfWebmAlphaDropped", () =>
+    warnIfWebmAlphaDropped(outputPath, options.format, options.quiet),
+  );
   if (options.exitAfterComplete) scheduleRenderProcessExit();
   return { renderTimeMs: elapsed };
 }
@@ -1439,8 +1561,18 @@ export async function renderLocal(
   outputPath: string,
   options: RenderOptions,
 ): Promise<SingleRenderResult> {
+  const recoveredOrphanTrees = killOrphanedProcesses();
+  if (recoveredOrphanTrees > 0 && !options.quiet) {
+    console.warn(
+      c.warn(
+        `  Recovered ${recoveredOrphanTrees} orphaned browser process ${recoveredOrphanTrees === 1 ? "tree" : "trees"} from an interrupted render.`,
+      ),
+    );
+  }
+
   const preflight = await runEnvironmentChecks({
     projectDir,
+    diskPaths: [tmpdir(), dirname(outputPath)],
     browserPath: options.browserPath,
     includeBrowser: true,
     includeDisk: true,
@@ -1468,6 +1600,26 @@ export async function renderLocal(
     process.env.PRODUCER_HEADLESS_SHELL_PATH = preflight.browser.executablePath;
   }
 
+  if (!options.gpu && options.format === "mp4" && preflight.ffmpegPath) {
+    let encoderMode: ReturnType<typeof detectH264EncoderMode> = "software";
+    try {
+      encoderMode = detectH264EncoderMode(preflight.ffmpegPath, false);
+    } catch (error) {
+      // Capability probing is advisory. Let the real encode surface the
+      // authoritative FFmpeg error instead of failing here with a bare stack.
+      if (!options.quiet) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(c.warn(`  Unable to probe H.264 encoder capabilities: ${detail}`));
+      }
+    }
+    if (encoderMode === "gpu") {
+      console.warn(
+        c.warn("  FFmpeg does not include libx264; falling back to VideoToolbox H.264 encoding."),
+      );
+      options = { ...options, gpu: true };
+    }
+  }
+
   const producer = await loadProducer();
   const deParallelRouterTrialArmed = maybeEnableDeParallelRouterTrial(
     options.quiet,
@@ -1479,33 +1631,39 @@ export async function renderLocal(
     producer.createConsoleLogger?.(options.debug ? "debug" : "info") ?? createNoopProducerLogger(),
   );
 
-  const job = producer.createRenderJob({
-    fps: options.fps,
-    quality: options.quality,
-    format: options.format,
-    gifLoop: options.gifLoop,
-    workers: options.workers,
-    useGpu: options.gpu,
-    logger,
-    producerConfig: producer.resolveConfig({
-      browserGpuMode: options.browserGpuMode ?? "software",
-      ...(options.pageNavigationTimeoutMs != null
-        ? { pageNavigationTimeout: options.pageNavigationTimeoutMs }
-        : {}),
-      ...(options.protocolTimeout != null && { protocolTimeout: options.protocolTimeout }),
-      ...(options.playerReadyTimeout != null && { playerReadyTimeout: options.playerReadyTimeout }),
-      ...(options.vp9CpuUsed != null ? { vp9CpuUsed: options.vp9CpuUsed } : {}),
-    }),
-    hdrMode: options.hdrMode,
-    crf: options.crf,
-    videoBitrate: options.videoBitrate,
-    videoFrameFormat: options.videoFrameFormat,
-    variables: options.variables,
-    entryFile: options.entryFile,
-    outputResolution: options.outputResolution,
-    debug: options.debug,
-    strictness: options.bestEffort === false ? "strict" : "best-effort",
+  const engineConfig = producer.resolveConfig({
+    browserGpuMode: options.browserGpuMode ?? "software",
+    ...(options.pageNavigationTimeoutMs != null
+      ? { pageNavigationTimeout: options.pageNavigationTimeoutMs }
+      : {}),
+    ...(options.protocolTimeout != null && { protocolTimeout: options.protocolTimeout }),
+    ...(options.playerReadyTimeout != null && { playerReadyTimeout: options.playerReadyTimeout }),
+    ...(options.vp9CpuUsed != null ? { vp9CpuUsed: options.vp9CpuUsed } : {}),
   });
+  const request = producer.createRenderRequest({
+    projectDir,
+    outputPath,
+    engineConfig,
+    options: {
+      fps: options.fps,
+      quality: options.quality,
+      format: options.format,
+      gifLoop: options.gifLoop,
+      workers: options.workers,
+      useGpu: options.gpu,
+      hdrMode: options.hdrMode,
+      crf: options.crf,
+      videoBitrate: options.videoBitrate,
+      videoFrameFormat: options.videoFrameFormat,
+      variables: options.variables,
+      entryFile: options.entryFile,
+      outputResolution: options.outputResolution,
+      outputResolutionAspectAgnostic: options.outputResolutionAspectAgnostic,
+      debug: options.debug,
+      strictness: options.bestEffort === false ? "strict" : "best-effort",
+    },
+  });
+  const job = producer.createRenderJob(producer.renderConfigFromRequest(request, { logger }));
 
   const onProgress = options.quiet
     ? undefined
@@ -1528,6 +1686,13 @@ export async function renderLocal(
     );
   }
 
+  // Render resolved without throwing → producer's `artifact validated`
+  // checkpoint fired AND the artifact was committed to disk. From this
+  // point on, ANY thrown teardown error must not be allowed to override
+  // the exit code. Field signal ts=1784169760 / ts=1784171150 / ts=1784172467
+  // (win32/x64, CLI 0.7.58): valid MP4 on disk, exited 1 with no error print.
+  markRenderSucceeded();
+
   maybeConsumeDeParallelRouterTrial(deParallelRouterTrialArmed, job, options.quiet);
   const elapsed = Date.now() - startTime;
   if (job.outcome === "completed_with_warnings") {
@@ -1535,20 +1700,26 @@ export async function renderLocal(
       console.warn(c.warn(`  [${warning.code}] ${warning.message}`));
     }
   }
-  trackRenderMetrics(job, elapsed, options, false);
-  printRenderComplete(
-    outputPath,
-    elapsed,
-    options.quiet,
-    job.perfSummary?.compositionDurationSeconds,
-    job.perfSummary?.totalFrames,
+  runPostRenderStep("trackRenderMetrics", () => trackRenderMetrics(job, elapsed, options, false));
+  runPostRenderStep("printRenderComplete", () =>
+    printRenderComplete(
+      outputPath,
+      elapsed,
+      options.quiet,
+      job.perfSummary?.compositionDurationSeconds,
+      job.perfSummary?.totalFrames,
+    ),
   );
-  warnIfWebmAlphaDropped(outputPath, options.format, options.quiet);
+  runPostRenderStep("warnIfWebmAlphaDropped", () =>
+    warnIfWebmAlphaDropped(outputPath, options.format, options.quiet),
+  );
   if (!options.skipFeedback) {
-    await maybePromptRenderFeedback({
-      renderDurationMs: elapsed,
-      quiet: options.quiet,
-    });
+    await runPostRenderStepAsync("maybePromptRenderFeedback", () =>
+      maybePromptRenderFeedback({
+        renderDurationMs: elapsed,
+        quiet: options.quiet,
+      }),
+    );
   }
   if (options.exitAfterComplete) scheduleRenderProcessExit();
   const durationMs = job.perfSummary
@@ -1973,6 +2144,14 @@ function handleRenderError(
     errorBox("Render failed — Chrome could not launch", message, remediation);
     process.exit(1);
   }
+  // macOS <13 dyld Symbol-not-found on the pinned chrome-headless-shell
+  // build. Different remediation shape (older shell + env-var override)
+  // than the Linux shared-lib install, so it lives in its own detector.
+  const macosRemediation = macosOldChromeCrashRemediation(message);
+  if (macosRemediation) {
+    errorBox("Render failed — Chrome could not launch", message, macosRemediation);
+    process.exit(1);
+  }
   errorBox("Render failed", message, hint);
   process.exit(1);
 }
@@ -2032,6 +2211,9 @@ function trackRenderMetrics(
     deVerifyInitMs: perf?.drawElement?.verifyInitMs,
     deSelfVerifyFallback: perf?.drawElement?.selfVerifyFallback,
     deFallbackReason: perf?.drawElement?.fallbackReason,
+    deFallbackFailedDb: perf?.drawElement?.fallbackFailedDb,
+    deFallbackFrameIndex: perf?.drawElement?.fallbackFrameIndex,
+    deFallbackThresholdDb: perf?.drawElement?.fallbackThresholdDb,
     deBlankSuspects: perf?.drawElement?.blankSuspects,
     deBlankDeterministicAccepts: perf?.drawElement?.blankDeterministicAccepts,
     deBlankRecaptures: perf?.drawElement?.blankRecaptures,

@@ -252,6 +252,32 @@ describe("render telemetry events", () => {
     );
   });
 
+  it("carries the failing dB, frame index, and threshold on render_error for a psnr fallback that failed hard afterward", () => {
+    trackRenderError({
+      fps: 30,
+      quality: "standard",
+      docker: false,
+      errorMessage: "worker crashed after a psnr fallback",
+      captureDeParallelRouter: "reverted",
+      captureDeSelfVerifyFallback: true,
+      captureDeFallbackReason: "psnr",
+      captureDeFallbackFailedDb: 28.4,
+      captureDeFallbackFrameIndex: 649,
+      captureDeFallbackThresholdDb: 32,
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "render_error",
+      expect.objectContaining({
+        de_fallback_reason: "psnr",
+        de_fallback_failed_db: 28.4,
+        de_fallback_frame_index: 649,
+        de_fallback_threshold_db: 32,
+      }),
+      undefined,
+    );
+  });
+
   it("prefers the explicit perfSummary-sourced de_worker_inversion over the capture-observability fallback on render_complete", () => {
     trackRenderComplete({
       durationMs: 1000,
@@ -268,6 +294,32 @@ describe("render telemetry events", () => {
     expect(trackEvent).toHaveBeenCalledWith(
       "render_complete",
       expect.objectContaining({ de_worker_inversion: "inverted" }),
+      undefined,
+    );
+  });
+
+  it("carries the perfSummary-sourced failing dB, frame index, and threshold on render_complete", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "standard",
+      docker: false,
+      gpu: false,
+      deParallelRouter: "reverted",
+      deFallbackReason: "psnr",
+      deFallbackFailedDb: 28.4,
+      deFallbackFrameIndex: 649,
+      deFallbackThresholdDb: 32,
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "render_complete",
+      expect.objectContaining({
+        de_fallback_reason: "psnr",
+        de_fallback_failed_db: 28.4,
+        de_fallback_frame_index: 649,
+        de_fallback_threshold_db: 32,
+      }),
       undefined,
     );
   });
@@ -400,6 +452,7 @@ describe("trackRenderFeedback", () => {
     const [, props] = trackEvent.mock.calls[0] as [string, Record<string, unknown>];
     expect(props).not.toHaveProperty("render_duration_ms");
     expect(props.$survey_response).toBe(4);
+    expect(props.rating_scale).toBe(10);
   });
 
   it("includes render_duration_ms when a real duration is supplied", () => {

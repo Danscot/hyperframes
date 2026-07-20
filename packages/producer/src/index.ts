@@ -24,6 +24,19 @@ export {
   type ProgressCallback,
 } from "./services/renderOrchestrator.js";
 export {
+  RENDER_REQUEST_VERSION,
+  createRenderRequest,
+  distributedConfigFromRequest,
+  parseRenderRequest,
+  renderConfigFromRequest,
+  renderRequestFromDistributedConfig,
+  serializeRenderRequest,
+  type CreateRenderRequestInput,
+  type DistributedRenderOptions,
+  type RenderRequest,
+  type RenderRequestOptions,
+} from "./renderRequest.js";
+export {
   type BrowserDiagnosticSummary,
   type RenderCaptureObservability,
   type RenderObservabilitySummary,
@@ -50,6 +63,10 @@ export {
   captureFrameToBuffer,
   getCompositionDuration,
   getCapturePerfSummary,
+  // Transient-vs-genuine init failure classifier — re-exported so standalone
+  // skill helpers (animation-map, contrast-report) can reuse the render
+  // pipeline's canonical retry gating instead of re-deriving it.
+  isTransientBrowserError,
   prepareCaptureSessionForReuse,
   type CaptureOptions,
   type CaptureSession,

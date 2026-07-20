@@ -21,8 +21,21 @@ export const examples: Example[] = [
   ],
   ["List all active preview servers", "hyperframes preview --list"],
   ["Kill all active preview servers", "hyperframes preview --kill-all"],
+  [
+    "Disable auto-proxying of browser-hostile video codecs (HEVC, ProRes, AV1)",
+    "hyperframes preview --no-proxy",
+  ],
 ];
-import { existsSync, lstatSync, symlinkSync, unlinkSync, readlinkSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs";
+import { parseStoryboard, STORYBOARD_FILENAME } from "@hyperframes/core/storyboard";
 import { resolve, dirname, basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -47,6 +60,8 @@ import {
 } from "../server/portUtils.js";
 import { killOrphanedProcesses, killProcessTree } from "../utils/orphanCleanup.js";
 import { resolveProject } from "../utils/project.js";
+import { resolveAutoProxy } from "../utils/projectConfig.js";
+import { studioProxyEnv } from "../utils/studioProxyEnv.js";
 import {
   readBackgroundPreviewStatus,
   startBackgroundPreview,
@@ -63,10 +78,12 @@ interface BrowserLaunchOptions {
 
 interface StudioLaunchOptions extends BrowserLaunchOptions {
   projectName?: string;
+  autoProxy?: boolean;
 }
 
 interface EmbeddedStudioOptions extends StudioLaunchOptions {
   forceNew?: boolean;
+  autoProxy?: boolean;
 }
 
 type StudioChildProcess = ChildProcessByStdio<null, Readable, Readable>;
@@ -171,6 +188,12 @@ export default defineCommand({
       default: false,
       description:
         "Launch the opened browser with --disable-gpu (requires --browser-path). For hosts where hardware acceleration crashes the graphics driver (e.g. NVIDIA Xid resets); with the system default browser use --no-open instead.",
+    },
+    proxy: {
+      type: "boolean",
+      description:
+        "Auto-transcode browser-hostile video codecs (HEVC, ProRes, AV1) to a cached authoring proxy for preview (default: on; overrides hyperframes.json's media.autoProxy)",
+      negativeDescription: "Disable auto-proxying of browser-hostile video codecs",
     },
   },
   async run({ args }) {
@@ -312,6 +335,9 @@ export default defineCommand({
       process.exitCode = 1;
       return;
     }
+    // Resolve once so embedded, monorepo-dev, and locally installed Studio
+    // modes all receive identical --proxy/--no-proxy + config semantics.
+    const autoProxy = resolveAutoProxy(dir, args.proxy as boolean | undefined);
 
     if (isDevMode()) {
       if (args.background) {
@@ -326,6 +352,7 @@ export default defineCommand({
         userDataDir,
         remoteDebuggingPort,
         browserNoGpu,
+        autoProxy,
       });
     }
 
@@ -343,6 +370,7 @@ export default defineCommand({
         userDataDir,
         remoteDebuggingPort,
         browserNoGpu,
+        autoProxy,
       });
     }
 
@@ -368,7 +396,7 @@ export default defineCommand({
         ],
         footer: `Stop with: hyperframes preview ${JSON.stringify(dir)} --stop`,
       });
-      openStudioBrowser(url, projectName, {
+      openStudioBrowser(url, projectName, dir, {
         noOpen,
         browserPath,
         userDataDir,
@@ -382,6 +410,7 @@ export default defineCommand({
     return runEmbeddedMode(dir, startPort, {
       projectName,
       forceNew,
+      autoProxy,
       noOpen,
       browserPath,
       userDataDir,
@@ -742,9 +771,47 @@ function compactSelectionPayload(selection: StudioSelectionSnapshot): CompactSel
   };
 }
 
-function openStudioBrowser(url: string, projectName: string, options?: BrowserLaunchOptions): void {
+// Land the browser on the Storyboard view while the project is still planning
+// or sketching — the timeline only becomes the right landing once frames are
+// animated (or the storyboard never tracked statuses at all, e.g. beat plans).
+export function studioLandingSearch(projectDir: string): string {
+  const storyboardPath = join(projectDir, STORYBOARD_FILENAME);
+  if (!existsSync(storyboardPath)) return "";
+  let frames;
+  try {
+    frames = parseStoryboard(readFileSync(storyboardPath, "utf8")).frames;
+  } catch {
+    return "";
+  }
+  // Sketch review in progress — the board is the review surface.
+  if (frames.some((f) => f.status === "built")) return "?view=storyboard";
+  // Pure planning stage: frames declare src paths but none are built yet.
+  const srcs = frames
+    .map((f) => f.src)
+    .filter((s): s is string => typeof s === "string" && s.length > 0);
+  const planning =
+    frames.length > 0 &&
+    frames.every((f) => f.status === "outline") &&
+    srcs.length > 0 &&
+    !srcs.some((s) => existsSync(join(projectDir, s)));
+  return planning ? "?view=storyboard" : "";
+}
+
+// The full Studio URL to open or hand to the user: status-aware landing view
+// plus the project hash route. `url` never carries a trailing slash (both the
+// embedded server and the Vite `Local:` match strip it).
+function studioDeepLink(url: string, projectName: string, projectDir: string): string {
+  return `${url}/${studioLandingSearch(projectDir)}#project/${projectName}`;
+}
+
+function openStudioBrowser(
+  url: string,
+  projectName: string,
+  projectDir: string,
+  options?: BrowserLaunchOptions,
+): void {
   if (options?.noOpen) return;
-  openBrowser(`${url}#project/${projectName}`, {
+  openBrowser(studioDeepLink(url, projectName, projectDir), {
     browserPath: options?.browserPath,
     userDataDir: options?.userDataDir,
     remoteDebuggingPort: options?.remoteDebuggingPort,
@@ -829,6 +896,7 @@ function attachStudioReadyHandler(
   child: StudioChildProcess,
   spinner: ReturnType<typeof clack.spinner>,
   projectName: string,
+  projectDir: string,
   options?: BrowserLaunchOptions,
 ): void {
   let detected = false;
@@ -840,7 +908,7 @@ function attachStudioReadyHandler(
     detected = true;
     spinner.stop(c.success("Studio running"));
     printStudioSummary(projectName, url, { footer: "Press Ctrl+C to stop" });
-    openStudioBrowser(url, projectName, options);
+    openStudioBrowser(url, projectName, projectDir, options);
     child.stdout.removeListener("data", handleOutput);
     child.stderr.removeListener("data", handleOutput);
   }
@@ -876,9 +944,10 @@ async function runDevMode(dir: string, options?: StudioLaunchOptions): Promise<v
   const child = spawn("bun", ["run", "dev"], {
     cwd: studioPkgDir,
     stdio: ["ignore", "pipe", "pipe"],
+    env: studioProxyEnv(options?.autoProxy ?? true),
   });
 
-  attachStudioReadyHandler(child, s, pName, options);
+  attachStudioReadyHandler(child, s, pName, dir, options);
   removeSymlinkOnExit(createdSymlink, symlinkPath);
 
   // Kill the child's entire process tree on SIGTERM/SIGINT. Ctrl+C sends
@@ -925,9 +994,10 @@ async function runLocalStudioMode(dir: string, options?: StudioLaunchOptions): P
   const child = spawn(viteCommand.command, viteCommand.args, {
     cwd: studioPkgPath,
     stdio: ["ignore", "pipe", "pipe"],
+    env: studioProxyEnv(options?.autoProxy ?? true),
   });
 
-  attachStudioReadyHandler(child, s, pName, options);
+  attachStudioReadyHandler(child, s, pName, dir, options);
   removeSymlinkOnExit(createdSymlink, symlinkPath);
 
   // Same tree-kill handler as dev mode. No-op on Windows (see comment above).
@@ -971,7 +1041,11 @@ async function runEmbeddedMode(
     return;
   }
 
-  const { app } = createStudioServer({ projectDir: dir, projectName: pName });
+  const { app } = createStudioServer({
+    projectDir: dir,
+    projectName: pName,
+    autoProxy: options?.autoProxy,
+  });
   const serverBuildSignature = await loadPreviewServerBuildSignature();
 
   let result: FindPortResult;
@@ -998,7 +1072,7 @@ async function runEmbeddedMode(
     printStudioSummary(pName, url, {
       details: ["Reusing existing server. Use --force-new to start a fresh instance."],
     });
-    openStudioBrowser(url, pName, options);
+    openStudioBrowser(url, pName, dir, options);
     return;
   }
 
@@ -1016,7 +1090,7 @@ async function runEmbeddedMode(
     ],
     footer: "Press Ctrl+C to stop",
   });
-  openStudioBrowser(url, pName, options);
+  openStudioBrowser(url, pName, dir, options);
 
   // Block until Ctrl+C. Node would normally exit on SIGINT, but the listening
   // HTTP server keeps handles open, so the event loop stays alive after the

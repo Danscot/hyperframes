@@ -10,6 +10,31 @@
 import type { TimelineElement } from "../store/playerStore";
 import type { ClipManifestClip } from "./playbackTypes";
 import { isFinitePositive } from "./playbackAdapter";
+import { getSourceScopedSelectorIndex } from "../../utils/sourceScopedSelectorIndex";
+
+// ---------------------------------------------------------------------------
+// Layer-reveal lift transparency
+// ---------------------------------------------------------------------------
+
+/**
+ * Attributes carrying the pre-lift state of a Layers-panel selection reveal
+ * (useLayerRevealOverride): while a layer is selected it PAINTS on top via a
+ * temporary inline z-index, but the lift is a purely visual, ephemeral studio
+ * affordance — every z reader must keep reporting the element's TRUE z
+ * (stored here) so menus, badges, the lane mirror, and the panel sort never
+ * reason on the lifted value. A z-reorder commit removes the attributes (the
+ * commit is the new truth).
+ */
+export const LAYER_REVEAL_PRIOR_Z_ATTR = "data-hf-reveal-prior-z";
+export const LAYER_REVEAL_PRIOR_POSITION_ATTR = "data-hf-reveal-prior-pos";
+
+/** The lifted element's true (pre-lift) z, or null when no lift is active. */
+export function readLayerRevealPriorZ(el: Element): number | null {
+  const raw = el.getAttribute(LAYER_REVEAL_PRIOR_Z_ATTR);
+  if (raw == null) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
 
 // ---------------------------------------------------------------------------
 // Duration attribute helpers
@@ -22,8 +47,11 @@ import { isFinitePositive } from "./playbackAdapter";
  * back to computed style; "auto" / empty / unparseable ⇒ 0. Works with a
  * detached parse Document (no defaultView) as well as a live iframe. Mirrors
  * canvasContextMenuZOrder.parseZIndex semantics so the two directions agree.
+ * Reveal-lift transparent: an active lift reports the stored TRUE z.
  */
 export function readTimelineElementZIndex(el: Element): number {
+  const prior = readLayerRevealPriorZ(el);
+  if (prior != null) return prior;
   const html = el as HTMLElement;
   const parseZ = (value: string | null | undefined): number | null => {
     if (value == null || value === "" || value === "auto") return null;
@@ -46,6 +74,10 @@ function readDurationAttribute(el: Element | null | undefined): number {
     Number.parseFloat(el.getAttribute("data-duration") ?? "") ||
     Number.parseFloat(el.getAttribute("data-hf-authored-duration") ?? "");
   return isFinitePositive(duration) ? duration : 0;
+}
+
+function normalizePlaybackRate(raw: number): number {
+  return Number.isFinite(raw) && raw > 0 ? Math.max(0.1, Math.min(5, raw)) : 1;
 }
 
 export function isTimelineIgnoredElement(el: Element): boolean {
@@ -121,19 +153,25 @@ export function resolveMediaElement(el: Element): HTMLMediaElement | HTMLImageEl
     : null;
 }
 
-export function applyMediaMetadataFromElement(entry: TimelineElement, el: Element): void {
-  const mediaStartAttr = el.getAttribute("data-playback-start")
-    ? "playback-start"
-    : el.getAttribute("data-media-start")
-      ? "media-start"
-      : undefined;
-  const mediaStartValue =
-    el.getAttribute("data-playback-start") ?? el.getAttribute("data-media-start");
+function applyPlaybackMetadataFromElement(entry: TimelineElement, el: Element): void {
+  const playbackStartValue = el.getAttribute("data-playback-start");
+  const legacyMediaStartValue = el.getAttribute("data-media-start");
+  const mediaStartValue = playbackStartValue ?? legacyMediaStartValue;
   if (mediaStartValue != null) {
     const playbackStart = parseFloat(mediaStartValue);
     if (Number.isFinite(playbackStart)) entry.playbackStart = playbackStart;
   }
-  if (mediaStartAttr) entry.playbackStartAttr = mediaStartAttr;
+  if (playbackStartValue != null) entry.playbackStartAttr = "playback-start";
+  else if (legacyMediaStartValue != null) entry.playbackStartAttr = "media-start";
+
+  const authoredPlaybackRate = Number.parseFloat(el.getAttribute("data-playback-rate") ?? "");
+  if (Number.isFinite(authoredPlaybackRate) && authoredPlaybackRate > 0) {
+    entry.playbackRate = normalizePlaybackRate(authoredPlaybackRate);
+  }
+}
+
+export function applyMediaMetadataFromElement(entry: TimelineElement, el: Element): void {
+  applyPlaybackMetadataFromElement(entry, el);
 
   const mediaEl = resolveMediaElement(el);
   if (!mediaEl) return;
@@ -154,8 +192,8 @@ export function applyMediaMetadataFromElement(entry: TimelineElement, el: Elemen
   }
 
   const playbackRate = mediaEl.defaultPlaybackRate;
-  if (Number.isFinite(playbackRate) && playbackRate > 0) {
-    entry.playbackRate = playbackRate;
+  if (entry.playbackRate == null && Number.isFinite(playbackRate) && playbackRate > 0) {
+    entry.playbackRate = normalizePlaybackRate(playbackRate);
   }
 }
 
@@ -237,17 +275,13 @@ export function getTimelineElementSelectorIndex(
   el: Element,
   selector: string | undefined,
 ): number | undefined {
-  if (!selector || selector.startsWith("#") || selector.startsWith("[data-composition-id=")) {
-    return undefined;
-  }
-
-  try {
-    const matches = Array.from(doc.querySelectorAll(selector));
-    const matchIndex = matches.indexOf(el);
-    return matchIndex >= 0 ? matchIndex : undefined;
-  } catch {
-    return undefined;
-  }
+  return getSourceScopedSelectorIndex(
+    doc,
+    el,
+    selector,
+    getTimelineElementSourceFile(el),
+    getTimelineElementSourceFile,
+  );
 }
 
 export function buildTimelineElementKey(params: {

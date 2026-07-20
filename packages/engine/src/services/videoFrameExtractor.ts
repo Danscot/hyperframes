@@ -6,12 +6,10 @@
  * Videos are replaced with <img> elements during capture.
  */
 
-import { spawn } from "child_process";
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { isAbsolute, join, posix, resolve, sep } from "path";
 import { parseHTML } from "linkedom";
 import { decodeUrlPathVariants, MEDIA_DURATION_CLAMP_EPSILON_SECONDS } from "@hyperframes/core";
-import { trackChildProcess } from "../utils/processTracker.js";
 import { resolveReferencedStart, type RefResolverEl } from "./referenceResolver.js";
 import { extractMediaMetadata, type VideoMetadata } from "../utils/ffprobe.js";
 import {
@@ -20,7 +18,7 @@ import {
   type HdrTransfer,
 } from "../utils/hdr.js";
 import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
-import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
+import { runFfmpeg } from "../utils/runFfmpeg.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { unwrapTemplate } from "../utils/htmlTemplate.js";
 import {
@@ -328,78 +326,51 @@ export async function extractVideoFramesRange(
   if (format === "png") args.push("-compression_level", "1");
   args.push("-y", outputPattern);
 
-  return new Promise((resolve, reject) => {
-    const ffmpeg = spawn(getFfmpegBinary(), args);
-    trackChildProcess(ffmpeg);
-    let stderr = "";
-    const onAbort = () => {
-      ffmpeg.kill("SIGTERM");
-    };
-    if (signal) {
-      if (signal.aborted) {
-        ffmpeg.kill("SIGTERM");
-      } else {
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
+  const processResult = await runFfmpeg(args, { signal, timeout: ffmpegProcessTimeout });
+  if (processResult.terminationReason === "abort") {
+    throw new Error("Video frame extraction cancelled");
+  }
+  if (processResult.terminationReason === "spawn_error") {
+    if ((processResult.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      throw new Error("[FFmpeg] ffmpeg not found");
     }
+    throw processResult.error ?? new Error(processResult.stderr);
+  }
+  if (!processResult.success) {
+    // With the SDR-to-HDR remap folded into this pass, a filter failure
+    // (e.g. an ffmpeg built without the colorspace filter) would otherwise
+    // surface as a generic extract error and the operator has to grep the
+    // filter chain to learn it was the HDR conversion. Attribute it.
+    const hdrPrefix = options.sdrToHdrTransfer
+      ? `SDR→HDR conversion failed (colorspace filter in extract pass, target ${options.sdrToHdrTransfer}): `
+      : "";
+    const timeoutSuffix =
+      processResult.terminationReason === "deadline"
+        ? ` (timed out after ${ffmpegProcessTimeout} ms)`
+        : "";
+    throw new Error(
+      `${hdrPrefix}FFmpeg exited with code ${processResult.exitCode}${timeoutSuffix}: ${processResult.stderr.slice(-500)}`,
+    );
+  }
 
-    const timer = setTimeout(() => {
-      ffmpeg.kill("SIGTERM");
-    }, ffmpegProcessTimeout);
-
-    ffmpeg.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    ffmpeg.on("close", (code) => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      if (signal?.aborted) {
-        reject(new Error("Video frame extraction cancelled"));
-        return;
-      }
-      if (code !== 0) {
-        // With the SDR-to-HDR remap folded into this pass, a filter failure
-        // (e.g. an ffmpeg built without the colorspace filter) would otherwise
-        // surface as a generic extract error and the operator has to grep the
-        // filter chain to learn it was the HDR conversion. Attribute it.
-        const hdrPrefix = options.sdrToHdrTransfer
-          ? `SDR→HDR conversion failed (colorspace filter in extract pass, target ${options.sdrToHdrTransfer}): `
-          : "";
-        reject(new Error(`${hdrPrefix}FFmpeg exited with code ${code}: ${stderr.slice(-500)}`));
-        return;
-      }
-
-      const framePaths = new Map<number, string>();
-      const files = readdirSync(videoOutputDir)
-        .filter((f) => f.startsWith(FRAME_FILENAME_PREFIX) && f.endsWith(`.${format}`))
-        .sort();
-      files.forEach((file, index) => {
-        framePaths.set(index, join(videoOutputDir, file));
-      });
-
-      resolve({
-        videoId,
-        srcPath: videoPath,
-        outputDir: videoOutputDir,
-        framePattern,
-        fps,
-        totalFrames: framePaths.size,
-        metadata,
-        framePaths,
-      });
-    });
-
-    ffmpeg.on("error", (err) => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        reject(new Error("[FFmpeg] ffmpeg not found"));
-      } else {
-        reject(err);
-      }
-    });
+  const framePaths = new Map<number, string>();
+  const files = readdirSync(videoOutputDir)
+    .filter((f) => f.startsWith(FRAME_FILENAME_PREFIX) && f.endsWith(`.${format}`))
+    .sort();
+  files.forEach((file, index) => {
+    framePaths.set(index, join(videoOutputDir, file));
   });
+
+  return {
+    videoId,
+    srcPath: videoPath,
+    outputDir: videoOutputDir,
+    framePattern,
+    fps,
+    totalFrames: framePaths.size,
+    metadata,
+    framePaths,
+  };
 }
 
 /**
@@ -1235,13 +1206,14 @@ export async function extractAllVideoFrames(
   };
 }
 
-export function getFrameAtTime(
+function getFrameIndexAtTime(
   extracted: ExtractedFrames,
   globalTime: number,
   videoStart: number,
   loop = false,
   mediaStart = 0,
-): string | null {
+  holdLastFrame = false,
+): number | null {
   let localTime = globalTime - videoStart;
   if (localTime < 0) return null;
   const loopDuration = Math.max(0, extracted.metadata.durationSeconds - mediaStart);
@@ -1251,21 +1223,29 @@ export function getFrameAtTime(
   // Add epsilon before flooring to avoid IEEE 754 boundary errors where
   // e.g. 0.28 * 25 === 6.999999999999999 instead of 7.
   const frameIndex = Math.floor(localTime * extracted.fps + 1e-9);
-  if (loop && frameIndex >= extracted.totalFrames && extracted.totalFrames > 0) {
-    return extracted.framePaths.get(extracted.totalFrames - 1) || null;
+  if (frameIndex < 0 || extracted.totalFrames <= 0) return null;
+  if (frameIndex >= extracted.totalFrames) {
+    return loop || holdLastFrame ? extracted.totalFrames - 1 : null;
   }
-  if (frameIndex < 0 || frameIndex >= extracted.totalFrames) return null;
-  return extracted.framePaths.get(frameIndex) || null;
+  return frameIndex;
 }
 
-const HOLD_LAST_FRAME_TOLERANCE_FRAMES = 2;
+export function getFrameAtTime(
+  extracted: ExtractedFrames,
+  globalTime: number,
+  videoStart: number,
+  loop = false,
+  mediaStart = 0,
+): string | null {
+  const frameIndex = getFrameIndexAtTime(extracted, globalTime, videoStart, loop, mediaStart);
+  return frameIndex == null ? null : extracted.framePaths.get(frameIndex) || null;
+}
 
 /**
- * Whether a clip's source is shorter than its `data-duration` slot by more than
- * the compiler tolerates before clamping the slot to the media
- * (MEDIA_DURATION_CLAMP_EPSILON_SECONDS) — the case worth warning about. Shared
- * by the render and `validate` warnings. `null` when the media covers the slot,
- * the clip loops, or inputs are unusable.
+ * Whether a media source is shorter than its `data-duration` slot by more than
+ * the compiler tolerance. The calculation stays tag-agnostic; current in-repo
+ * warnings call it for audio only because video slots may intentionally outlive
+ * their source and hold the final frame.
  */
 export function analyzeClipMediaFit(params: {
   /** Timeline slot length in seconds — `end - start` (a.k.a. data-duration). */
@@ -1325,7 +1305,15 @@ export class FrameLookupTable {
     const video = this.videos.get(videoId);
     if (!video) return null;
     if (globalTime < video.start || globalTime > video.end) return null;
-    return getFrameAtTime(video.extracted, globalTime, video.start, video.loop, video.mediaStart);
+    const frameIndex = getFrameIndexAtTime(
+      video.extracted,
+      globalTime,
+      video.start,
+      video.loop,
+      video.mediaStart,
+      true,
+    );
+    return frameIndex == null ? null : video.extracted.framePaths.get(frameIndex) || null;
   }
 
   private resetActiveState(): void {
@@ -1386,37 +1374,15 @@ export class FrameLookupTable {
     for (const videoId of this.activeVideoIds) {
       const video = this.videos.get(videoId);
       if (!video) continue;
-      let localTime = globalTime - video.start;
-      const loopDuration = Math.max(0, video.extracted.metadata.durationSeconds - video.mediaStart);
-      if (video.loop && loopDuration > 0 && localTime >= loopDuration) {
-        localTime %= loopDuration;
-      }
-      const frameIndex = Math.floor(localTime * video.extracted.fps + 1e-9);
-      if (video.loop && frameIndex >= video.extracted.totalFrames) {
-        const framePath = video.extracted.framePaths.get(video.extracted.totalFrames - 1);
-        if (framePath) {
-          frames.set(videoId, { framePath, frameIndex: video.extracted.totalFrames - 1 });
-        }
-        continue;
-      }
-      if (frameIndex < 0 || frameIndex >= video.extracted.totalFrames) {
-        // Source exhausted. Hold the last frame near the clip end so a media that
-        // falls a hair short of its slot (e.g. `ffmpeg -t 1.45` → 1.433s at 30fps)
-        // doesn't flash the background for one frame. A clip that's substantially
-        // shorter than its slot still blanks for the tail. Tolerance floored at
-        // the clamp epsilon so the seam is covered at any fps (see that const).
-        const fps = video.extracted.fps;
-        const holdTolerance = Math.max(
-          fps > 0 ? HOLD_LAST_FRAME_TOLERANCE_FRAMES / fps : 0,
-          MEDIA_DURATION_CLAMP_EPSILON_SECONDS,
-        );
-        if (globalTime >= video.end - holdTolerance && video.extracted.totalFrames > 0) {
-          const lastIndex = video.extracted.totalFrames - 1;
-          const lastPath = video.extracted.framePaths.get(lastIndex);
-          if (lastPath) frames.set(videoId, { framePath: lastPath, frameIndex: lastIndex });
-        }
-        continue;
-      }
+      const frameIndex = getFrameIndexAtTime(
+        video.extracted,
+        globalTime,
+        video.start,
+        video.loop,
+        video.mediaStart,
+        true,
+      );
+      if (frameIndex == null) continue;
       const framePath = video.extracted.framePaths.get(frameIndex);
       if (!framePath) continue;
       frames.set(videoId, { framePath, frameIndex });

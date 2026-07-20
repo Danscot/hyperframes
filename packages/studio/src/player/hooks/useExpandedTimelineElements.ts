@@ -133,6 +133,7 @@ function buildChildElements(
   siblings: ClipManifestClip[],
   display: DisplayBounds,
   editBasis: { start: number; sourceFile: string | undefined },
+  expandedHostKey: string,
 ): TimelineElement[] {
   const result: TimelineElement[] = [];
   for (const child of siblings) {
@@ -168,10 +169,21 @@ function buildChildElements(
       // file's coordinate space) and the runtime-computed `stackingContextId`
       // must survive verbatim — lane persists and z-sync read them, they are
       // never reconstructed from display lanes.
-      track: display.track + result.length,
+      //
+      // COLLISION-FREE synthetic rows: the old `display.track + index` scheme
+      // could equal a REAL clip's integer lane (host on track 0 with two
+      // children puts child #2 on track 1 — where an unrelated top-level clip
+      // may live). Lane grouping merges purely by track number, so that
+      // collision fused clips from DIFFERENT source files into one display
+      // lane, and lane-scoped actions (gap close) then batch-persisted foreign
+      // clips. Fractions strictly between the host's lane and the next integer
+      // can never equal a normalized (integer) lane, while still rendering the
+      // children as their own ordered rows directly under the host.
+      track: display.track + (result.length + 1) / (siblings.length + 2),
       authoredTrack: base.authoredTrack,
       stackingContextId: base.stackingContextId,
       expandedParentStart: editBasis.start,
+      expandedHostKey,
       domId,
       selector,
       sourceFile: editBasis.sourceFile,
@@ -205,6 +217,7 @@ function domSiblingClips(
         parentCompositionId: host.id ?? null,
         compositionSrc: host.compositionSrc ?? null,
         assetUrl: null,
+        stackingContextId: c.stackingContextId,
       }),
     );
 }
@@ -249,6 +262,7 @@ export function buildExpandedElements(
       track: topLevelElement.track,
     },
     editBasis,
+    parentKey,
   );
   if (expanded.length === 0) return filterToTopLevel(elements, parentMap);
 

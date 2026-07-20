@@ -22,6 +22,10 @@ export interface TimelineDropCallbacks {
     blockName: string,
     placement: { start: number; track: number },
   ) => Promise<void> | void;
+  onCompositionDrop?: (
+    sourcePath: string,
+    placement: { start: number; track: number },
+  ) => Promise<void> | void;
 }
 
 export interface TimelineEditCallbacks {
@@ -31,11 +35,14 @@ export interface TimelineEditCallbacks {
   ) => Promise<void> | void;
   /** Atomic multi-clip move (single undo) for main-track ripple + track-insert.
    *  `coalesceKey` (drag-commit gesture id) merges the move history entry with a
-   *  lane change's follow-up z-reorder entry into one undo step. */
+   *  lane change's follow-up z-reorder entry into one undo step; `coalesceMs`
+   *  widens that entry's fold window when a server round-trip separates the
+   *  gesture's records (per-gesture-unique keys keep the fold gesture-scoped). */
   onMoveElements?: (
     edits: Array<{ element: TimelineElement; updates: Pick<TimelineElement, "start" | "track"> }>,
     coalesceKey?: string,
     operation?: TimelineMoveOperation,
+    coalesceMs?: number,
   ) => Promise<void> | void;
   onResizeElement?: (
     element: TimelineElement,

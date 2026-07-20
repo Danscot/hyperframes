@@ -11,20 +11,17 @@ import { submitFeedback } from "../utils/submitFeedback.js";
 import { buildIssueUrl, HYPERFRAMES_REPO_URL } from "../utils/feedbackIssue.js";
 import { VERSION } from "../version.js";
 import { c } from "../ui/colors.js";
+import { parseFeedbackRating } from "../utils/feedbackRating.js";
+import { lintFeedbackComment, type FeedbackLintInput } from "../utils/feedbackLint.js";
 
 export const examples: Example[] = [
-  ["Submit render feedback", 'hyperframes feedback --rating 4 --comment "fast but font missing"'],
-  ["Quick rating only", "hyperframes feedback --rating 5"],
+  ["Submit render feedback", 'hyperframes feedback --rating 8 --comment "fast but font missing"'],
+  ["Quick rating only", "hyperframes feedback --rating 10"],
   [
     "Also file a GitHub issue with a published repro",
-    'hyperframes feedback --rating 2 --comment "GSAP timeline froze" --file-issue',
+    'hyperframes feedback --rating 3 --comment "GSAP timeline froze" --file-issue',
   ],
 ];
-
-function parseRating(raw: string): number | null {
-  const n = parseInt(raw, 10);
-  return n >= 1 && n <= 5 && Number.isFinite(n) ? n : null;
-}
 
 function normalizeComment(raw?: string): string | undefined {
   return raw || undefined;
@@ -82,6 +79,18 @@ async function publishRepro(dir: string): Promise<string | undefined> {
   }
 }
 
+/**
+ * Print soft-warn feedback-lint messages to stdout. Extracted so the
+ * command's `run` stays a flat control-flow driver — the warning loop is
+ * incidental to the command logic and its complexity would otherwise push
+ * `run` over the Fallow CRAP threshold.
+ */
+function printFeedbackLintWarnings(input: FeedbackLintInput): void {
+  for (const warning of lintFeedbackComment(input)) {
+    console.log(c.warn(`⚠ ${warning.message}`));
+  }
+}
+
 async function openAndPrintIssue(url: string): Promise<void> {
   if (process.stdout.isTTY) {
     try {
@@ -122,7 +131,7 @@ export default defineCommand({
   args: {
     rating: {
       type: "string",
-      description: "Satisfaction rating (1=poor, 5=great)",
+      description: "Likelihood to recommend (0=not likely, 10=extremely likely)",
       required: true,
     },
     comment: {
@@ -146,9 +155,9 @@ export default defineCommand({
     },
   },
   async run({ args }) {
-    const rating = parseRating(args.rating);
+    const rating = parseFeedbackRating(args.rating);
     if (rating === null) {
-      console.error(c.error("Rating must be between 1 and 5"));
+      console.error(c.error("Rating must be an integer between 0 and 10"));
       process.exit(1);
     }
 
@@ -159,6 +168,11 @@ export default defineCommand({
 
     const comment = normalizeComment(args.comment);
     const doctorSummary = await getDoctorSummary();
+
+    // Soft-warn (never blocks) when the comment for a non-clean report is
+    // missing the mandated reproduction-packet markers. Prints before the
+    // submission ack so the reporter sees the nudge while their run is fresh.
+    printFeedbackLintWarnings({ rating, comment });
 
     // The standalone command runs separately from `render`, so it has no real
     // elapsed time to report. Omit it rather than recording a fake duration.

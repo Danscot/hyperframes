@@ -21,12 +21,14 @@ import {
   buildChromeArgs,
   resolveBrowserGpuMode,
   resolveHeadlessShellPath,
+  type BrowserLease,
   type CaptureMode,
 } from "./browserManager.js";
 import {
   beginFrameCapture,
   ensureRenderFrameSiblings,
   getCdpSession,
+  pageContentExceedsCaptureHeight,
   pageScreenshotCapture,
   initTransparentBackground,
   shouldDefaultCaptureBeyondViewport,
@@ -53,6 +55,7 @@ import type {
   CaptureWarning,
   SubTimelineWaitOutcome,
 } from "../types.js";
+export { isMemoryExhaustionError, isTransientBrowserError } from "./captureFailure.js";
 
 export type { CaptureOptions, CaptureResult, CaptureBufferResult, CapturePerfSummary };
 
@@ -61,6 +64,8 @@ export type BeforeCaptureHook = (page: Page, time: number) => Promise<void>;
 
 export interface CaptureSession {
   browser: Browser;
+  /** Exact ownership token for this browser acquisition. */
+  browserLease?: BrowserLease;
   page: Page;
   options: CaptureOptions;
   serverUrl: string;
@@ -179,6 +184,17 @@ export interface CaptureSession {
   deVerifyFrames?: Map<number, Buffer>;
   /** Low-cardinality init-gate reason when drawElement routed to baseline (telemetry). */
   deGateReason?: string;
+  /**
+   * Full trigger string when drawElement gated off to the screenshot fallback
+   * path — preserves the specific CSS effect (`filter:blur`,
+   * `filter:drop-shadow`, `backdrop-filter`, `clip-path`) that
+   * {@link deGateReason} sanitizes down to a low-cardinality bucket. Populated
+   * on the same fallback-gate branches as `deGateReason`; consumed by the
+   * `capture_fallback_profile` observability checkpoint gated behind
+   * `HF_PROFILE_FALLBACK_CAPTURE=true`. See
+   * `packages/producer/src/services/render/fallbackCaptureProfile.ts`.
+   */
+  deFallbackTrigger?: string;
   /** Wall-clock ms spent capturing self-verification ground truth at init (telemetry). */
   deVerifyInitMs?: number;
   /** Count of per-frame "No cached paint record" screenshot fallbacks (telemetry). */
@@ -201,14 +217,40 @@ export interface CaptureSession {
  * forceScreenshot. Discriminant-based guard (not instanceof) so it survives
  * duplicated module instances across package boundaries.
  */
+/**
+ * Structured detail carried alongside the human-readable message — lets
+ * telemetry report the actual failure kind / failing dB / frame index
+ * instead of the orchestrator having to regex them back out of formatted
+ * text (a message-text dependency is exactly the failure mode this shape
+ * exists to close — review finding: message wording, translation, or a
+ * cross-module/serialized error must never be able to flip the reported
+ * kind). All fields but `kind` are optional: a blank-frame trip has no PSNR
+ * score, so `failedDb`/`verifyThresholdDb` are omitted for that throw site.
+ */
+export interface DrawElementVerificationDetails {
+  kind: "blank" | "psnr";
+  frameIndex?: number;
+  failedDb?: number;
+  verifyThresholdDb?: number;
+}
+
 export class DrawElementVerificationError extends Error {
-  constructor(message: string) {
+  readonly kind: "blank" | "psnr";
+  readonly frameIndex?: number;
+  readonly failedDb?: number;
+  readonly verifyThresholdDb?: number;
+
+  constructor(message: string, details: DrawElementVerificationDetails) {
     super(message);
     this.name = "DrawElementVerificationError";
     // Discriminant property, assigned dynamically: isDrawElementVerificationError
     // reads it structurally so detection survives duplicated module instances
     // across package boundaries (where instanceof fails).
     (this as unknown as { deVerificationFailure: boolean }).deVerificationFailure = true;
+    this.kind = details.kind;
+    this.frameIndex = details.frameIndex;
+    this.failedDb = details.failedDb;
+    this.verifyThresholdDb = details.verifyThresholdDb;
   }
 }
 
@@ -220,6 +262,122 @@ export function isDrawElementVerificationError(err: unknown): boolean {
     e = (e as { cause?: unknown }).cause;
   }
   return false;
+}
+
+/**
+ * Extracts the structured details off a (possibly cause-wrapped) verification
+ * error — same chain-walk as isDrawElementVerificationError, structural
+ * (not instanceof) for the same duplicated-module-instance reason. Returns
+ * undefined when the error isn't a verification failure at all.
+ */
+export function getDrawElementVerificationDetails(
+  err: unknown,
+): DrawElementVerificationDetails | undefined {
+  let e: unknown = err;
+  for (let depth = 0; depth < 5 && typeof e === "object" && e !== null; depth++) {
+    const rec = e as { deVerificationFailure?: boolean } & Partial<DrawElementVerificationDetails>;
+    if (rec.deVerificationFailure === true) {
+      // Every construction path sets `kind` (required on the constructor), so
+      // this only defends against a malformed cross-module-instance shape —
+      // treat anything other than exactly "blank" as "psnr", the same
+      // fallback polarity the old message regex had, but driven by a
+      // structural field instead of parsing text.
+      const details: DrawElementVerificationDetails = {
+        kind: rec.kind === "blank" ? "blank" : "psnr",
+      };
+      if (typeof rec.frameIndex === "number") details.frameIndex = rec.frameIndex;
+      if (typeof rec.failedDb === "number") details.failedDb = rec.failedDb;
+      if (typeof rec.verifyThresholdDb === "number")
+        details.verifyThresholdDb = rec.verifyThresholdDb;
+      return details;
+    }
+    e = (e as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** Wait for inline CSS background images introduced by the latest seek. */
+export async function decodeDynamicCssBackgroundImages(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const root = globalThis as typeof globalThis & {
+      __hf_css_background_decoded?: Set<string>;
+      __hfDecodeDynamicCssBackgroundImages?: () => Promise<void>;
+    };
+    const decode = (root.__hfDecodeDynamicCssBackgroundImages ??= async () => {
+      const decoded = (root.__hf_css_background_decoded ??= new Set<string>());
+      const urls: string[] = [];
+      const parseBackgroundUrls = (value: string): string[] => {
+        const found: string[] = [];
+        let cursor = 0;
+
+        while (cursor < value.length) {
+          const start = value.indexOf("url(", cursor);
+          if (start < 0) break;
+
+          let index = start + 4;
+          while (index < value.length && /\s/.test(value[index] ?? "")) index += 1;
+
+          const quote = value[index] === '"' || value[index] === "'" ? value[index] : null;
+          if (quote) index += 1;
+          const contentStart = index;
+          let contentEnd = -1;
+
+          while (index < value.length) {
+            const char = value[index];
+            if (char === "\\") {
+              index = Math.min(index + 2, value.length);
+              continue;
+            }
+            if ((quote && char === quote) || (!quote && char === ")")) {
+              contentEnd = index;
+              break;
+            }
+            index += 1;
+          }
+
+          if (contentEnd < 0) break;
+          if (quote) {
+            index += 1;
+            while (index < value.length && /\s/.test(value[index] ?? "")) index += 1;
+            if (value[index] !== ")") {
+              cursor = index;
+              continue;
+            }
+          }
+
+          const url = value.slice(contentStart, contentEnd).trim();
+          if (url) found.push(url);
+          cursor = index + 1;
+        }
+
+        return found;
+      };
+
+      for (const element of document.querySelectorAll<HTMLElement>('[style*="background"]')) {
+        const backgroundImage = element.style.backgroundImage;
+        if (!backgroundImage || backgroundImage === "none") continue;
+
+        for (const url of parseBackgroundUrls(backgroundImage)) {
+          if (!decoded.has(url)) urls.push(url);
+        }
+      }
+
+      await Promise.all(
+        [...new Set(urls)].map(async (url) => {
+          const image = new Image();
+          image.src = url;
+          try {
+            await image.decode();
+            decoded.add(url);
+          } catch {
+            // Keep existing capture behavior for missing assets; request diagnostics report them.
+          }
+        }),
+      );
+    });
+
+    await decode();
+  });
 }
 
 // Circular buffer for browser console messages dumped on render failure diagnostics.
@@ -339,6 +497,27 @@ export function formatRequestFailureDiagnostic(input: {
     `[Browser:REQUESTFAILED] ${input.method} ${sanitizeDiagnosticUrl(input.url)} ` +
     `resource=${input.resourceType} error=${input.failureText}`
   );
+}
+
+/**
+ * Chromium reports media loads that it intentionally cancels during probing as
+ * request failures. They are expected when the probe discovers or seeks local
+ * audio/video and do not indicate a missing asset.
+ */
+export function shouldIgnoreRequestFailureDiagnostic(input: {
+  resourceType: string;
+  url: string;
+  failureText: string;
+}): boolean {
+  if (input.failureText !== "net::ERR_ABORTED") return false;
+  if (input.resourceType === "media") return true;
+  try {
+    return /\.(?:aac|flac|m4a|mp3|mp4|mov|oga|ogg|ogv|wav|webm)$/i.test(
+      new URL(input.url).pathname,
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function formatHttpErrorDiagnostic(input: {
@@ -509,6 +688,7 @@ async function initDrawElementOrTransparentBackground(
     (!forceScreenshot || forceDE);
   if ((session.config?.useDrawElement ?? false) && supersampling) {
     session.deGateReason = "supersampling";
+    session.deFallbackTrigger = "supersampling";
     console.log(
       "[engine] --experimental-fast-capture disabled for this render: drawElementImage " +
         "ignores deviceScaleFactor, so supersampled (DPR > 1) output uses screenshot capture.",
@@ -516,6 +696,7 @@ async function initDrawElementOrTransparentBackground(
   }
   if ((session.config?.useDrawElement ?? false) && !supersampling && forceScreenshot) {
     session.deGateReason = "render_mode_hint";
+    session.deFallbackTrigger = "render_mode_hint";
     console.log(
       "[engine] fast capture: falling back to screenshot — render-mode compatibility " +
         "hint forced screenshot capture (e.g. raw requestAnimationFrame composition).",
@@ -565,6 +746,7 @@ async function initDrawElementOrTransparentBackground(
     });
     if (!supportsDrawElement) {
       session.deGateReason = "unsupported_chrome";
+      session.deFallbackTrigger = "unsupported_chrome";
       console.log(
         `[engine] fast capture: falling back to ${session.launchCaptureMode} capture — ` +
           "this Chrome build does not implement canvas.drawElementImage (Dev/Canary-only " +
@@ -590,6 +772,7 @@ async function initDrawElementOrTransparentBackground(
     const mode = resolveDrawElementCaptureMode(session.isSwiftShader, transparent);
     if (mode === "screenshot") {
       session.deGateReason = "swiftshader";
+      session.deFallbackTrigger = "swiftshader";
       // Fall back to the browser's LAUNCH mode, not unconditionally to
       // "screenshot": on a BeginFrame-launched browser (Linux fast capture)
       // Page.captureScreenshot hangs for the full protocol timeout, while
@@ -610,6 +793,11 @@ async function initDrawElementOrTransparentBackground(
         const cssFx = await detectCssEffectRisk(page);
         if (cssFx) {
           session.deGateReason = `css_effect:${(cssFx.split(":")[0] ?? "").replace(/[^a-z-]/gi, "")}`;
+          // Full specific effect ("filter:blur" / "filter:drop-shadow" /
+          // "backdrop-filter" / "clip-path") — `deGateReason` sanitizes
+          // this to the low-cardinality prefix; `deFallbackTrigger` keeps
+          // the fine-grained value for the diagnostic profile emission.
+          session.deFallbackTrigger = cssFx;
           console.log(
             `[engine] fast capture: falling back to ${session.launchCaptureMode} capture — ` +
               `${cssFx} detected (drawElementImage cannot reproduce it; see fast-capture-limitations.md)`,
@@ -644,6 +832,7 @@ async function initDrawElementOrTransparentBackground(
         );
         if (atRisk.size > 0 && atRiskFraction > fractionFloor) {
           session.deGateReason = "at_risk_timeline";
+          session.deFallbackTrigger = "at_risk_timeline";
           console.log(
             `[engine] fast capture: falling back to ${session.launchCaptureMode} capture — ` +
               `${atRisk.size}/${totalFrames} frames animate a compositor-incompatible prop ` +
@@ -661,6 +850,7 @@ async function initDrawElementOrTransparentBackground(
       const threeD = await initThreeDProjection(page);
       if (!forceDE && !threeD.ok) {
         session.deGateReason = "3d_init_failed";
+        session.deFallbackTrigger = "3d_init_failed";
         console.log(
           `[engine] fast capture: falling back to ${session.launchCaptureMode} capture — ` +
             `3D projection init failed (${threeD.reason ?? "unknown"})`,
@@ -712,6 +902,9 @@ async function finalizeDrawElementInit(
   opts: { transparent: boolean; forceDE: boolean },
 ): Promise<void> {
   const { transparent, forceDE } = opts;
+  // Install the page-local decoder before batch drawElement capture begins;
+  // the batch loop re-runs it after every in-page seek.
+  await decodeDynamicCssBackgroundImages(page);
   // Self-verification ground truth: must run pre-injection — after the canvas
   // wraps the root, a page screenshot shows the canvas's last-drawn bitmap,
   // not the live DOM (see the Lim 6 boundary-screenshot note).
@@ -847,9 +1040,85 @@ export async function createCaptureSession(
     { ...config, browserGpuMode: resolvedGpuMode },
   );
 
-  const { browser, captureMode } = await acquireBrowser(chromeArgs, config);
+  const browserLease = await acquireBrowser(chromeArgs, config);
+  return constructCaptureSessionWithRollback({
+    browserLease,
+    serverUrl,
+    outputDir,
+    options,
+    onBeforeCapture,
+    config,
+    useDrawElement,
+  });
+}
+
+interface CaptureSessionConstructionInput {
+  browserLease: BrowserLease;
+  serverUrl: string;
+  outputDir: string;
+  options: CaptureOptions;
+  onBeforeCapture: BeforeCaptureHook | null;
+  config?: Partial<EngineConfig>;
+  useDrawElement: boolean;
+}
+
+async function constructCaptureSessionWithRollback(
+  input: CaptureSessionConstructionInput,
+): Promise<CaptureSession> {
+  let page: Page | undefined;
+  try {
+    return await constructCaptureSession({
+      ...input,
+      onPageCreated: (createdPage) => {
+        page = createdPage;
+      },
+    });
+  } catch (error) {
+    let pageClosed = true;
+    try {
+      if (page) {
+        const rollbackPage = page;
+        pageClosed = await waitForCloseWithTimeout(
+          Promise.resolve().then(() => rollbackPage.close()),
+        );
+      }
+    } finally {
+      if (!pageClosed) {
+        console.warn(
+          "[FrameCapture] Timed out closing page during construction rollback; forcing browser process shutdown",
+        );
+        input.browserLease.forceRelease();
+      } else {
+        const browserClosed = await waitForCloseWithTimeout(input.browserLease.release());
+        if (!browserClosed) {
+          console.warn(
+            "[FrameCapture] Timed out closing browser during construction rollback; forcing browser process shutdown",
+          );
+          input.browserLease.forceRelease();
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+async function constructCaptureSession(
+  input: CaptureSessionConstructionInput & { onPageCreated(page: Page): void },
+): Promise<CaptureSession> {
+  const {
+    browserLease,
+    serverUrl,
+    outputDir,
+    options,
+    onBeforeCapture,
+    config,
+    useDrawElement,
+    onPageCreated,
+  } = input;
+  const { browser, captureMode } = browserLease;
 
   const page = await browser.newPage();
+  onPageCreated(page);
   // Polyfill esbuild's keepNames helper inside the page.
   //
   // The engine is published as raw TypeScript (`packages/engine/package.json`
@@ -959,6 +1228,7 @@ export async function createCaptureSession(
 
   return {
     browser,
+    browserLease,
     page,
     options: sessionOptions,
     serverUrl,
@@ -1581,16 +1851,20 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
   });
 
   page.on("requestfailed", (request) => {
-    if (request.resourceType() === "script") {
+    const resourceType = request.resourceType();
+    const url = request.url();
+    const failureText = request.failure()?.errorText ?? "unknown";
+    if (resourceType === "script") {
       recordScriptLoadFailure(session, request.url());
     }
+    if (shouldIgnoreRequestFailureDiagnostic({ resourceType, url, failureText })) return;
     appendBrowserDiagnostic(
       session,
       formatRequestFailureDiagnostic({
         method: request.method(),
-        resourceType: request.resourceType(),
-        url: request.url(),
-        failureText: request.failure()?.errorText ?? "unknown",
+        resourceType,
+        url,
+        failureText,
       }),
     );
   });
@@ -1730,6 +2004,23 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
     );
 
     await recordSessionInitTelemetry(session, initStart);
+
+    // Ground-truth-check the upstream captureBeyondViewport request (see
+    // pageContentExceedsCaptureHeight) now that the page is fully settled —
+    // downgrade it when the page doesn't actually overflow the requested
+    // capture height, since the beyond-viewport CDP path is otherwise pure
+    // downside (HF#2550: phantom duplicate content on SwiftShader) for
+    // content it was never needed for.
+    if (session.options.captureBeyondViewport) {
+      const needsBeyondViewport = await pageContentExceedsCaptureHeight(
+        page,
+        session.options.height,
+      );
+      if (!needsBeyondViewport) {
+        session.options.captureBeyondViewport = false;
+        logInitPhase("captureBeyondViewport downgraded: page content fits the capture viewport");
+      }
+    }
 
     // drawElement or transparent-background init — runs after page is fully ready.
     await initDrawElementOrTransparentBackground(session, page, logInitPhase);
@@ -2005,6 +2296,8 @@ async function prepareFrameForCapture(
       .__hf_page_composite_pending;
   }, quantizedTime);
 
+  await decodeDynamicCssBackgroundImages(page);
+
   const seekMs = Date.now() - seekStart;
 
   // Before-capture hook (e.g. video frame injection) — runs before
@@ -2270,6 +2563,13 @@ export async function computeStaticFrameSet(
 // sampleCount, so that knob's effect on density stays monotonic (see below).
 const STATIC_VERIFY_REFERENCE_STRIDE = 24;
 
+// Verification uses full-page screenshots, whose cost scales with canvas size
+// and page complexity rather than frame count. Bound wall time as well as the
+// capture count so a long composition cannot spend minutes proving an
+// optimization before the real render starts. Exhaustion fails closed: dedup is
+// disabled and normal capture proceeds.
+const STATIC_VERIFY_MAX_MS = 15_000;
+
 /**
  * Interior verification points for a run [a..b], plus the always-included end `b`.
  * Density used to be a flat point-count cap (min(sampleCount, 8)), so a run's
@@ -2325,6 +2625,7 @@ export async function verifyStaticFramesSafe(
 ): Promise<{ badFrame: number; budgetExhausted: boolean } | null> {
   const frames = [...staticFrames].sort((a, b) => a - b);
   if (frames.length === 0) return null;
+  const deadline = Date.now() + STATIC_VERIFY_MAX_MS;
   // Runs are maximal-contiguous (adjacent frames merge), so a run's anchor a-1 is
   // guaranteed NOT static — always a freshly-captured frame.
   const runs: Array<{ a: number; b: number }> = [];
@@ -2371,9 +2672,11 @@ export async function verifyStaticFramesSafe(
     for (const { a, b } of runs) {
       const anchor = a - 1;
       if (anchor < 0) continue;
+      if (Date.now() >= deadline) return { badFrame: a, budgetExhausted: true };
       const anchorBuf = await seekCapture(anchor);
       spent++;
       for (const f of computeStaticVerificationPoints(a, b, sampleCount)) {
+        if (Date.now() >= deadline) return { badFrame: f, budgetExhausted: true };
         const cur = await seekCapture(f);
         spent++;
         if (!anchorBuf.equals(cur)) return { badFrame: f, budgetExhausted: false };
@@ -3166,18 +3469,20 @@ export async function closeCaptureSession(session: CaptureSession): Promise<void
     const pageClosed = await waitForCloseWithTimeout(session.page.close());
     if (!pageClosed) {
       console.warn("[FrameCapture] Timed out closing page; forcing browser process shutdown");
-      forceReleaseBrowser(session.browser);
+      if (session.browserLease) session.browserLease.forceRelease();
+      else forceReleaseBrowser(session.browser);
       session.browserReleased = true;
     }
     session.pageReleased = true;
   }
   if (!session.browserReleased && session.browser) {
     const browserClosed = await waitForCloseWithTimeout(
-      releaseBrowser(session.browser, session.config),
+      session.browserLease?.release() ?? releaseBrowser(session.browser, session.config),
     );
     if (!browserClosed) {
       console.warn("[FrameCapture] Timed out closing browser; forcing browser process shutdown");
-      forceReleaseBrowser(session.browser);
+      if (session.browserLease) session.browserLease.forceRelease();
+      else forceReleaseBrowser(session.browser);
     }
     session.browserReleased = true;
   }
@@ -3353,6 +3658,26 @@ function medianOf(samples: number[]): number {
   return Math.round(sorted[Math.floor(sorted.length / 2)] ?? 0);
 }
 
+/**
+ * Percentile of a positive-real sample set (nearest-rank; matches how the
+ * existing {@link medianOf} p50 helper picks the middle index). `p` is a
+ * fraction in [0, 1]; the sample at `floor(p * n)` (clamped to `[0, n-1]`)
+ * is returned. Sample set is not mutated. Returns 0 for empty input, mirroring
+ * the p50 helper.
+ *
+ * Used for the `capture_fallback_profile` observability checkpoint added in
+ * the fast-capture fallback profiling PR: we already collect `capturePerf.frameMs`
+ * per session, so computing p95/p99 is one sort + two lookups — cheap enough
+ * to always compute alongside the existing p50, no separate opt-in path
+ * needed for the math. The env gate lives at the emission site.
+ */
+export function percentileOf(samples: number[], p: number): number {
+  if (samples.length === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(p * sorted.length)));
+  return Math.round(sorted[idx] ?? 0);
+}
+
 export function getCapturePerfSummary(session: CaptureSession): CapturePerfSummary {
   const frames = Math.max(1, session.capturePerf.frames);
   return {
@@ -3362,6 +3687,8 @@ export function getCapturePerfSummary(session: CaptureSession): CapturePerfSumma
     avgBeforeCaptureMs: Math.round(session.capturePerf.beforeCaptureMs / frames),
     avgScreenshotMs: Math.round(session.capturePerf.screenshotMs / frames),
     p50TotalMs: medianOf(session.capturePerf.frameMs),
+    p95TotalMs: percentileOf(session.capturePerf.frameMs, 0.95),
+    p99TotalMs: percentileOf(session.capturePerf.frameMs, 0.99),
     subTimelineWaitOutcome: session.subTimelineWaitOutcome,
     warnings: session.warnings.map((warning) => ({
       ...warning,
@@ -3382,105 +3709,11 @@ export function getCapturePerfSummary(session: CaptureSession): CapturePerfSumma
     beginFrameHasDamage: session.beginFrameHasDamageCount,
     captureMode: session.captureMode,
     deGateReason: session.deGateReason,
+    deFallbackTrigger: session.deFallbackTrigger,
     deWorkerEncode: session.workerEncodeEnabled ?? false,
     deVerifyArmed: session.deVerifyFrames?.size ?? 0,
     deVerifyInitMs: session.deVerifyInitMs ?? 0,
     deBoundaryFrames: session.clipBoundaryFrames?.size ?? 0,
     deNcprFallbacks: session.deNcprFallbacks ?? 0,
   };
-}
-
-// ── Transient browser error classification ─────────────────────────────────
-// Puppeteer/Chrome can fail with transient errors that succeed on retry with a
-// fresh browser session. These are infrastructure-level failures (frame
-// detachment, connection drop, OOM kill, launch failure) — NOT composition bugs.
-
-const TRANSIENT_BROWSER_ERROR_PATTERNS = [
-  /Navigating frame was detached/i,
-  /Target closed/i,
-  /Session closed/i,
-  /browser has disconnected/i,
-  /Page crashed/i,
-  /Execution context was destroyed/i,
-  /Cannot find context with specified id/i,
-  /Failed to launch the browser process/i,
-  /Navigation timeout of \d+ ms exceeded/i,
-  /ECONNREFUSED/i,
-  // pollHfReady's own timeout — thrown when window.__renderReady never flips
-  // true within playerReadyTimeout. "Runtime ready: false" means init simply
-  // didn't finish in time (commonly a slow/contended host, e.g. several
-  // concurrent renders), which a fresh session usually clears on retry. This
-  // is distinct from the "Runtime ready: true" fast-fail case a few lines up
-  // in pollHfReady (no timeline + no data-duration) — that's a genuine
-  // authoring bug and intentionally NOT matched here, so it still fails fast.
-  /Composition has zero duration[\s\S]*Runtime ready: false/,
-];
-
-export function isTransientBrowserError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return TRANSIENT_BROWSER_ERROR_PATTERNS.some((pattern) => pattern.test(message));
-}
-
-// ── Memory-exhaustion classification ────────────────────────────────────────
-// A render can run the Node process (or a page-side allocation) out of memory
-// on an oversized composition — huge canvas, thousands of frames, or a very
-// large frame cache. These surface as cryptic V8 RangeErrors ("Set maximum
-// size exceeded", "Invalid array length"/"string length", "Array buffer
-// allocation failed") or a hard V8 heap-limit abort. They are NOT transient
-// (a retry re-hits the same ceiling) and NOT composition-logic bugs — they're
-// resource limits. Classify them so the caller can surface actionable guidance
-// (lower resolution / fps / duration, or enable low-memory mode) instead of a
-// raw RangeError.
-
-// Deliberately specific: each pattern is a distinct V8/Node allocation-failure
-// signature. We intentionally do NOT match a bare /out of memory/ — that
-// substring appears in benign browser-console noise (WebGL `CONTEXT_LOST … out
-// of memory`, GPU driver notes) that gets carried into the error path, and
-// misclassifying it would replace the real failure message with generic OOM
-// guidance.
-const MEMORY_EXHAUSTION_ERROR_PATTERNS = [
-  /Set maximum size exceeded/i,
-  /Map maximum size exceeded/i,
-  /Invalid (?:array|string) length/i,
-  /Array buffer allocation failed/i,
-  /Cannot create a string longer than/i,
-  /Reached heap limit/i,
-  /JavaScript heap out of memory/i,
-];
-
-// The producer's deployed runtime is Bun (JavaScriptCore), not Node (V8) —
-// see `packages/gcp-cloud-run/Dockerfile`'s `CMD ["bun", "dist/server.js"]`.
-// JSC's own allocation-failure message for the equivalent single-oversized-
-// allocation RangeErrors above is the bare string "Out of memory" (verified:
-// `new Uint8Array(Number.MAX_SAFE_INTEGER)`, an unbounded `Set`, and
-// `"x".repeat(2**53)` all throw exactly this under Bun) — none of the V8
-// patterns above match it. This is exactly the substring the comment above
-// says NOT to match anywhere in the message (benign browser-console noise
-// like a WebGL `CONTEXT_LOST … out of memory` carries that phrase too), so
-// this checks the ENTIRE (trimmed) message equals it, not merely contains
-// it — a compound message with other text around the phrase still misses.
-const BUN_MEMORY_EXHAUSTION_EXACT_MESSAGE = /^out of memory\.?$/i;
-
-// The parallel-DE capture path — the exact cohort the OOM-aware retry in
-// renderOrchestrator.ts targets — never reaches isMemoryExhaustionError with
-// a bare message: `executeParallelCapture`/`formatWorkerFailure`
-// (parallelCoordinator.ts) always wrap a worker's error as
-// "Worker N: <message>", optionally suffixed "; diagnostics: ..." and joined
-// with other failed workers' segments via "; ", all prefixed
-// "[Parallel] Capture failed: ". The exact-match check above is defeated by
-// that wrapping entirely (verified) — this pattern recovers the Bun OOM
-// signal by requiring "out of memory" appear immediately after "Worker N: "
-// and immediately before end-of-string, ";", or ".", i.e. as the WHOLE
-// worker-segment content, not merely somewhere inside it. This preserves the
-// exact-match property (no bare "out of memory" substring inside otherwise-
-// unrelated worker text, e.g. "Worker 2: WebGL context lost, out of memory
-// reported by driver" does NOT match) while surviving this codebase's own
-// error-flattening.
-const BUN_MEMORY_EXHAUSTION_WRAPPED_WORKER_MESSAGE = /\bworker \d+: out of memory\.?(?:;|$)/i;
-
-export function isMemoryExhaustionError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  if (BUN_MEMORY_EXHAUSTION_EXACT_MESSAGE.test(message.trim())) return true;
-  if (BUN_MEMORY_EXHAUSTION_WRAPPED_WORKER_MESSAGE.test(message)) return true;
-  return MEMORY_EXHAUSTION_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }

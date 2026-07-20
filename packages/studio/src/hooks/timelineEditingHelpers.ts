@@ -13,6 +13,10 @@ import { saveProjectFilesWithHistory, type RecordEditInput } from "../utils/stud
 import type { TimelineZIndexReorderCommit } from "./useTimelineEditingTypes";
 import { setCompositionDurationToContent } from "../utils/timelineAssetDrop";
 import { readFileContent } from "./timelineTimingSync";
+import {
+  findElementForSelection,
+  findElementForTimelineElement,
+} from "../components/editor/domEditingElement";
 export { deleteSelectedKeyframes } from "./deleteSelectedKeyframes";
 export { readFileContent };
 function isHTMLElement(element: Element | null): element is HTMLElement {
@@ -53,12 +57,6 @@ export function applyTimelineStackingReorder(input: {
     input.timelineElements.map((el) => [getTimelineElementIdentity(el), el]),
   );
   const doc = input.iframe?.contentDocument ?? null;
-  const findLive = (domId?: string, selector?: string, selectorIndex?: number): Element | null => {
-    if (!doc) return null;
-    if (domId) return doc.getElementById(domId);
-    if (selector) return doc.querySelectorAll(selector)[selectorIndex ?? 0] ?? null;
-    return null;
-  };
   const commitEntries: Array<{
     element: HTMLElement;
     zIndex: number;
@@ -73,7 +71,15 @@ export function applyTimelineStackingReorder(input: {
     const domId = change.domId ?? sibling?.domId;
     const selector = change.selector ?? sibling?.selector;
     const selectorIndex = change.selectorIndex ?? sibling?.selectorIndex;
-    const element = findLive(domId, selector, selectorIndex);
+    const sourceFile =
+      change.sourceFile ?? sibling?.sourceFile ?? input.activeCompPath ?? "index.html";
+    const element = doc
+      ? findElementForSelection(
+          doc,
+          { id: domId, selector, selectorIndex, sourceFile },
+          input.activeCompPath,
+        )
+      : null;
     if (!isHTMLElement(element)) return Promise.resolve();
     if (getElementZIndex(element) === change.zIndex) continue;
     commitEntries.push({
@@ -82,12 +88,15 @@ export function applyTimelineStackingReorder(input: {
       id: domId ?? sibling?.id ?? change.key,
       selector,
       selectorIndex,
-      sourceFile: change.sourceFile ?? sibling?.sourceFile ?? input.activeCompPath ?? "index.html",
+      sourceFile,
       key: change.key,
     });
   }
   if (commitEntries.length === 0) return Promise.resolve();
-  return input.commit?.(commitEntries, input.coalesceKey) ?? Promise.resolve();
+  // The durability report is for gesture-level callers (z→lane mirror); this
+  // lane-drag z-sync path has no dependent follow-up write — swallow it.
+  // Promise.resolve-wrapped: a commit implementation may return void.
+  return Promise.resolve(input.commit?.(commitEntries, input.coalesceKey)).then(() => undefined);
 }
 export function extendRootDurationIfNeeded(newEnd: number): boolean {
   const store = usePlayerStore.getState();
@@ -126,15 +135,28 @@ export type PatchTarget = NonNullable<ReturnType<typeof buildPatchTarget>>;
 export function findTimelineElementInIframe(
   iframe: HTMLIFrameElement | null,
   element: TimelineElement,
+  activeCompositionPath: string | null = null,
 ): Element | null {
   try {
     const doc = iframe?.contentDocument;
     if (!doc) return null;
-    return element.domId
-      ? doc.getElementById(element.domId)
-      : element.selector
-        ? (doc.querySelectorAll(element.selector)[element.selectorIndex ?? 0] ?? null)
-        : null;
+    if (element.kind === "composition" && element.compositionSrc) {
+      return findElementForTimelineElement(doc, element, {
+        activeCompositionPath,
+        isMasterView: true,
+      });
+    }
+    return findElementForSelection(
+      doc,
+      {
+        hfId: element.hfId,
+        id: element.domId,
+        selector: element.selector,
+        selectorIndex: element.selectorIndex,
+        sourceFile: element.sourceFile || activeCompositionPath || "index.html",
+      },
+      activeCompositionPath,
+    );
   } catch {
     return null;
   }
@@ -143,14 +165,23 @@ export function patchIframeDomTiming(
   iframe: HTMLIFrameElement | null,
   element: TimelineElement,
   attrs: Array<[string, string]>,
+  activeCompositionPath: string | null = null,
 ): void {
   try {
-    const el = findTimelineElementInIframe(iframe, element);
+    const el = findTimelineElementInIframe(iframe, element, activeCompositionPath);
     if (!el) return;
     for (const [name, value] of attrs) el.setAttribute(name, value);
   } catch {
     // Cross-origin or mid-navigation — file save is enqueued; iframe patch is best-effort.
   }
+}
+
+export function playbackStartAttributeForElement(
+  element: Pick<TimelineElement, "kind" | "playbackStartAttr">,
+): "data-media-start" | "data-playback-start" {
+  return element.playbackStartAttr === "playback-start" || element.kind === "composition"
+    ? "data-playback-start"
+    : "data-media-start";
 }
 // fallow-ignore-next-line complexity
 function resolveResizePlaybackStart(
@@ -160,8 +191,7 @@ function resolveResizePlaybackStart(
   updates: Pick<TimelineElement, "start" | "playbackStart">,
 ): { attrName: string; value: number } | null {
   if (updates.playbackStart != null) {
-    const attrName =
-      element.playbackStartAttr === "playback-start" ? "playback-start" : "media-start";
+    const attrName = playbackStartAttributeForElement(element).slice("data-".length);
     return { attrName, value: updates.playbackStart };
   }
   const trimDelta = updates.start - element.start;
@@ -171,8 +201,7 @@ function resolveResizePlaybackStart(
     readAttributeByTarget(original, target, "media-start");
   const current = raw != null ? parseFloat(raw) : undefined;
   if (current == null || !Number.isFinite(current)) return null;
-  const attrName =
-    element.playbackStartAttr === "playback-start" ? "playback-start" : "media-start";
+  const attrName = playbackStartAttributeForElement(element).slice("data-".length);
   return {
     attrName,
     value: Math.max(0, current + trimDelta * Math.max(element.playbackRate ?? 1, 0.1)),
@@ -248,7 +277,7 @@ export interface PersistTimelineEditInput {
   activeCompPath: string | null;
   label: string;
   buildPatches: (original: string, target: PatchTarget) => string;
-  writeProjectFile: (path: string, content: string) => Promise<void>;
+  writeProjectFile: (path: string, content: string, expectedContent?: string) => Promise<void>;
   recordEdit: (input: RecordEditInput) => Promise<void>;
   domEditSaveTimestampRef: React.MutableRefObject<number>;
   pendingTimelineEditPathRef: React.MutableRefObject<Set<string>>;
@@ -294,11 +323,13 @@ export interface PersistTimelineBatchEditInput {
   activeCompPath: string | null;
   label: string;
   changes: PersistTimelineBatchChange[];
-  writeProjectFile: (path: string, content: string) => Promise<void>;
+  writeProjectFile: (path: string, content: string, expectedContent?: string) => Promise<void>;
   recordEdit: (input: RecordEditInput) => Promise<void>;
   domEditSaveTimestampRef: React.MutableRefObject<number>;
   pendingTimelineEditPathRef: React.MutableRefObject<Set<string>>;
   coalesceKey?: string;
+  /** Per-entry undo coalesce window override (ms) — see EditHistoryEntry.coalesceMs. */
+  coalesceMs?: number;
 }
 
 export async function persistTimelineBatchEdit(
@@ -347,6 +378,7 @@ export async function persistTimelineBatchEdit(
     label: input.label,
     kind: "timeline",
     coalesceKey: input.coalesceKey,
+    coalesceMs: input.coalesceMs,
     files,
     readFile: async (path) => originals.get(path) ?? readFileContent(input.projectId, path),
     writeFile: input.writeProjectFile,

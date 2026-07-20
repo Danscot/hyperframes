@@ -28,6 +28,12 @@ import { assertSwiftShader } from "../utils/assertSwiftShader.js";
 import { readWebGlVendorInfoFromCanvas } from "../utils/readWebGlVendorInfoFromCanvas.js";
 import { resolveHeadlessShellPath } from "./browserManager.js";
 import { getSystemTotalMb } from "./systemMemory.js";
+import {
+  CaptureFailure,
+  classifyCaptureFailure,
+  isFatalCaptureFailure,
+  type CaptureWorkerDiagnostic,
+} from "./captureFailure.js";
 
 export interface WorkerTask {
   workerId: number;
@@ -61,6 +67,7 @@ export interface WorkerResult {
   perf?: CapturePerfSummary;
   error?: string;
   diagnostics?: string[];
+  failure?: CaptureFailure;
 }
 
 export interface ParallelProgress {
@@ -147,8 +154,49 @@ function compactDiagnosticLine(line: string): string {
   return line.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Expected frame count for a worker task, honoring its stride. Contiguous
+ * tasks (stride 1) expect `endFrame - startFrame`; interleaved tasks
+ * (stride > 1) expect `ceil((endFrame - startFrame) / stride)`, matching
+ * the loop shape in `captureFrameRange`.
+ */
+export function expectedFramesForTask(task: {
+  startFrame: number;
+  endFrame: number;
+  frameStride?: number;
+}): number {
+  const stride = task.frameStride ?? 1;
+  return Math.max(0, Math.ceil((task.endFrame - task.startFrame) / stride));
+}
+
+/**
+ * Synthetic terminal-error message for a worker whose exit didn't produce
+ * an explicit error string but under-captured its expected frame range.
+ * Field signal ts=1784042064: a 1292s Windows render hard-exited during
+ * capture with no final error string, leaving the operator with no
+ * actionable trace. This message surfaces the shortfall + reruns hint
+ * so downstream telemetry (and operators grepping logs) can classify the
+ * failure instead of it disappearing silently.
+ */
+export function synthesizeSilentWorkerExitError(
+  result: Pick<WorkerResult, "workerId" | "framesCaptured" | "startFrame" | "endFrame">,
+  expectedFrames: number,
+): string {
+  return (
+    `worker ${result.workerId} exited without terminal error string ` +
+    `(framesCaptured=${result.framesCaptured}, expected=${expectedFrames}, ` +
+    `range=[${result.startFrame}, ${result.endFrame})). ` +
+    `Field signal ts=1784042064 — this class of failure has been reported; ` +
+    `consider re-run with --workers=1 to isolate.`
+  );
+}
+
 export function formatWorkerFailure(result: WorkerResult): string {
-  const base = `Worker ${result.workerId}: ${result.error ?? "unknown error"}`;
+  const errorText =
+    result.error && result.error.length > 0
+      ? result.error
+      : synthesizeSilentWorkerExitError(result, expectedFramesForTask(result));
+  const base = `Worker ${result.workerId}: ${errorText}`;
   if (!result.diagnostics || result.diagnostics.length === 0) return base;
 
   const diagnostics = result.diagnostics.map(compactDiagnosticLine).join(" | ");
@@ -160,6 +208,10 @@ export function calculateOptimalWorkers(
   requested?: number,
   config?: WorkerSizingConfig,
 ): number {
+  if (requested !== undefined) {
+    return Math.max(MIN_WORKERS, Math.min(ABSOLUTE_MAX_WORKERS, requested));
+  }
+
   // Resolve effective values: config overrides → DEFAULT_CONFIG fallback.
   const effectiveMaxWorkers = (() => {
     const concurrency = config?.concurrency ?? DEFAULT_CONFIG.concurrency;
@@ -173,10 +225,6 @@ export function calculateOptimalWorkers(
   const effectiveLargeRenderThreshold =
     config?.largeRenderThreshold ?? DEFAULT_CONFIG.largeRenderThreshold;
   const captureCostMultiplier = Math.max(1, config?.captureCostMultiplier ?? 1);
-
-  if (requested !== undefined) {
-    return Math.max(MIN_WORKERS, Math.min(effectiveMaxWorkers, requested));
-  }
 
   if (totalFrames < MIN_FRAMES_PER_WORKER * 2) return 1;
 
@@ -382,6 +430,7 @@ async function executeWorkerTask(
   onFrameBuffer?: (frameIndex: number, buffer: Buffer, session: CaptureSession) => Promise<void>,
   config?: Partial<EngineConfig>,
   parallel?: boolean,
+  onFailure?: (failure: CaptureFailure) => void,
 ): Promise<WorkerResult> {
   const startTime = Date.now();
   let framesCaptured = 0;
@@ -442,8 +491,19 @@ async function executeWorkerTask(
       perf,
     };
   } catch (error) {
-    const errMsg = error instanceof Error ? error.message : String(error);
     const diagnostics = session ? selectWorkerDiagnostics(session.browserConsoleBuffer) : [];
+    const workerDiagnostic: CaptureWorkerDiagnostic = {
+      workerId: task.workerId,
+      framesCaptured,
+      startFrame: task.startFrame,
+      endFrame: task.endFrame,
+      lines: diagnostics,
+    };
+    const failure = classifyCaptureFailure(error, {
+      signal,
+      workerDiagnostics: [workerDiagnostic],
+    });
+    onFailure?.(failure);
     return {
       workerId: task.workerId,
       framesCaptured,
@@ -451,8 +511,9 @@ async function executeWorkerTask(
       endFrame: task.endFrame,
       durationMs: Date.now() - startTime,
       perf,
-      error: errMsg,
+      error: failure.message,
       diagnostics: diagnostics.length > 0 ? diagnostics : undefined,
+      failure,
     };
   } finally {
     if (session) await closeCaptureSession(session).catch(() => {});
@@ -525,6 +586,16 @@ export async function executeParallelCapture(
     deVerifySamples === captureOptions.deVerifySamples
       ? captureOptions
       : { ...captureOptions, deVerifySamples };
+  const peerController = new AbortController();
+  const workerSignal = signal
+    ? AbortSignal.any([signal, peerController.signal])
+    : peerController.signal;
+  let firstFatalFailure: CaptureFailure | undefined;
+  const onFailure = (failure: CaptureFailure): void => {
+    if (firstFatalFailure || !isFatalCaptureFailure(failure)) return;
+    firstFatalFailure = failure;
+    peerController.abort(failure);
+  };
   const results = await Promise.all(
     tasks.map((task) =>
       executeWorkerTask(
@@ -532,19 +603,38 @@ export async function executeParallelCapture(
         serverUrl,
         workerCaptureOptions,
         createBeforeCaptureHook,
-        signal,
+        workerSignal,
         onFrameCaptured,
         onFrameBuffer,
         config,
         parallel,
+        onFailure,
       ),
     ),
   );
 
-  const errors = results.filter((r) => r.error);
+  // A worker may return without an error string yet with framesCaptured
+  // below the task's expected count — that's the silent-exit shape field
+  // signal ts=1784042064 called out. Synthesize a terminal error string
+  // in-place so the filter below treats it as a failure (and so the
+  // caller's failure message actually names what went wrong).
+  for (const r of results) {
+    if (!r.error && r.framesCaptured < expectedFramesForTask(r)) {
+      r.error = synthesizeSilentWorkerExitError(r, expectedFramesForTask(r));
+    }
+  }
+
+  const errors = results.filter((r) => r.failure || r.error);
   if (errors.length > 0) {
     const errorMessages = errors.map(formatWorkerFailure).join("; ");
-    throw new Error(`[Parallel] Capture failed: ${errorMessages}`);
+    const representative = firstFatalFailure ?? errors.find((result) => result.failure)?.failure;
+    const workerDiagnostics = errors.flatMap((result) => result.failure?.workerDiagnostics ?? []);
+    throw new CaptureFailure({
+      kind: representative?.kind ?? "io",
+      message: `[Parallel] Capture failed: ${errorMessages}`,
+      cause: representative,
+      workerDiagnostics,
+    });
   }
 
   return results;
