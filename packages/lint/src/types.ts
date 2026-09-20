@@ -9,6 +9,20 @@ export type HyperframeLintFinding = {
   elementId?: string;
   fixHint?: string;
   snippet?: string;
+  /** Optional standalone entry that command-specific guidance can act on. */
+  suggestedComposition?: string;
+};
+
+/**
+ * Where a single lint pass spent its time. Attributed per rule-source module
+ * ("gsap", "core", ...) rather than per rule, plus the single slowest rule as
+ * `<group>#<index-within-group>` so a pathological rule is locatable.
+ */
+export type LintTimings = {
+  totalMs: number;
+  groupMs: Record<string, number>;
+  slowestRule: string;
+  slowestRuleMs: number;
 };
 
 export type HyperframeLintResult = {
@@ -17,6 +31,7 @@ export type HyperframeLintResult = {
   warningCount: number;
   infoCount: number;
   findings: HyperframeLintFinding[];
+  timings?: LintTimings;
 };
 
 export type HyperframeLinterOptions = {
@@ -31,6 +46,8 @@ export type HyperframeLinterOptions = {
    * render time — the font will silently fall back to whatever the OS provides.
    */
   distributed?: boolean;
+  /** Who is running the lint: Studio raises the structure rules to errors, the CLI keeps them warnings. */
+  host?: "studio" | "cli";
 };
 
 // A rule is a function: receives parsed context, returns zero or more findings.

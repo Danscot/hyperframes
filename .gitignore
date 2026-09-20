@@ -97,6 +97,8 @@ examples/*
 !examples/k8s-jobs/**
 !examples/gcp-cloud-run
 !examples/gcp-cloud-run/**
+!examples/docs-reference-project
+!examples/docs-reference-project/**
 # …but never the local smoke run's build/render artifacts.
 examples/gcp-cloud-run/scripts/gcp-smoke-artifacts/
 packages/studio/data/
@@ -147,6 +149,8 @@ captures/
 *-capture/
 *-demo/
 *-ad/
+!registry/blocks/slack-notification-ad/
+!registry/blocks/slack-notification-ad/**
 *-tour/
 *-brand/
 
@@ -181,3 +185,10 @@ tmp/
 
 # Local editor settings
 .zed/
+
+# Local Chrome-for-Testing downloads (large binaries, never commit)
+chrome/
+
+# Hosted catalog item files are generated output the docs host serves; the rules above match their folder names
+!docs/public/catalog/items/**/compositions/
+!docs/public/catalog/items/*-ad/

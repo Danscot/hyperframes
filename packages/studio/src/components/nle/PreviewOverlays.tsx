@@ -1,15 +1,12 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { CaptionOverlay } from "../../captions/components/CaptionOverlay";
+import { useCaptionStore } from "../../captions/store";
 import { DomEditOverlay } from "../editor/DomEditOverlay";
+import { TopologyLens } from "../editor/TopologyLens";
 import { MotionPathOverlay } from "../editor/MotionPathOverlay";
 import { SnapToolbar } from "../editor/SnapToolbar";
+import { usePreviewReadOnly } from "../editor/previewReadOnlyContext";
 import { useCompositionDimensions } from "../../hooks/useCompositionDimensions";
-import {
-  STUDIO_INSPECTOR_PANELS_ENABLED,
-  STUDIO_KEYFRAMES_ENABLED,
-  STUDIO_PREVIEW_MANUAL_EDITING_ENABLED,
-  STUDIO_PREVIEW_SELECTION_ENABLED,
-} from "../editor/manualEditingAvailability";
 import { useStudioPlaybackContext, useStudioShellContext } from "../../contexts/StudioContext";
 import {
   useDomEditActionsContext,
@@ -27,6 +24,7 @@ import type { GestureRecordingState } from "../editor/GestureRecordControl";
 import type { ReactNode } from "react";
 
 export interface PreviewOverlaysProps {
+  shouldShowMotionPath: boolean;
   shouldShowSelectedDomBounds: boolean;
   blockPreview?: BlockPreviewInfo | null;
   isGestureRecording?: boolean;
@@ -132,6 +130,7 @@ export function resolveZIndexEntries(
 
 // fallow-ignore-next-line complexity
 export function PreviewOverlays({
+  shouldShowMotionPath,
   shouldShowSelectedDomBounds,
   blockPreview,
   isGestureRecording,
@@ -141,7 +140,27 @@ export function PreviewOverlays({
 }: PreviewOverlaysProps) {
   const { activeCompPath, previewIframeRef } = useStudioShellContext();
   const { captionEditMode, compositionLoading, isPlaying } = useStudioPlaybackContext();
-  const compositionDimensions = useCompositionDimensions();
+  const compositionDimensions = useCompositionDimensions(previewIframeRef);
+  const readOnly = usePreviewReadOnly();
+  const previewCaptionEditMode = captionEditMode && !readOnly;
+
+  // Caption edit mode is entered automatically when captions are detected;
+  // these give the author an explicit way OUT (and back in). Without them the
+  // caption overlay permanently replaces normal element editing.
+  const captionModelPresent = useCaptionStore((state) => state.model !== null);
+  const captionDismissed = useCaptionStore((state) => state.dismissed);
+  const captionSyncError = useCaptionStore((state) => state.syncError);
+  const exitCaptionMode = useCallback(() => {
+    const store = useCaptionStore.getState();
+    store.clearSelection();
+    store.setDismissed(true);
+    store.setEditMode(false);
+  }, []);
+  const enterCaptionMode = useCallback(() => {
+    const store = useCaptionStore.getState();
+    store.setDismissed(false);
+    store.setEditMode(true);
+  }, []);
 
   const { domEditHoverSelection, domEditSelection, domEditGroupSelections } =
     useDomEditSelectionContext();
@@ -176,46 +195,88 @@ export function PreviewOverlays({
 
   if (blockPreview) {
     return (
-      <div className="absolute inset-0 z-30 bg-black pointer-events-none">
-        {blockPreview.videoUrl ? (
-          <video
-            src={blockPreview.videoUrl}
-            autoPlay
-            muted
-            loop
-            playsInline
-            className="w-full h-full object-contain"
-          />
-        ) : blockPreview.posterUrl ? (
-          <img
-            src={blockPreview.posterUrl}
-            alt={blockPreview.title}
-            className="w-full h-full object-contain"
-          />
-        ) : null}
-      </div>
+      <>
+        <TopologyLens iframeRef={previewIframeRef} activeCompositionPath={activeCompPath} />
+        <div className="absolute inset-0 z-30 bg-black pointer-events-none">
+          {blockPreview.videoUrl ? (
+            <video
+              src={blockPreview.videoUrl}
+              autoPlay
+              muted
+              loop
+              playsInline
+              className="w-full h-full object-contain"
+            />
+          ) : blockPreview.posterUrl ? (
+            <img
+              src={blockPreview.posterUrl}
+              alt={blockPreview.title}
+              className="w-full h-full object-contain"
+            />
+          ) : null}
+        </div>
+      </>
     );
   }
 
-  if (captionEditMode) {
-    return <CaptionOverlay iframeRef={previewIframeRef} />;
+  if (previewCaptionEditMode) {
+    return (
+      <>
+        <TopologyLens iframeRef={previewIframeRef} activeCompositionPath={activeCompPath} />
+        <CaptionOverlay iframeRef={previewIframeRef} />
+        {/* Mode indicator + explicit exit */}
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 z-60 flex items-center gap-2 rounded-full border border-studio-accent/40 bg-black/70 px-2.5 py-1">
+          <span className="h-1.5 w-1.5 rounded-full bg-studio-accent" aria-hidden="true" />
+          <span className="text-2xs text-neutral-200">Editing captions</span>
+          <button
+            type="button"
+            onClick={exitCaptionMode}
+            className="rounded-sm text-2xs text-neutral-400 underline underline-offset-2 hover:text-neutral-100 focus-visible:outline-solid focus-visible:outline-1 focus-visible:outline-studio-accent"
+          >
+            Exit
+          </button>
+        </div>
+        {captionSyncError && (
+          <div
+            role="alert"
+            className="absolute top-10 left-1/2 -translate-x-1/2 z-60 flex items-center gap-2 rounded-full border border-red-500/50 bg-red-950/90 px-2.5 py-1"
+          >
+            <span className="text-2xs text-red-200">{captionSyncError}</span>
+            <button
+              type="button"
+              onClick={() => useCaptionStore.getState().retrySave?.()}
+              className="rounded-sm text-2xs text-red-100 underline underline-offset-2 hover:text-white"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={() => useCaptionStore.getState().setSyncError(null)}
+              aria-label="Dismiss"
+              className="rounded-sm px-0.5 text-2xs text-red-300/70 hover:text-red-100"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+      </>
+    );
   }
-
-  if (!STUDIO_INSPECTOR_PANELS_ENABLED) return null;
 
   return (
     <>
+      <TopologyLens iframeRef={previewIframeRef} activeCompositionPath={activeCompPath} />
       <DomEditOverlay
         iframeRef={previewIframeRef}
         activeCompositionPath={activeCompPath}
         hoverSelection={
-          STUDIO_PREVIEW_SELECTION_ENABLED && !captionEditMode && !compositionLoading && !isPlaying
+          !previewCaptionEditMode && !compositionLoading && !isPlaying
             ? domEditHoverSelection
             : null
         }
         selection={shouldShowSelectedDomBounds ? domEditSelection : null}
         groupSelections={shouldShowSelectedDomBounds ? domEditGroupSelections : []}
-        allowCanvasMovement={STUDIO_PREVIEW_MANUAL_EDITING_ENABLED && !isGestureRecording}
+        allowCanvasMovement={!isGestureRecording}
         onCanvasMouseDown={handlePreviewCanvasMouseDown}
         onCanvasPointerMove={handlePreviewCanvasPointerMove}
         onCanvasPointerLeave={handlePreviewCanvasPointerLeave}
@@ -271,15 +332,24 @@ export function PreviewOverlays({
         onMarqueeSelect={applyMarqueeSelection}
       />
       <SnapToolbar onSnapChange={setSnapPrefs} />
-      {STUDIO_KEYFRAMES_ENABLED && (
+      {!readOnly && (
         <MotionPathOverlay
           iframeRef={previewIframeRef}
-          selection={shouldShowSelectedDomBounds ? domEditSelection : null}
+          selection={shouldShowMotionPath ? domEditSelection : null}
           compositionSize={compositionDimensions}
           isPlaying={isPlaying}
         />
       )}
       {gestureOverlay}
+      {captionModelPresent && captionDismissed && (
+        <button
+          type="button"
+          onClick={enterCaptionMode}
+          className="absolute top-2 left-1/2 -translate-x-1/2 z-60 rounded-full border border-neutral-700 bg-black/60 px-2.5 py-1 text-2xs text-neutral-300 transition-colors hover:border-studio-accent/50 hover:text-studio-accent focus-visible:outline-solid focus-visible:outline-1 focus-visible:outline-studio-accent"
+        >
+          Edit captions
+        </button>
+      )}
     </>
   );
 }

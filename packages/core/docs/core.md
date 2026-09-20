@@ -4,7 +4,7 @@ Reference for generating and editing HyperFrames HTML compositions. This is your
 
 **New to HyperFrames?** Start with the [quickstart template](./quickstart-template.html) — a copy-paste composition with inline comments explaining every required piece. See [common mistakes](./common-mistakes.md) for pitfalls that break compositions.
 
-For Frame adapters and deterministic frame rendering direction, see [`../../FRAME.md`](../../FRAME.md) and [`../adapters/README.md`](../adapters/README.md).
+For frame adapters and deterministic frame rendering direction, see the [frame adapters](https://hyperframes.heygen.com/concepts/frame-adapters) and [determinism](https://hyperframes.heygen.com/concepts/determinism) concept docs.
 
 Producer-canonical parity note:
 
@@ -117,7 +117,7 @@ Use the `data-composition-src` attribute to load a composition from an external 
   <video id="el-1" data-start="0" data-duration="10" data-track-index="0" src="..."></video>
   <video id="el-2" data-start="el-1" data-duration="8" data-track-index="0" src="..."></video>
   <img id="el-3" data-start="5" data-duration="4" data-track-index="1" src="..." />
-  <audio id="el-4" data-start="0" data-duration="30" data-track-index="2" src="..." />
+  <audio id="el-4" data-start="0" data-duration="30" data-track-index="2" src="..."></audio>
 
   <!-- Load composition from external file -->
   <div
@@ -183,7 +183,7 @@ A clip is any discrete block on the timeline. We represent clips as HTML element
 
 - `id` — Unique identifier (e.g., "el-1")
 - `data-start` — Start time in seconds, or a clip `id` reference. See [Relative Timing](#relative-timing).
-- `data-duration` — Duration in seconds. Required for `<img>` clips. Optional for `<video>` and `<audio>` (defaults to the source media's full duration). Not used on compositions.
+- `data-duration` — Duration in seconds. Optional for `<img>` (defaults to 3 seconds), `<video>` and `<audio>` (default to the source media's length, less any playback offset, over the playback rate; an authored value trims). Not used on compositions.
 - `data-track-index` — Timeline track number. Tracks serve two purposes: they determine visual layering (higher tracks render in front) and they group clips into rows on the timeline. Clips on the same track **cannot overlap in time**.
 
 ### Media Clips (video, audio)
@@ -343,7 +343,7 @@ The top-level composition is the `index.html` entry point. It acts as the conduc
   <video id="el-1" data-start="0" data-duration="10" data-track-index="0" src="..."></video>
   <video id="el-2" data-start="el-1" data-duration="8" data-track-index="0" src="..."></video>
   <img id="el-3" data-start="5" data-duration="4" data-track-index="1" src="..." />
-  <audio id="el-4" data-start="0" data-duration="30" data-track-index="2" src="..." />
+  <audio id="el-4" data-start="0" data-duration="30" data-track-index="2" src="..."></audio>
 
   <!-- Load sub-compositions from external files -->
   <div

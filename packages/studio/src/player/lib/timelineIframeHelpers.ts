@@ -84,8 +84,14 @@ export function autoHealMissingCompositionIds(doc: Document): void {
 
 type PreviewPlayerHost = HTMLElement & {
   muted?: boolean;
+  volume?: number;
   playbackRate?: number;
 };
+
+function normalizePreviewVolume(volume: number): number {
+  if (!Number.isFinite(volume)) return 1;
+  return Math.max(0, Math.min(1, volume));
+}
 
 function isPreviewPlayerHost(value: unknown): value is PreviewPlayerHost {
   return value instanceof HTMLElement;
@@ -111,10 +117,6 @@ function postPreviewControl(
   postRuntimeControlMessage(iframe.contentWindow, action, payload);
 }
 
-export function shouldMutePreviewAudio(audioMuted: boolean, playbackRate: number): boolean {
-  return audioMuted || playbackRate > 1;
-}
-
 export function setPreviewMediaMuted(iframe: HTMLIFrameElement | null, muted: boolean): void {
   if (!iframe) return;
   try {
@@ -125,6 +127,36 @@ export function setPreviewMediaMuted(iframe: HTMLIFrameElement | null, muted: bo
     }
     postPreviewControl(iframe, "set-muted", { muted });
   } catch {}
+}
+
+export function setPreviewMediaVolume(iframe: HTMLIFrameElement | null, volume: number): void {
+  if (!iframe) return;
+  const nextVolume = normalizePreviewVolume(volume);
+  try {
+    const host = resolvePreviewPlayerHost(iframe);
+    if (host && typeof host.volume === "number") {
+      host.volume = nextVolume;
+      return;
+    }
+    postPreviewControl(iframe, "set-volume", { volume: nextVolume });
+  } catch {}
+}
+
+/**
+ * Everything the preview runtime has to be told about audio after it loads.
+ * Called from `applyPreviewAudioState`, which is the path that re-runs after a
+ * preview reload — the runtime comes back with the transport at its defaults
+ * and nothing else pushes them again.
+ */
+export function applyPreviewAudioFlags(
+  iframe: HTMLIFrameElement | null,
+  muted: boolean,
+  volume: number,
+): void {
+  setPreviewMediaMuted(iframe, muted);
+  // Volume too: the transport comes back at unity after a reload, so a preview
+  // the author had turned down came back loud.
+  setPreviewMediaVolume(iframe, volume);
 }
 
 export function setPreviewPlaybackRate(
@@ -186,10 +218,26 @@ let scrubPrevVolume: number | null = null;
 // Resolve the SAME element the store identified as music: prefer its id, then
 // the role attribute, and only fall back to the first <audio> (which could be a
 // voiceover, so the id hint matters).
+/**
+ * `doc` is the preview iframe's document, so its `<audio>` nodes are instances of
+ * the IFRAME's `HTMLAudioElement`, never this module's. `instanceof
+ * HTMLAudioElement` here is false for every one of them, which silently threw the
+ * `musicId` hint away and fell through to "first `<audio>` in the document" — the
+ * very thing the comment above warns can be a voiceover. Ask what the node IS.
+ * Same rule and same reasoning as packages/core/src/runtime/domRealm.ts.
+ */
+function isAudioNode(node: Element | null): node is HTMLAudioElement {
+  return (
+    node !== null &&
+    node.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+    node.localName === "audio"
+  );
+}
+
 function resolveScrubAudioEl(doc: Document, musicId?: string | null): HTMLAudioElement | null {
   if (musicId) {
     const byId = doc.getElementById(musicId);
-    if (byId instanceof HTMLAudioElement) return byId;
+    if (isAudioNode(byId)) return byId;
   }
   return (
     doc.querySelector<HTMLAudioElement>("audio[data-timeline-role='music']") ??
@@ -197,14 +245,27 @@ function resolveScrubAudioEl(doc: Document, musicId?: string | null): HTMLAudioE
   );
 }
 
-function applyScrub(el: HTMLAudioElement, audioFileTime: number): void {
+/** The runtime stops any media running under a paused clock, and a scrub audition
+ *  IS media running under a paused clock, so it has to borrow the element. Every
+ *  hop is optional: a runtime predating the hook must no-op, not throw. Wrapped in
+ *  named calls so `applyScrub` does not carry the optional chains' branches. */
+function leaseScrubElement(el: HTMLAudioElement): void {
+  (el.ownerDocument.defaultView as IframeWindow | null)?.__hf?.leasePausedMedia?.(el);
+}
+
+function releaseScrubElement(el: HTMLAudioElement): void {
+  (el.ownerDocument.defaultView as IframeWindow | null)?.__hf?.releasePausedMedia?.(el);
+}
+
+function applyScrub(el: HTMLAudioElement, audioFileTime: number, previewVolume: number): void {
   if (scrubAudioEl && scrubAudioEl !== el) stopScrubPreviewAudio();
   if (scrubPrevMuted === null) scrubPrevMuted = el.muted;
   if (scrubPrevVolume === null) scrubPrevVolume = el.volume;
   scrubAudioEl = el;
+  leaseScrubElement(el);
   try {
     el.muted = false;
-    el.volume = SCRUB_VOLUME;
+    el.volume = SCRUB_VOLUME * normalizePreviewVolume(previewVolume);
     if (Math.abs(el.currentTime - audioFileTime) > 0.04) el.currentTime = audioFileTime;
     if (el.paused) void el.play().catch(() => {});
   } catch {
@@ -222,6 +283,7 @@ export function scrubPreviewAudio(
   iframe: HTMLIFrameElement | null,
   audioFileTime: number | null,
   musicId?: string | null,
+  previewVolume = 1,
 ): void {
   if (!iframe) return;
   if (audioFileTime === null) {
@@ -236,7 +298,7 @@ export function scrubPreviewAudio(
   }
   if (!doc) return;
   const el = resolveScrubAudioEl(doc, musicId);
-  if (el) applyScrub(el, audioFileTime);
+  if (el) applyScrub(el, audioFileTime, previewVolume);
 }
 
 export function stopScrubPreviewAudio(): void {
@@ -247,6 +309,9 @@ export function stopScrubPreviewAudio(): void {
   const el = scrubAudioEl;
   scrubAudioEl = null;
   if (!el) return;
+  // `scrubStopTimer` guarantees this runs within ~140 ms of the last scrub, so
+  // the borrow cannot outlive the audition.
+  releaseScrubElement(el);
   try {
     el.pause();
     if (scrubPrevMuted !== null) el.muted = scrubPrevMuted;
@@ -387,6 +452,7 @@ function buildMissingCompositionEntry(params: {
     start: window.start,
     duration: window.duration,
     track: timing.trackIndex,
+    authoredTrack: timing.trackIndex,
     domId: optionalNonEmpty(element.id),
     hfId: optionalNonEmpty(element.getAttribute("data-hf-id")),
     selector,

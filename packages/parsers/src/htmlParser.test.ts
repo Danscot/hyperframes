@@ -2,6 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect } from "vitest";
+import { ensureHfIds } from "./hfIds.js";
 import {
   parseHtml,
   updateElementInHtml,
@@ -12,6 +13,34 @@ import {
 } from "./htmlParser.js";
 
 describe("parseHtml", () => {
+  it("preserves runtime HTML normalization for mixed-case attributes", () => {
+    const result = parseHtml(`<!doctype html><HTML DATA-RESOLUTION="square"><BODY>
+      <DIV ID="x" DATA-START="2" DATA-DURATION="3" DATA-TRACK-INDEX="4" DATA-NAME="UP"><DIV>hello</DIV></DIV>
+    </BODY></HTML>`);
+    expect(result.resolution).toBe("square");
+    expect(result.elements).toHaveLength(1);
+    expect(result.elements[0]).toMatchObject({
+      startTime: 2,
+      duration: 3,
+      zIndex: 4,
+      name: "UP",
+      content: "hello",
+    });
+  });
+
+  it.each([
+    `<DIV ID="x" DATA-START="2" DATA-DURATION="3" DATA-NAME="UP"><DIV>hello</DIV></DIV>`,
+    `<DIV ID="x" DATA-START="2" DATA-HF-ID="pinned" DATA-HF-STATE="ignored"><DIV>hello</DIV></DIV>`,
+  ])("matches persisted and runtime IDs for mixed-case HTML: %s", (body) => {
+    const html = `<!doctype html><html><body>${body}</body></html>`;
+    const first = parseHtml(html);
+    const persisted = parseHtml(ensureHfIds(html));
+    expect(first.elements.length).toBeGreaterThan(0);
+    expect(first.elements.map((element) => element.id)).toEqual(
+      persisted.elements.map((element) => element.id),
+    );
+  });
+
   it("extracts elements with data-start and data-end", () => {
     const html = `
       <html>
@@ -578,6 +607,19 @@ describe("removeElementFromHtml", () => {
 
     expect(updated).not.toContain('id="el1"');
     expect(updated).toContain('id="el2"');
+  });
+
+  it("cascades DOM and stable ids for every descendant", () => {
+    const html = `<!doctype html><html><body>
+      <div id="parent"><div id="box" data-hf-id="hf-box"></div></div>
+      <script>const tl = gsap.timeline();
+        tl.to("#parent", { x: 10 }); tl.to("#box", { x: 20 });
+        tl.to('[data-hf-id="hf-box"]', { x: 30 });
+      </script></body></html>`;
+    const updated = removeElementFromHtml(html, "parent");
+    expect(updated).not.toContain("#parent");
+    expect(updated).not.toContain("#box");
+    expect(updated).not.toContain("hf-box");
   });
 
   it("strips ALL gsap tweens for the removed element, not just the first", () => {

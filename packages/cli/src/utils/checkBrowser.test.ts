@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+// fallow-ignore-file code-duplication
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -153,6 +154,28 @@ it("carries raw browser geometry through the page driver and pipeline", async ()
   ]);
   expect(result.timings).toEqual({ launchSettleMs: 60, seekLoopMs: 40, contrastMs: 0 });
   expect(mocks.serverClose).toHaveBeenCalledOnce();
+});
+
+it("uses check --timeout for both navigation and render-ready settling", async () => {
+  mountCanvasFixture();
+  const page = fakePage();
+  installSessionMock(page);
+
+  await runBrowserCheck(
+    PROJECT,
+    { ...DEFAULT_CHECK_OPTIONS, samples: 1, contrast: false, timeout: 30_000 },
+    { kind: "none" },
+    runAuditGrid,
+  );
+
+  expect(openSettledCompositionPage).toHaveBeenCalledWith(
+    "<html></html>",
+    "http://127.0.0.1:3000",
+    expect.objectContaining({
+      navigationTimeoutMs: 30_000,
+      renderReadyTimeoutMs: 30_000,
+    }),
+  );
 });
 
 it("round-trips the browser script's raw contrast candidates back into finish", async () => {
@@ -409,6 +432,96 @@ it("surfaces the runtime's media-proxy-unavailable console.info line as its own 
       code: "media_proxy_unavailable",
       severity: "info",
       message: unavailableMessage.text(),
+    }),
+  );
+});
+
+it("surfaces the runtime's web-audio-bypass console.info line as its own info finding", async () => {
+  // The whole complaint in #3458 is that nothing was reported. The runtime
+  // emits this from media DISCOVERY, not from playback scheduling, precisely
+  // because `check` seeks and never calls play() — a diagnostic raised from
+  // the transport would never reach this scraper.
+  vi.spyOn(Date, "now").mockReturnValue(100);
+  mountCanvasFixture();
+  const page = fakePage();
+  const bypassMessage = fakeConsoleMessage(
+    "info",
+    '[hyperframes] runtime_web_audio_bypass: "https://cdn.example.com/track.mp3" ' +
+      "(cross_origin_no_cors): Web Audio capture withheld; the track plays through native " +
+      "HTMLMediaElement output. Native playback cannot reproduce: fx-chain — proxy or download " +
+      "the asset to a same-origin URL to keep it.",
+  );
+  const authorInfo = fakeConsoleMessage("info", "debug runtime_web_audio_bypass lookalike");
+  page.on = vi.fn(
+    (event: string, handler: (message: ReturnType<typeof fakeConsoleMessage>) => void) => {
+      if (event === "console") {
+        handler(bypassMessage);
+        handler(authorInfo);
+      }
+    },
+  );
+  installSessionMock(page);
+
+  const result = await runBrowserCheck(
+    PROJECT,
+    { ...DEFAULT_CHECK_OPTIONS, samples: 1, contrast: false },
+    { kind: "none" },
+    runAuditGrid,
+  );
+
+  expect(result.runtimeFindings).toContainEqual(
+    expect.objectContaining({
+      code: "web_audio_bypass",
+      severity: "info",
+      message: bypassMessage.text(),
+    }),
+  );
+  // Prefix-anchored, so a composition author's own console.info that merely
+  // mentions the code is not promoted into a finding.
+  expect(result.runtimeFindings.some((finding) => finding.message === authorInfo.text())).toBe(
+    false,
+  );
+});
+
+it("elevates and deduplicates WebGPU validation warnings while preserving ordinary warnings", async () => {
+  vi.spyOn(Date, "now").mockReturnValue(100);
+  mountCanvasFixture();
+  const page = fakePage();
+  const validationFailure = fakeConsoleMessage(
+    "warn",
+    "WebGPU uncaptured error: GPUValidationError: Destroyed texture used in a submit",
+  );
+  const ordinaryWarning = fakeConsoleMessage("warn", "Optional caption font was not loaded");
+  page.on = vi.fn(
+    (event: string, handler: (message: ReturnType<typeof fakeConsoleMessage>) => void) => {
+      if (event === "console") {
+        handler(validationFailure);
+        handler(validationFailure);
+        handler(ordinaryWarning);
+      }
+    },
+  );
+  installSessionMock(page);
+
+  const result = await runBrowserCheck(
+    PROJECT,
+    { ...DEFAULT_CHECK_OPTIONS, samples: 1, contrast: false },
+    { kind: "none" },
+    runAuditGrid,
+  );
+
+  expect(result.runtimeFindings).toContainEqual(
+    expect.objectContaining({
+      code: "webgpu_runtime_error",
+      severity: "error",
+      message: `${validationFailure.text()} (repeated 2 times)`,
+    }),
+  );
+  expect(result.runtimeFindings).toContainEqual(
+    expect.objectContaining({
+      code: "console_warning",
+      severity: "warning",
+      message: ordinaryWarning.text(),
     }),
   );
 });

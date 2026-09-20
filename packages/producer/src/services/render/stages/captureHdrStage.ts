@@ -44,6 +44,7 @@ import {
   type HdrTransfer,
   type StreamingEncoder,
   closeCaptureSession,
+  cloneCaptureWarnings,
   createCaptureSession,
   getEncoderPreset,
   initTransparentBackground,
@@ -59,7 +60,6 @@ import {
   type HdrTransitionMeta,
   type HdrVideoFrameSource,
   type TransitionRange,
-  closeHdrVideoFrameSource,
   resolveCompositeTransfer,
 } from "../../hdrCompositor.js";
 import { type HdrPerfCollector, createHdrPerfCollector } from "../hdrPerf.js";
@@ -67,6 +67,7 @@ import type { HdrDiagnostics, ProgressCallback, RenderJob } from "../../renderOr
 import type { CompositionMetadata } from "../shared.js";
 import {
   decodeHdrImageBuffers,
+  cleanupHdrVideoFrameSource,
   extractHdrVideoFrames,
   planHdrResources,
   probeHdrExtractionDims,
@@ -75,6 +76,7 @@ import { partitionTransitionFrames, shouldUseHybridLayeredPath } from "./capture
 import { runSequentialLayeredFrameLoop } from "./captureHdrSequentialLoop.js";
 import { runHybridLayeredFrameLoop } from "./captureHdrHybridLoop.js";
 import { wrapCaptureStageError } from "../captureStageError.js";
+import { encoderFailureError } from "../encoderInterruption.js";
 import type { HdrLayeredCapturePlan } from "../capturePlan.js";
 
 export interface CaptureHdrStageInput {
@@ -128,18 +130,7 @@ export interface CaptureHdrStageResult {
   warnings: CaptureWarning[];
 }
 
-function cloneCaptureWarnings(warnings: readonly CaptureWarning[]): CaptureWarning[] {
-  return warnings.map((warning) => ({
-    ...warning,
-    details: warning.details
-      ? {
-          ...warning.details,
-          sources: warning.details.sources ? [...warning.details.sources] : undefined,
-        }
-      : undefined,
-  }));
-}
-
+// fallow-ignore-next-line complexity
 export async function runCaptureHdrStage(
   input: CaptureHdrStageInput,
 ): Promise<CaptureHdrStageResult> {
@@ -212,7 +203,6 @@ export async function runCaptureHdrStage(
     nativeHdrImageIds,
     projectDir,
     compiledDir,
-    existsSync,
   });
 
   const domSession = await createCaptureSession(
@@ -226,6 +216,7 @@ export async function runCaptureHdrStage(
   let hdrEncoder: StreamingEncoder | null = null;
   let hdrEncoderClosed = false;
   let domSessionClosed = false;
+  let releaseHdrExtractionReservation: (() => void) | null = null;
   const hdrVideoFrameSources = new Map<string, HdrVideoFrameSource>();
   try {
     await initializeSession(domSession);
@@ -307,7 +298,8 @@ export async function runCaptureHdrStage(
       abortSignal,
       hdrDiagnostics,
     });
-    for (const [id, source] of extracted) hdrVideoFrameSources.set(id, source);
+    releaseHdrExtractionReservation = extracted.releaseReservation;
+    for (const [id, source] of extracted.sources) hdrVideoFrameSources.set(id, source);
     const hdrImageBuffers = decodeHdrImageBuffers({
       log,
       hdrImageSrcPaths,
@@ -440,7 +432,7 @@ export async function runCaptureHdrStage(
     hdrEncoderClosed = true;
     assertNotAborted();
     if (!hdrEncodeResult.success) {
-      throw new Error(`HDR encode failed: ${hdrEncodeResult.error}`);
+      throw encoderFailureError("HDR encode failed", hdrEncodeResult);
     }
     captureDurationMs = Date.now() - stageStart;
     encodeMs = hdrEncodeResult.durationMs;
@@ -465,9 +457,11 @@ export async function runCaptureHdrStage(
       });
     }
     for (const frameSource of hdrVideoFrameSources.values()) {
-      closeHdrVideoFrameSource(frameSource, log);
+      cleanupHdrVideoFrameSource(frameSource, log);
     }
     hdrVideoFrameSources.clear();
+    releaseHdrExtractionReservation?.();
+    releaseHdrExtractionReservation = null;
   }
 
   return {

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdtempSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -27,14 +28,15 @@ function createFakeProc(): FakeProc {
   return proc;
 }
 
-type SpawnCall = { command: string; args: string[]; proc: FakeProc };
-type SpawnImpl = (command: string, args: string[]) => FakeProc;
+type SpawnOptions = { windowsHide?: boolean };
+type SpawnCall = { command: string; args: string[]; options?: SpawnOptions; proc: FakeProc };
+type SpawnImpl = (command: string, args: string[], options?: SpawnOptions) => FakeProc;
 
 function createSpawnSpy(): { spawn: SpawnImpl; calls: SpawnCall[] } {
   const calls: SpawnCall[] = [];
-  const spawn: SpawnImpl = (command, args) => {
+  const spawn: SpawnImpl = (command, args, options) => {
     const proc = createFakeProc();
-    calls.push({ command, args, proc });
+    calls.push({ command, args, options, proc });
     return proc;
   };
   return { spawn, calls };
@@ -221,6 +223,7 @@ describe("resolveProxy", () => {
     await flush();
 
     expect(calls[0]!.args).toEqual(["-hide_banner", "-filters"]);
+    expect(calls[0]!.options?.windowsHide).toBe(true);
     calls[0]!.proc.stdout.emit(
       "data",
       Buffer.from(" ..C zscale V->V zimg scale\n T.C tonemap V->V tone map\n"),
@@ -458,6 +461,7 @@ describe("resolveProxy", () => {
     const retry = resolveProxy(projectDir, sourcePath);
     await flush();
     expect(calls).toHaveLength(2);
+    expect(calls[1]!.options?.windowsHide).toBe(true);
     succeed(calls[1]!);
     await expect(retry).resolves.toBeTruthy();
   });
@@ -497,9 +501,9 @@ describe("resolveProxy", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("rejects an in-project symlink whose target escapes the project", async () => {
+  it("proxies an external target reached through an in-project symlink", async () => {
     const { spawn, calls } = createSpawnSpy();
-    const { resolveProxy, ProxySourceOutsideProjectError } = await loadModule(spawn, FFMPEG_PATH);
+    const { resolveProxy, getProxyCachePath } = await loadModule(spawn, FFMPEG_PATH);
     const projectDir = tmpProject();
     const outsideDir = tmpProject();
     const outsidePath = join(outsideDir, "outside.mov");
@@ -507,10 +511,15 @@ describe("resolveProxy", () => {
     writeFileSync(outsidePath, "source-bytes");
     symlinkSync(outsidePath, sourcePath);
 
-    await expect(resolveProxy(projectDir, sourcePath)).rejects.toBeInstanceOf(
-      ProxySourceOutsideProjectError,
-    );
-    expect(calls).toHaveLength(0);
+    const cachePath = getProxyCachePath(projectDir, sourcePath);
+    const result = resolveProxy(projectDir, sourcePath);
+    await flush();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args).toContain(realpathSync(outsidePath));
+    succeed(calls[0]!);
+    await expect(result).resolves.toBe(cachePath);
+    expect(cachePath.startsWith(join(realpathSync(projectDir), ".transcode-cache"))).toBe(true);
   });
 
   it("retries after the source file changes (mtime in the cache key invalidates the remembered failure)", async () => {

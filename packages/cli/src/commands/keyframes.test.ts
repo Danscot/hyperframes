@@ -1,10 +1,24 @@
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import type { ArgsDef } from "citty";
 import { ensureDOMParser } from "../utils/dom.js";
+import keyframesCommand from "./keyframes.js";
 import { collectShotSelectors, resolveScope, surfaceComposition } from "./keyframes.js";
 import { ensureShotOutputDir } from "./motionShot.js";
+
+// citty types `args` as Resolvable<ArgsDef> (object | promise | thunk); this
+// command always uses a static object, same narrowing as assertKnownFlags.
+function layoutArgDescription(): string {
+  const rawDef = keyframesCommand.args;
+  const args = rawDef && typeof rawDef === "object" ? (rawDef as ArgsDef) : undefined;
+  const layout = args?.["layout"];
+  if (!layout || typeof layout !== "object" || !("description" in layout)) {
+    throw new Error("expected keyframesCommand.args.layout.description to be defined");
+  }
+  return String(layout.description);
+}
 
 beforeAll(() => ensureDOMParser());
 
@@ -28,6 +42,29 @@ describe("keyframes direct composition scope", () => {
 });
 
 describe("keyframes shot output", () => {
+  it("rejects an output path that would overwrite the composition source", () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-keyframes-shot-source-"));
+    const sourcePath = join(projectDir, "index.html");
+    writeFileSync(sourcePath, wrap(""));
+
+    expect(() => ensureShotOutputDir(sourcePath, sourcePath)).toThrow(
+      /must not overwrite the composition source/,
+    );
+    expect(readFileSync(sourcePath, "utf8")).toBe(wrap(""));
+  });
+
+  it("rejects an existing output alias that refers to the composition source", () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-keyframes-shot-alias-"));
+    const sourcePath = join(projectDir, "index.html");
+    const aliasPath = join(projectDir, "shot.png");
+    writeFileSync(sourcePath, wrap(""));
+    linkSync(sourcePath, aliasPath);
+
+    expect(() => ensureShotOutputDir(aliasPath, sourcePath)).toThrow(
+      /must not overwrite the composition source/,
+    );
+  });
+
   it("creates a missing parent directory before writing --shot", () => {
     const projectDir = mkdtempSync(join(tmpdir(), "hf-keyframes-shot-dir-"));
     const outputDir = join(projectDir, "nested", "proofs");
@@ -169,6 +206,20 @@ describe("keyframes runtime surfacing", () => {
 
     expect(selectors).toEqual(expect.arrayContaining([".dot", ".chip"]));
   });
+
+  it("does not forward unresolved static targets as concrete shot selectors", () => {
+    const html = wrap(`
+      const tl = gsap.timeline({ paused: true });
+      tl.to(runtimeOnlyTarget(), { x: 240, duration: 1 });
+      tl.to("#drag", { x: 240, duration: 1 });
+    `);
+
+    const selectors = collectShotSelectors([
+      surfaceComposition(html, "helper.html", "helper.html"),
+    ]).map((item) => item.selector);
+
+    expect(selectors).toEqual(["#drag"]);
+  });
 });
 
 describe("keyframes template-wrapped sub-compositions", () => {
@@ -280,5 +331,26 @@ describe("keyframes template-wrapped sub-compositions", () => {
     </script></body></html>`;
     const { tweens } = surfaceComposition(topLevel, "index.html", "index.html");
     expect(tweens.length).toBeGreaterThan(0);
+  });
+});
+
+// PRINFRA-667: `--layout strip` only does a real per-time pixel capture when
+// the sampled selector is an SVG element (see motionShot.ts's stripTargetsSvg
+// gate); every other selector -- including every nested sub-composition host,
+// always a <div data-composition-src> -- silently falls back to one live
+// frame plus vector position markers. The old help text's unqualified
+// "filmstrip by time" promised the former for the latter case. This guards
+// against reintroducing that over-promise without a matching capability.
+describe("--layout strip help text", () => {
+  it("does not promise a universal per-time filmstrip", () => {
+    expect(layoutArgDescription()).not.toMatch(
+      /^--shot layout: 'path'.*or 'strip' \(filmstrip by time/,
+    );
+  });
+
+  it("discloses the SVG-only condition for a real per-time capture", () => {
+    const description = layoutArgDescription();
+    expect(description).toContain("SVG");
+    expect(description.toLowerCase()).toContain("only when");
   });
 });

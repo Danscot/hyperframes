@@ -64,6 +64,40 @@ asset (it records provenance and auto-promotes to the global cache).
 > `--from`. Add a thin `process` verb only if agents repeatedly fumble these
 > recipes.
 
+## Exact error-diffusion dither
+
+Use the local processor when the requested look specifically calls for
+Floyd-Steinberg, Atkinson/Macintosh, Jarvis-Judice-Ninke, Stucki, Burkes, or a
+Sierra variant. These are sequential error-diffusion algorithms, not the
+realtime Bayer `effects.dither` shader.
+
+```bash
+node <SKILL_DIR>/scripts/dither.mjs \
+  --input source.mp4 \
+  --out source.atkinson.mp4 \
+  --algorithm atkinson \
+  --palette '#0f380f,#306230,#8bac0f,#9bbc0f' \
+  --point-size 3
+
+node <SKILL_DIR>/scripts/resolve.mjs \
+  --from source.atkinson.mp4 --type video --project .
+```
+
+Available algorithms: `floyd-steinberg`, `atkinson`,
+`jarvis-judice-ninke`, `stucki`, `burkes`, `sierra`, `sierra-lite`, and
+`two-row-sierra`. The default is balanced Floyd-Steinberg with a black/white
+palette. Palettes contain 2-6 `#rrggbb` colors in authored dark-to-light order;
+reversing the order intentionally inverts the mapping. `--point-size` controls
+1-20px blocks; `--brightness` and `--contrast` accept 0.5-2; `--detail` accepts
+0.1-1.
+
+The processor supports ordinary SDR images and MP4 video, preserves video
+audio, and emits BT.709 MP4. It rejects tagged PQ/HLG input rather than silently
+tone-mapping it. To animate the transformation, keep the original and processed
+files as two real media layers and use the seek-safe GSAP timeline to reveal or
+crossfade between them. Use the realtime Bayer shader instead when the dither
+amount itself must animate continuously.
+
 ## Transcription (default: Parakeet, better than whisper.cpp)
 
 `transcribe.mjs` is the default local transcription path. It runs **NVIDIA
@@ -111,9 +145,10 @@ Use `--plan` first when you want to inspect the kept segment JSON before encodin
 
 ## Ducking (declare in-composition / bake for export)
 
-B1, declare ducking in the composition. `audio-duck.mjs` emits GSAP volume
-keyframes. Paste them into the composition timeline, the source file stays
-untouched.
+B1, declare ducking in the composition. `audio-duck.mjs` emits a volume lane
+as a `data-automation` attribute. Add it to the background `<audio>` element;
+the source file stays untouched. Lane times are clip-local, so pass
+`--composition` to let the script subtract the element's `data-start`.
 
 ```bash
 node <SKILL_DIR>/scripts/audio-duck.mjs \
@@ -122,10 +157,9 @@ node <SKILL_DIR>/scripts/audio-duck.mjs \
   --composition index.html
 ```
 
-```js
-// auto-duck: #bgm under narration (generated; base volume 0.6)
-tl.to("#bgm", { volume: 0.15, duration: 0.15 }, 3.42);
-tl.to("#bgm", { volume: 0.6, duration: 0.4 }, 9.87);
+```html
+<!-- auto-duck: #bgm under narration; add to its <audio> element -->
+data-automation='{"version":1,"lanes":[{"target":"volume","points":[{"t":0,"v":0.6},{"t":3.42,"v":0.6},{"t":3.57,"v":0.15},{"t":9.87,"v":0.15},{"t":10.27,"v":0.6}]}]}'
 ```
 
 B2, bake ducking only for exported or standalone files.
@@ -280,3 +314,12 @@ reuse across many scripts, create a reusable **Photo Avatar** once instead
 (`heygen avatar create`). Ledger the result with
 `resolve --from <downloaded.mp4> --type video`. Docs:
 <https://developers.heygen.com/image-to-video>.
+
+## HEVC / H.265 sources
+
+HEVC/H.265 sources need no conversion for **render** (FFmpeg pre-decodes all
+input video) or for **preview** (auto-proxy transcodes and caches an H.264
+copy on first use, disable with `--no-proxy` or `media.autoProxy: false` in
+hyperframes.json). A manual H.264 proxy via `ffmpeg -i in.mp4 -c:v libx264
+-crf 18 proxy.mp4`, registered with `resolve --from`, remains available for
+edge cases (e.g. auto-proxy disabled, or ffmpeg unavailable at preview time).

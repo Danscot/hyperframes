@@ -1,6 +1,7 @@
-import { useState, useCallback, useRef, useEffect, memo } from "react";
+import { useState, useCallback, useEffect, useId, useRef, memo } from "react";
 import { formatTime, frameToSeconds } from "../lib/time";
 import { Tooltip } from "../../components/ui";
+import { useContextMenuDismiss } from "../../hooks/useContextMenuDismiss";
 
 const SHORTCUT_SECTIONS = [
   {
@@ -18,7 +19,7 @@ const SHORTCUT_SECTIONS = [
     ],
   },
   {
-    title: "Keyframes",
+    title: "Keyframes (when an element is selected)",
     hints: [
       { key: "K", label: "Add keyframe at playhead" },
       { key: "Del", label: "Delete selected keyframe" },
@@ -36,9 +37,10 @@ const SHORTCUT_SECTIONS = [
       { key: "⌘V", label: "Paste element" },
       { key: "⌘X", label: "Cut element" },
       { key: "S", label: "Split clip at playhead" },
+      { key: "⇧Click", label: "Razor tool: split all tracks" },
       { key: "⌘G", label: "Group elements" },
       { key: "⌘⇧G", label: "Ungroup" },
-      { key: "Del", label: "Delete selected element" },
+      { key: "Del", label: "Delete selected element (no keyframe selected)" },
     ],
   },
   {
@@ -108,18 +110,21 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
 }: ShortcutsPanelProps) {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [jumpFrame, setJumpFrame] = useState("");
-  const shortcutsPanelRef = useRef<HTMLDivElement>(null);
+  const shortcutsPanelId = useId();
+  const closeShortcuts = useCallback(() => setShowShortcuts(false), []);
+  const shortcutsPanelRef = useContextMenuDismiss(closeShortcuts);
+  const panelBodyRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
+  // Move focus into the panel on open so keyboard users can scroll and read
+  // it; hand focus back to the trigger on close.
+  // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     if (!showShortcuts) return;
-    const handleMouseDown = (e: MouseEvent) => {
-      if (shortcutsPanelRef.current && !shortcutsPanelRef.current.contains(e.target as Node)) {
-        setShowShortcuts(false);
-      }
-    };
-    document.addEventListener("mousedown", handleMouseDown);
+    const trigger = triggerRef.current;
+    panelBodyRef.current?.focus();
     return () => {
-      document.removeEventListener("mousedown", handleMouseDown);
+      trigger?.focus();
     };
   }, [showShortcuts]);
 
@@ -148,18 +153,18 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
   );
 
   return (
-    <div ref={shortcutsPanelRef} className="relative flex-shrink-0">
+    <div ref={shortcutsPanelRef} className="relative shrink-0">
       <Tooltip label="Shortcuts and tools">
         <button
+          ref={triggerRef}
           type="button"
           onClick={() => setShowShortcuts((v) => !v)}
-          className={`w-6 h-6 flex items-center justify-center rounded border transition-colors ${
-            showShortcuts
-              ? "border-neutral-600 text-neutral-200 bg-neutral-800"
-              : "border-neutral-800 text-neutral-600 hover:text-neutral-300 hover:border-neutral-600"
+          className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+            showShortcuts ? "text-neutral-200" : "text-neutral-600 hover:text-neutral-300"
           }`}
           aria-label="Shortcuts and tools"
           aria-expanded={showShortcuts}
+          aria-controls={shortcutsPanelId}
         >
           <svg
             width="11"
@@ -179,7 +184,15 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
       </Tooltip>
       {showShortcuts && (
         <div
-          className="absolute bottom-full right-0 mb-2 z-50 rounded-lg shadow-xl min-w-[220px] overflow-y-auto"
+          id={shortcutsPanelId}
+          ref={panelBodyRef}
+          tabIndex={-1}
+          role="dialog"
+          aria-label="Keyboard shortcuts and tools"
+          // Deliberately NOT aria-modal. This is a non-modal disclosure: focus is
+          // not trapped and the rest of the editor stays operable, so claiming
+          // modality would make assistive tech treat the whole app as inert.
+          className="absolute bottom-full right-0 mb-2 z-50 rounded-lg shadow-xl min-w-[220px] overflow-y-auto outline-hidden"
           style={{
             background: "#161618",
             border: "1px solid rgba(255,255,255,0.08)",
@@ -199,7 +212,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                 pattern="[0-9]*"
                 aria-label="Jump to frame"
                 placeholder="frame number"
-                className="h-6 flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 text-[10px] font-mono tabular-nums text-neutral-200 outline-none transition-colors placeholder:text-neutral-600 focus:border-studio-accent/60"
+                className="h-6 flex-1 rounded-sm border border-neutral-700 bg-neutral-900 px-2 text-[10px] font-mono tabular-nums text-neutral-200 outline-hidden transition-colors placeholder:text-neutral-600 focus:border-studio-accent/60"
                 onKeyDown={handleJumpKeyDown}
                 onBlur={commitJumpFrame}
               />
@@ -207,7 +220,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                 <button
                   type="submit"
                   disabled={disabled}
-                  className="h-6 px-2 rounded border border-neutral-700 text-[10px] text-neutral-300 transition-colors hover:border-neutral-500 hover:bg-neutral-800 disabled:opacity-40"
+                  className="h-6 px-2 rounded-sm border border-neutral-700 text-[10px] text-neutral-300 transition-colors hover:border-neutral-500 hover:bg-neutral-800 disabled:opacity-40"
                 >
                   Go
                 </button>
@@ -223,7 +236,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span
-                    className="font-mono text-[10px] rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 min-w-[20px] text-center"
+                    className="font-mono text-[10px] rounded-sm border border-neutral-700 px-1.5 py-0.5 text-neutral-300 min-w-[20px] text-center"
                     style={{ background: "rgba(255,255,255,0.05)" }}
                   >
                     I
@@ -240,7 +253,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                         <button
                           type="button"
                           onClick={() => setInPoint(null)}
-                          className="w-4 h-4 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-200 transition-colors"
+                          className="w-4 h-4 flex items-center justify-center rounded-sm text-neutral-500 hover:text-neutral-200 transition-colors"
                           aria-label="Clear in-point"
                         >
                           <svg
@@ -264,7 +277,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span
-                    className="font-mono text-[10px] rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 min-w-[20px] text-center"
+                    className="font-mono text-[10px] rounded-sm border border-neutral-700 px-1.5 py-0.5 text-neutral-300 min-w-[20px] text-center"
                     style={{ background: "rgba(255,255,255,0.05)" }}
                   >
                     O
@@ -281,7 +294,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                         <button
                           type="button"
                           onClick={() => setOutPoint(null)}
-                          className="w-4 h-4 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-200 transition-colors"
+                          className="w-4 h-4 flex items-center justify-center rounded-sm text-neutral-500 hover:text-neutral-200 transition-colors"
                           aria-label="Clear out-point"
                         >
                           <svg
@@ -315,7 +328,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                   {section.hints.map((hint) => (
                     <div key={hint.key} className="flex items-center gap-3">
                       <span
-                        className="font-mono text-[10px] rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 min-w-[36px] text-center"
+                        className="font-mono text-[10px] rounded-sm border border-neutral-700 px-1.5 py-0.5 text-neutral-300 min-w-[36px] text-center"
                         style={{ background: "rgba(255,255,255,0.05)" }}
                       >
                         {hint.key}

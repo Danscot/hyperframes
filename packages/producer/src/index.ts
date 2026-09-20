@@ -108,13 +108,20 @@ export {
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 export { normalizeErrorMessage } from "./utils/errorMessage.js";
+export { collectRenderMedia, type RenderMedia } from "./services/renderMediaCollector.js";
 // Font localization: fetch + embed @font-face rules for requested families
 // (including those declared only via a remote <link>) so a bundled composition
 // renders with the real font instead of a fallback, regardless of network
 // timing. The render pipeline runs this in its compile stage; the CLI audit
 // paths (snapshot/check) reuse it so their captures match the render.
 export {
+  FONT_FETCH_FAILED,
+  FONT_FETCH_UNAVAILABLE,
+  FontFetchError,
+  FontFetchUnavailableError,
   injectDeterministicFontFaces,
+  type FontFetchErrorCode,
+  type FontFetchRetryPolicy,
   type InjectDeterministicFontFacesOptions,
 } from "./services/deterministicFonts.js";
 export { quantizeTimeToFrame } from "./utils/parityContract.js";
@@ -133,10 +140,58 @@ export {
 // separate subpath import.
 export {
   assemble,
+  assembleV2,
+  CURRENT_PLAN_PROTOCOL,
+  DISTRIBUTED_RENDER_CAPABILITIES,
+  getDistributedRenderCapabilities,
+  PLAN_ARTIFACT_LAYOUT,
+  PLAN_HASH_SCHEMA,
+  PLAN_PROTOCOL_V1,
+  PLAN_PROTOCOL_V2,
+  PLAN_PROTOCOL_UNSUPPORTED,
+  PLAN_SCHEMA_VERSION,
+  PLAN_V2_ARTIFACT_LAYOUT,
+  PLAN_V2_HASH_SCHEMA,
+  PLAN_V2_INTEGRITY_UNRECOVERABLE,
+  PLAN_V2_MATERIALIZATION_MARKER,
+  PLAN_V2_SCHEMA_VERSION,
+  createPlanV2FromExecutionPlan,
+  createPlanV2FromV1,
+  getPlanV2ExecutionPlanHash,
+  listPlanV2ArtifactsForTarget,
+  materializePlanV2Target,
   plan,
+  planV2,
+  planV2WithPublisher,
+  PlanV2IntegrityError,
+  PlanProtocolUnsupportedError,
+  readPlanProtocol,
+  readPlanProtocolV1,
+  readPlanV2Manifest,
+  publishPlanV2FromExecutionPlan,
+  publishPlanV2FromV1,
   renderChunk,
+  renderChunkV2,
+  validatePlanV2MaterializedTarget,
   type AssembleResult,
+  type ChunkRenderer,
   type ChunkResult,
+  type EffectiveChunkResult,
+  type DistributedRenderCapabilities,
   type DistributedRenderConfig,
+  type PlanProtocolConsumerCapabilities,
+  type PlanProtocolDescriptor,
+  type PlanProtocolV1Descriptor,
+  type PlanProtocolV2Descriptor,
   type PlanResult,
+  type PlanV2Artifact,
+  type PlanV2Limitations,
+  type PlanV2Manifest,
+  type PlanV2MaterializationResult,
+  type PlanV2MaterializationTarget,
+  type PlanV2Result,
+  type PlanV2WithPublisherOptions,
+  type PlanV2ArtifactPublisher,
+  type PlanV2PublishBlob,
+  type SupportedPlanProtocolDescriptor,
 } from "./distributed.js";

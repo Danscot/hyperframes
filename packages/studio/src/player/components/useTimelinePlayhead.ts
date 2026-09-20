@@ -1,15 +1,16 @@
 import { useRef, useCallback, useEffect, useLayoutEffect } from "react";
-import { liveTime, type ZoomMode } from "../store/playerStore";
+import { liveTime, usePlayerStore, type ZoomMode } from "../store/playerStore";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { getPinchTimelineZoomPercent } from "./timelineZoom";
 import {
-  GUTTER,
-  TRACKS_LEFT_PAD,
+  getTimelinePlaybackFollowScrollLeft,
   getTimelinePlayheadLeft,
+  getTimelineScrubTime,
   getTimelineScrollLeftForZoomTransition,
   getTimelineScrollLeftForZoomAnchor,
   shouldAutoScrollTimeline,
 } from "./timelineLayout";
+import { applyTimelineHorizontalAutoScrollStep } from "./timelineEditing";
 
 interface UseTimelinePlayheadInput {
   playheadRef: React.RefObject<HTMLDivElement | null>;
@@ -31,6 +32,7 @@ interface UseTimelinePlayheadInput {
   setZoomMode: (mode: ZoomMode) => void;
   setManualZoomPercent: (percent: number) => void;
   onSeek?: (time: number) => void;
+  contentOrigin: number;
 }
 
 export function useTimelinePlayhead({
@@ -52,6 +54,7 @@ export function useTimelinePlayhead({
   setZoomMode,
   setManualZoomPercent,
   onSeek,
+  contentOrigin,
 }: UseTimelinePlayheadInput) {
   const dragScrollRaf = useRef(0);
   const previousZoomModeRef = useRef<ZoomMode | null>(zoomMode);
@@ -60,6 +63,8 @@ export function useTimelinePlayhead({
   // anchors at the cursor instead, so it opts out via `skipCenterAnchorRef`.
   const previousAnchorPpsRef = useRef(pps);
   const skipCenterAnchorRef = useRef(false);
+  const contentOriginRef = useRef(contentOrigin);
+  contentOriginRef.current = contentOrigin;
 
   useLayoutEffect(() => {
     const scroll = scrollRef.current;
@@ -74,21 +79,21 @@ export function useTimelinePlayhead({
     const nextScrollLeft = getTimelineScrollLeftForZoomAnchor({
       pointerX: scroll.clientWidth / 2,
       currentScrollLeft: scroll.scrollLeft,
-      gutter: GUTTER + TRACKS_LEFT_PAD,
+      contentOrigin,
       currentPixelsPerSecond: prevPps,
       nextPixelsPerSecond: pps,
       duration: durationRef.current,
     });
     const maxScrollLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
     scroll.scrollLeft = Math.max(0, Math.min(maxScrollLeft, nextScrollLeft));
-  }, [pps, scrollRef, durationRef]);
+  }, [pps, scrollRef, durationRef, contentOrigin]);
 
   const syncPlayheadPosition = useCallback(
     (time: number) => {
       if (!playheadRef.current || durationRef.current <= 0) return;
-      playheadRef.current.style.left = `${getTimelinePlayheadLeft(time, ppsRef.current)}px`;
+      playheadRef.current.style.left = `${getTimelinePlayheadLeft(time, ppsRef.current, contentOrigin)}px`;
     },
-    [playheadRef, durationRef, ppsRef],
+    [playheadRef, durationRef, ppsRef, contentOrigin],
   );
 
   useEffect(() => {
@@ -118,9 +123,31 @@ export function useTimelinePlayhead({
   useMountEffect(() => {
     const unsub = liveTime.subscribe((t) => {
       if (!playheadRef.current || durationRef.current <= 0) return;
-      // Playback deliberately does NOT scroll the viewport to chase the playhead —
-      // the user's scroll position is theirs; the playhead may run off-screen.
-      playheadRef.current.style.left = `${getTimelinePlayheadLeft(t, ppsRef.current)}px`;
+      const playheadX = contentOriginRef.current + Math.max(0, t) * ppsRef.current;
+      playheadRef.current.style.left = `${getTimelinePlayheadLeft(
+        t,
+        ppsRef.current,
+        contentOriginRef.current,
+      )}px`;
+      const scroll = scrollRef.current;
+      if (
+        !scroll ||
+        !usePlayerStore.getState().isPlaying ||
+        isDragging.current ||
+        zoomModeRef.current === "fit"
+      ) {
+        return;
+      }
+      const nextScrollLeft = getTimelinePlaybackFollowScrollLeft({
+        playheadX,
+        currentScrollLeft: scroll.scrollLeft,
+        viewportWidth: scroll.clientWidth,
+        contentOrigin: contentOriginRef.current,
+        maxScrollLeft: scroll.scrollWidth - scroll.clientWidth,
+      });
+      if (Math.abs(nextScrollLeft - scroll.scrollLeft) >= 0.5) {
+        scroll.scrollLeft = nextScrollLeft;
+      }
     });
     return unsub;
   });
@@ -130,13 +157,18 @@ export function useTimelinePlayhead({
       const el = scrollRef.current;
       if (!el || effectiveDuration <= 0) return;
       const rect = el.getBoundingClientRect();
-      const x = clientX - rect.left + el.scrollLeft - GUTTER - TRACKS_LEFT_PAD;
-      if (x < 0) return;
-      const time = Math.max(0, Math.min(effectiveDuration, x / pps));
+      const time = getTimelineScrubTime({
+        clientX,
+        viewportLeft: rect.left,
+        scrollLeft: el.scrollLeft,
+        contentOrigin,
+        pixelsPerSecond: pps,
+        duration: effectiveDuration,
+      });
       liveTime.notify(time);
       onSeek?.(time);
     },
-    [scrollRef, effectiveDuration, pps, onSeek],
+    [scrollRef, effectiveDuration, pps, onSeek, contentOrigin],
   );
 
   const autoScrollDuringDrag = useCallback(
@@ -149,16 +181,7 @@ export function useTimelinePlayhead({
         !shouldAutoScrollTimeline(zoomModeRef.current, el.scrollWidth, el.clientWidth)
       )
         return;
-      const rect = el.getBoundingClientRect();
-      const edgeZone = 40;
-      const maxSpeed = 12;
-      let scrollDelta = 0;
-      if (clientX < rect.left + edgeZone)
-        scrollDelta = -maxSpeed * Math.max(0, 1 - (clientX - rect.left) / edgeZone);
-      else if (clientX > rect.right - edgeZone)
-        scrollDelta = maxSpeed * Math.max(0, 1 - (rect.right - clientX) / edgeZone);
-      if (scrollDelta !== 0) {
-        el.scrollLeft += scrollDelta;
+      if (applyTimelineHorizontalAutoScrollStep(el, clientX)) {
         seekFromX(clientX);
         dragScrollRaf.current = requestAnimationFrame(() => autoScrollDuringDrag(clientX));
       }
@@ -179,6 +202,7 @@ export function useTimelinePlayhead({
         e.deltaY,
         zoomModeRef.current,
         manualZoomPercentRef.current,
+        fitPpsRef.current,
       );
       if (nextZoomPercent === manualZoomPercentRef.current && zoomModeRef.current === "manual")
         return;
@@ -186,7 +210,7 @@ export function useTimelinePlayhead({
       const nextScrollLeft = getTimelineScrollLeftForZoomAnchor({
         pointerX: e.clientX - rect.left,
         currentScrollLeft: scroll.scrollLeft,
-        gutter: GUTTER + TRACKS_LEFT_PAD,
+        contentOrigin,
         currentPixelsPerSecond: ppsRef.current,
         nextPixelsPerSecond: nextPps,
         duration: durationRef.current,
@@ -209,6 +233,7 @@ export function useTimelinePlayhead({
       manualZoomPercentRef,
       setManualZoomPercent,
       setZoomMode,
+      contentOrigin,
     ],
   );
 

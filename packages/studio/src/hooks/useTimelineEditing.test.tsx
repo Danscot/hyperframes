@@ -1,6 +1,7 @@
+// fallow-ignore-file code-duplication
 // @vitest-environment happy-dom
 
-import React, { act, useRef } from "react";
+import React, { act, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { openComposition } from "@hyperframes/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,17 @@ import { usePlayerStore, type TimelineElement } from "../player";
 import { jsonResponse, requestUrl } from "./fetchStubTestUtils";
 import { useElementLifecycleOps } from "./useElementLifecycleOps";
 import { useTimelineEditing } from "./useTimelineEditing";
+
+vi.mock("../components/editor/manualEditingAvailability", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../components/editor/manualEditingAvailability")>();
+  return {
+    ...actual,
+    STUDIO_SDK_CUTOVER_ENABLED: true,
+    STUDIO_SDK_CUTOVER_FAMILIES: new Set(["timing"]),
+    STUDIO_SDK_RESOLVER_SHADOW_ENABLED: false,
+  };
+});
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -74,7 +86,6 @@ function timelineElement(input: {
     parentCompositionId: null,
     compositionAncestors: ["root"],
     sourceFile: input.sourceFile ?? "index.html",
-    timingSource: "authored",
   };
 }
 
@@ -107,14 +118,20 @@ function renderTimelineEditingHook(input: {
   }) => Promise<void>;
   reloadPreview?: () => void;
   sdkSession?: Awaited<ReturnType<typeof openComposition>> | null;
+  publishSdkSession?: NonNullable<Parameters<typeof useTimelineEditing>[0]["publishSdkSession"]>;
   forceReloadSdkSession?: () => void;
+  invalidateGsapCache?: () => void;
   showToast?: (message: string, kind?: string) => void;
+  canEdit?: NonNullable<Parameters<typeof useTimelineEditing>[0]["canEdit"]>;
 }): {
   move: ReturnType<typeof useTimelineEditing>["handleTimelineElementMove"];
   resize: ReturnType<typeof useTimelineEditing>["handleTimelineElementResize"];
   groupMove: ReturnType<typeof useTimelineEditing>["handleTimelineGroupMove"];
   groupResize: ReturnType<typeof useTimelineEditing>["handleTimelineGroupResize"];
   del: ReturnType<typeof useTimelineEditing>["handleTimelineElementDelete"];
+  elementsDelete: ReturnType<typeof useTimelineEditing>["handleTimelineElementsDelete"];
+  handleAutoGroupCarveSources: ReturnType<typeof useTimelineEditing>["handleAutoGroupCarveSources"];
+  setAudioGroupAttribute: ReturnType<typeof useTimelineEditing>["setAudioGroupAttribute"];
   unmount: () => void;
 } {
   let move: ReturnType<typeof useTimelineEditing>["handleTimelineElementMove"] | null = null;
@@ -122,6 +139,14 @@ function renderTimelineEditingHook(input: {
   let groupMove: ReturnType<typeof useTimelineEditing>["handleTimelineGroupMove"] | null = null;
   let groupResize: ReturnType<typeof useTimelineEditing>["handleTimelineGroupResize"] | null = null;
   let del: ReturnType<typeof useTimelineEditing>["handleTimelineElementDelete"] | null = null;
+  let elementsDelete: ReturnType<typeof useTimelineEditing>["handleTimelineElementsDelete"] | null =
+    null;
+  let handleAutoGroupCarveSources:
+    | ReturnType<typeof useTimelineEditing>["handleAutoGroupCarveSources"]
+    | null = null;
+  let setAudioGroupAttribute:
+    | ReturnType<typeof useTimelineEditing>["setAudioGroupAttribute"]
+    | null = null;
 
   function Harness() {
     const commitRef = useRef(input.onZIndexCommit);
@@ -133,20 +158,25 @@ function renderTimelineEditingHook(input: {
       showToast: input.showToast ?? vi.fn(),
       writeProjectFile: input.writeProjectFile ?? vi.fn(),
       recordEdit: input.recordEdit ?? vi.fn(),
-      domEditSaveTimestampRef: { current: 0 },
       reloadPreview: input.reloadPreview ?? vi.fn(),
       previewIframeRef: { current: input.iframe },
       pendingTimelineEditPathRef: { current: new Set<string>() },
       uploadProjectFiles: vi.fn(),
       sdkSession: input.sdkSession,
+      publishSdkSession: input.publishSdkSession,
       forceReloadSdkSession: input.forceReloadSdkSession,
+      invalidateGsapCache: input.invalidateGsapCache,
       handleDomZIndexReorderCommitRef: commitRef,
+      canEdit: input.canEdit,
     });
     move = hook.handleTimelineElementMove;
     resize = hook.handleTimelineElementResize;
     groupMove = hook.handleTimelineGroupMove;
     groupResize = hook.handleTimelineGroupResize;
     del = hook.handleTimelineElementDelete;
+    elementsDelete = hook.handleTimelineElementsDelete;
+    handleAutoGroupCarveSources = hook.handleAutoGroupCarveSources;
+    setAudioGroupAttribute = hook.setAudioGroupAttribute;
     return null;
   }
 
@@ -156,11 +186,27 @@ function renderTimelineEditingHook(input: {
   if (!groupMove) throw new Error("Expected hook to expose group move handler");
   if (!groupResize) throw new Error("Expected hook to expose group resize handler");
   if (!del) throw new Error("Expected hook to expose delete handler");
-  return { move, resize, groupMove, groupResize, del, unmount };
+  if (!elementsDelete) throw new Error("Expected hook to expose elements-delete handler");
+  if (!handleAutoGroupCarveSources) throw new Error("Expected hook to expose group handler");
+  if (!setAudioGroupAttribute) throw new Error("Expected hook to expose audio group handler");
+  return {
+    move,
+    resize,
+    groupMove,
+    groupResize,
+    del,
+    elementsDelete,
+    handleAutoGroupCarveSources,
+    setAudioGroupAttribute,
+    unmount,
+  };
 }
 
 type TimelineRecordEdit = NonNullable<
   Parameters<typeof renderTimelineEditingHook>[0]["recordEdit"]
+>;
+type TimelinePublishSdkSession = NonNullable<
+  Parameters<typeof renderTimelineEditingHook>[0]["publishSdkSession"]
 >;
 
 function renderTimelineEditingHookWithLifecycle(input: {
@@ -182,7 +228,6 @@ function renderTimelineEditingHookWithLifecycle(input: {
       activeCompPath: "index.html",
       showToast: vi.fn(),
       writeProjectFile: vi.fn(),
-      domEditSaveTimestampRef: { current: 0 },
       editHistory: { recordEdit: vi.fn() },
       projectIdRef: { current: "p1" },
       reloadPreview: vi.fn(),
@@ -198,7 +243,6 @@ function renderTimelineEditingHookWithLifecycle(input: {
       showToast: vi.fn(),
       writeProjectFile: vi.fn(),
       recordEdit: vi.fn(),
-      domEditSaveTimestampRef: { current: 0 },
       reloadPreview: vi.fn(),
       previewIframeRef: { current: input.iframe },
       pendingTimelineEditPathRef: { current: new Set<string>() },
@@ -226,28 +270,41 @@ async function flushAsyncWork(): Promise<void> {
  * with `gsapBody`. Returns the mock for call inspection.
  */
 function stubProjectFetch(files: string | Record<string, string>, gsapBody?: unknown) {
-  // Keep this test server's capability, file-read, and mutation routes together;
-  // splitting the fixture would obscure the request sequence asserted by callers.
-  // fallow-ignore-next-line complexity
-  const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-    const url = requestUrl(input);
-    if (url.includes("/api/projects/p1/gsap-mutation-capabilities")) {
-      return jsonResponse({ atomicOwnershipPairs: true });
-    }
-    if (url.includes("/api/projects/p1/files/")) {
-      if (typeof files === "string") return jsonResponse({ content: files });
-      const path = decodeURIComponent(url.split("/files/")[1] ?? "index.html");
-      return jsonResponse({ content: files[path] });
-    }
-    if (url.includes("/api/projects/p1/gsap-mutations/")) {
-      const path = decodeURIComponent(url.split("/gsap-mutations/")[1] ?? "index.html");
-      const content = typeof files === "string" ? files : (files[path] ?? "");
-      return jsonResponse(
-        gsapBody ?? { mutated: false, scriptText: null, before: content, after: content },
-      );
-    }
-    throw new Error(`Unexpected fetch: ${url}`);
-  });
+  const pathAfter = (url: string, marker: string) =>
+    decodeURIComponent(url.split(marker)[1] ?? "index.html");
+  const fileContent = (path: string) => (typeof files === "string" ? files : files[path]);
+  // One handler per route, so the mock itself stays a lookup: the request
+  // sequence callers assert on is still readable top to bottom.
+  const routes: Array<[marker: string, respond: (url: string) => Response]> = [
+    [
+      "/api/projects/p1/gsap-mutation-capabilities",
+      () => jsonResponse({ atomicOwnershipPairs: true }),
+    ],
+    [
+      "/api/projects/p1/files/",
+      (url) => jsonResponse({ content: fileContent(pathAfter(url, "/files/")) }),
+    ],
+    [
+      "/api/projects/p1/gsap-mutations/",
+      (url) => {
+        const content = fileContent(pathAfter(url, "/gsap-mutations/")) ?? "";
+        return jsonResponse(
+          gsapBody ?? { mutated: false, scriptText: null, before: content, after: content },
+        );
+      },
+    ],
+  ];
+  const fetchMock = vi.fn(
+    async (
+      input: Parameters<typeof fetch>[0],
+      _init?: Parameters<typeof fetch>[1],
+    ): Promise<Response> => {
+      const url = requestUrl(input);
+      const route = routes.find(([marker]) => url.includes(marker));
+      if (!route) throw new Error(`Unexpected fetch: ${url}`);
+      return route[1](url);
+    },
+  );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
@@ -261,6 +318,7 @@ function setupSingleClipHarness(options?: {
   source?: string;
   clipStyle?: string;
   onZIndexCommit?: (entries: ZIndexEntry[]) => Promise<void>;
+  canEdit?: NonNullable<Parameters<typeof useTimelineEditing>[0]["canEdit"]>;
 }) {
   const iframe = createPreviewIframe([{ id: "clip", track: 0, style: options?.clipStyle }]);
   const clip = timelineElement({ id: "clip", track: 0, zIndex: 0 });
@@ -272,16 +330,63 @@ function setupSingleClipHarness(options?: {
   const fetchMock = stubProjectFetch(
     options?.source ?? '<div id="clip" data-start="0" data-track-index="0"></div>',
   );
+  const recordEdit = vi.fn(async () => {});
+  const showToast = vi.fn();
   const hook = renderTimelineEditingHook({
     timelineElements: [clip],
     iframe,
     onZIndexCommit: commit,
     projectId: "p1",
     writeProjectFile,
-    recordEdit: vi.fn(async () => {}),
+    recordEdit,
     reloadPreview,
+    showToast,
+    canEdit: options?.canEdit,
   });
-  return { iframe, clip, commit, writeProjectFile, reloadPreview, fetchMock, ...hook };
+  return {
+    iframe,
+    clip,
+    commit,
+    writeProjectFile,
+    recordEdit,
+    showToast,
+    reloadPreview,
+    fetchMock,
+    ...hook,
+  };
+}
+
+const SDK_KEYFRAMED_SOURCE = [
+  `<div data-hf-id="hf-stage" data-hf-root data-composition-id="main" data-duration="10">`,
+  `  <div id="clip" data-hf-id="hf-clip" data-start="1" data-duration="2"></div>`,
+  `</div>`,
+  `<script>`,
+  `const tl = gsap.timeline({ paused: true });`,
+  `tl.to("#clip", { keyframes: [{ x: 0 }, { x: 100 }], duration: 2 }, 1);`,
+  `window.__timelines = [tl];`,
+  `</script>`,
+].join("\n");
+
+async function setupSdkKeyframedClipHarness() {
+  const iframe = createPreviewIframe([{ id: "clip", track: 0 }]);
+  const clip = timelineElement({ id: "clip", track: 0, zIndex: 0, start: 1 });
+  const sdkSession = await openComposition(SDK_KEYFRAMED_SOURCE);
+  const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+  const invalidateGsapCache = vi.fn();
+  const fetchMock = stubProjectFetch(SDK_KEYFRAMED_SOURCE);
+  usePlayerStore.getState().setDuration(10);
+  const hook = renderTimelineEditingHook({
+    timelineElements: [clip],
+    iframe,
+    onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+    projectId: "p1",
+    writeProjectFile,
+    recordEdit: vi.fn(async () => {}),
+    sdkSession,
+    publishSdkSession: vi.fn<TimelinePublishSdkSession>(() => "published"),
+    invalidateGsapCache,
+  });
+  return { clip, fetchMock, hook, invalidateGsapCache, writeProjectFile };
 }
 
 /** Assert a lane write landed in both the live iframe DOM and the persisted file. */
@@ -709,6 +814,58 @@ describe("useTimelineEditing timeline z-index reorder", () => {
     h.unmount();
   });
 
+  it("shifts authored GSAP positions after an SDK-backed clip move commits", async () => {
+    const { clip, fetchMock, hook, invalidateGsapCache, writeProjectFile } =
+      await setupSdkKeyframedClipHarness();
+
+    await act(async () => {
+      await hook.move(clip, { start: 2.25, track: clip.track });
+    });
+
+    expect(writeProjectFile.mock.calls[0]?.[1]).toContain('data-start="2.25"');
+    const mutationCall = fetchMock.mock.calls.find((call) =>
+      requestUrl(call[0]).includes("/gsap-mutations/"),
+    );
+    expect(mutationCall).toBeDefined();
+    const init = mutationCall?.[1] as RequestInit | undefined;
+    expect(JSON.parse(String(init?.body))).toEqual({
+      type: "shift-positions",
+      targetSelector: "#clip",
+      delta: 1.25,
+    });
+    expect(invalidateGsapCache).toHaveBeenCalledTimes(1);
+
+    hook.unmount();
+  });
+
+  it("scales authored GSAP positions after an SDK-backed clip resize commits", async () => {
+    const { clip, fetchMock, hook, invalidateGsapCache, writeProjectFile } =
+      await setupSdkKeyframedClipHarness();
+
+    await act(async () => {
+      await hook.resize(clip, { start: 2, duration: 4, playbackStart: undefined });
+    });
+
+    expect(writeProjectFile.mock.calls[0]?.[1]).toContain('data-start="2"');
+    expect(writeProjectFile.mock.calls[0]?.[1]).toContain('data-duration="4"');
+    const mutationCall = fetchMock.mock.calls.find((call) =>
+      requestUrl(call[0]).includes("/gsap-mutations/"),
+    );
+    expect(mutationCall).toBeDefined();
+    const init = mutationCall?.[1] as RequestInit | undefined;
+    expect(JSON.parse(String(init?.body))).toEqual({
+      type: "scale-positions",
+      targetSelector: "#clip",
+      oldStart: 1,
+      oldDuration: 2,
+      newStart: 2,
+      newDuration: 4,
+    });
+    expect(invalidateGsapCache).toHaveBeenCalledTimes(1);
+
+    hook.unmount();
+  });
+
   it("persists a vertical-only lane move (start unchanged) through the single-element fallback", async () => {
     // Regression: `if (!startChanged) return` ran BEFORE the file persist, so a
     // pure lane change routed through onMoveElement (no onMoveElements wired)
@@ -818,6 +975,55 @@ describe("useTimelineEditing timeline z-index reorder", () => {
     expect(Object.keys(recordEdit.mock.calls[0]![0].files)).toEqual(["index.html"]);
 
     unmount();
+  });
+
+  it("shifts every keyed clip and invalidates the cache after an SDK-backed group move", async () => {
+    const source = [
+      `<div data-hf-id="hf-stage" data-hf-root data-duration="10">`,
+      `  <div id="a" data-hf-id="hf-a" data-start="0" data-duration="1"></div>`,
+      `  <div id="b" data-hf-id="hf-b" data-start="1" data-duration="1"></div>`,
+      `</div>`,
+      `<script>`,
+      `const tl = gsap.timeline({ paused: true });`,
+      `tl.to("#a", { keyframes: [{ x: 0 }, { x: 100 }], duration: 1 }, 0);`,
+      `tl.to("#b", { keyframes: [{ x: 0 }, { x: 100 }], duration: 1 }, 1);`,
+      `window.__timelines = [tl];`,
+      `</script>`,
+    ].join("\n");
+    const { iframe, a, b } = makeTwoClipPair();
+    const sdkSession = await openComposition(source);
+    const fetchMock = stubProjectFetch(source);
+    const invalidateGsapCache = vi.fn();
+    usePlayerStore.getState().setDuration(10);
+    const hook = renderTimelineEditingHook({
+      timelineElements: [a, b],
+      iframe,
+      onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+      projectId: "p1",
+      writeProjectFile: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+      recordEdit: vi.fn(async () => {}),
+      sdkSession,
+      publishSdkSession: vi.fn<TimelinePublishSdkSession>(() => "published"),
+      invalidateGsapCache,
+    });
+
+    await act(async () => {
+      await hook.groupMove([
+        { element: a, start: 1 },
+        { element: b, start: 2 },
+      ]);
+    });
+
+    const mutations = fetchMock.mock.calls
+      .filter((call) => requestUrl(call[0]).includes("/gsap-mutations/"))
+      .map((call) => JSON.parse(String((call[1] as RequestInit | undefined)?.body)));
+    expect(mutations).toEqual([
+      { type: "shift-positions", targetSelector: "#a", delta: 1 },
+      { type: "shift-positions", targetSelector: "#b", delta: 1 },
+    ]);
+    expect(invalidateGsapCache).toHaveBeenCalledTimes(1);
+
+    hook.unmount();
   });
 
   it("partitions a group move by source file while keeping one undo entry", async () => {
@@ -1267,5 +1473,441 @@ describe("useTimelineEditing duration rollback on failed persist", () => {
     expect(rootDurationAttr(iframe)).toBe("5");
 
     succeeding.unmount();
+  });
+});
+
+// Blocked means no fetch write, no recordEdit, and the host's reason
+// toasted. Absent canEdit behaves exactly as before (asserted above).
+describe("useTimelineEditing: canEdit gate", () => {
+  it("re-reads canEdit after the host changes its verdict", async () => {
+    const iframe = createPreviewIframe([{ id: "clip", track: 0 }]);
+    const clip = timelineElement({ id: "clip", track: 0, zIndex: 0 });
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    const showToast = vi.fn();
+    const recordEdit = vi.fn(async () => {});
+    const pendingTimelineEditPathRef = { current: new Set<string>() };
+    const previewIframeRef = { current: iframe };
+    const uploadProjectFiles = vi.fn();
+    const reloadPreview = vi.fn();
+    let setBlocked = () => {};
+    let hook: ReturnType<typeof useTimelineEditing> | null = null;
+
+    function Harness() {
+      const [blocked, updateBlocked] = useState(false);
+      setBlocked = () => updateBlocked(true);
+      hook = useTimelineEditing({
+        projectId: "p1",
+        activeCompPath: "index.html",
+        timelineElements: [clip],
+        showToast,
+        writeProjectFile,
+        recordEdit,
+        reloadPreview,
+        previewIframeRef,
+        pendingTimelineEditPathRef,
+        uploadProjectFiles,
+        canEdit: () => (blocked ? { blocked: true, reason: "Reserved by an agent" } : true),
+      });
+      return null;
+    }
+
+    const { unmount } = mountHarness(<Harness />);
+    if (!hook) throw new Error("Expected hook to mount");
+    act(() => setBlocked());
+
+    await act(async () => {
+      await hook!.handleTimelineElementMove(clip, { start: 3, track: clip.track });
+      await flushAsyncWork();
+    });
+
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(recordEdit).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    unmount();
+  });
+
+  it("refuses a move with the host's reason, writing nothing", async () => {
+    const { clip, move, writeProjectFile, recordEdit, showToast, unmount } = setupSingleClipHarness(
+      {
+        canEdit: () => ({ blocked: true, reason: "Reserved by an agent" }),
+      },
+    );
+
+    await act(async () => {
+      await move(clip, { start: 3, track: clip.track });
+      await flushAsyncWork();
+    });
+
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(recordEdit).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    unmount();
+  });
+
+  it("refuses a delete (single and multi) with nothing written", async () => {
+    const { clip, del, elementsDelete, writeProjectFile, recordEdit, unmount } =
+      setupSingleClipHarness({
+        canEdit: () => ({ blocked: true, reason: "Reserved by an agent" }),
+      });
+
+    await act(async () => {
+      await del(clip);
+      await elementsDelete([clip]);
+      await flushAsyncWork();
+    });
+
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(recordEdit).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("resolves toggle-track-hidden against the store-owned timeline rows", async () => {
+    // The visibility hook reads the single store-owned row source. The editing
+    // guard must receive that same source so a blocked row cannot fall through
+    // to the write path.
+    const iframe = createPreviewIframe([{ id: "clip", track: 0 }]);
+    const clip = timelineElement({ id: "clip", track: 0, zIndex: 0 });
+    usePlayerStore.getState().setElements([clip]);
+    const showToast = vi.fn();
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    const canEdit = vi.fn((element: TimelineElement) =>
+      element.id === "clip" ? { blocked: true as const, reason: "Reserved by an agent" } : true,
+    );
+    let hook: ReturnType<typeof useTimelineEditing> | null = null;
+    function Harness() {
+      hook = useTimelineEditing({
+        projectId: "p1",
+        activeCompPath: "index.html",
+        timelineElements: [clip],
+        showToast,
+        writeProjectFile,
+        recordEdit: vi.fn(),
+        reloadPreview: vi.fn(),
+        previewIframeRef: { current: iframe },
+        pendingTimelineEditPathRef: { current: new Set<string>() },
+        uploadProjectFiles: vi.fn(),
+        canEdit,
+      });
+      return null;
+    }
+    const { unmount } = mountHarness(<Harness />);
+    if (!hook) throw new Error("Expected hook to mount");
+
+    await act(async () => {
+      await hook!.handleToggleTrackHidden(0, true);
+      await flushAsyncWork();
+    });
+
+    expect(canEdit).toHaveBeenCalledWith(clip);
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("lets an unblocked element through while a blocked one is refused", async () => {
+    const iframe = createPreviewIframe([
+      { id: "free", track: 0 },
+      { id: "locked", track: 1 },
+    ]);
+    const free = timelineElement({ id: "free", track: 0, zIndex: 0 });
+    const locked = timelineElement({ id: "locked", track: 1, zIndex: 0 });
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    const recordEdit = vi.fn(async () => {});
+    stubProjectFetch(
+      '<div id="free" data-start="0" data-track-index="0"></div>' +
+        '<div id="locked" data-start="0" data-track-index="1"></div>',
+    );
+    const hook = renderTimelineEditingHook({
+      timelineElements: [free, locked],
+      iframe,
+      onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+      projectId: "p1",
+      writeProjectFile,
+      recordEdit,
+      canEdit: (element) =>
+        element.id === "locked" ? { blocked: true, reason: "Reserved by an agent" } : true,
+    });
+
+    await act(async () => {
+      await hook.move(locked, { start: 3, track: locked.track });
+      await flushAsyncWork();
+    });
+    expect(writeProjectFile).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await hook.move(free, { start: 3, track: free.track });
+      await flushAsyncWork();
+    });
+    expect(writeProjectFile).toHaveBeenCalled();
+    hook.unmount();
+  });
+
+  it("refuses razor-split-all when it would split a blocked clip, writing nothing", async () => {
+    const iframe = createPreviewIframe([{ id: "clip", track: 0 }]);
+    const clip = timelineElement({ id: "clip", track: 0, zIndex: 0, start: 0, duration: 2 });
+    usePlayerStore.getState().setElements([clip]);
+    const showToast = vi.fn();
+    const fetchMock = vi.fn(async () => {
+      throw new Error("must not be called: canEdit should have refused the split");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let hook: ReturnType<typeof useTimelineEditing> | null = null;
+    function Harness() {
+      hook = useTimelineEditing({
+        projectId: "p1",
+        activeCompPath: "index.html",
+        timelineElements: [clip],
+        showToast,
+        writeProjectFile: vi.fn(),
+        recordEdit: vi.fn(),
+        reloadPreview: vi.fn(),
+        previewIframeRef: { current: iframe },
+        pendingTimelineEditPathRef: { current: new Set<string>() },
+        uploadProjectFiles: vi.fn(),
+        canEdit: () => ({ blocked: true, reason: "Reserved by an agent" }),
+      });
+      return null;
+    }
+    const { unmount } = mountHarness(<Harness />);
+    if (!hook) throw new Error("Expected hook to mount");
+
+    await act(async () => {
+      await hook!.handleRazorSplitAll(1);
+      await flushAsyncWork();
+    });
+
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    expect(fetchMock).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("refuses a blocked group's audio attribute write, writing nothing", async () => {
+    const iframe = createPreviewIframe([{ id: "member", track: 0 }]);
+    const member = timelineElement({ id: "member", track: 0, zIndex: 0 });
+    usePlayerStore.getState().setElements([{ ...member, audioGroup: "hf-group" }]);
+    const showToast = vi.fn();
+    const fetchMock = vi.fn(async () => {
+      throw new Error("must not be called: canEdit should have refused the write");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let hook: ReturnType<typeof useTimelineEditing> | null = null;
+    function Harness() {
+      hook = useTimelineEditing({
+        projectId: "p1",
+        activeCompPath: "index.html",
+        timelineElements: [member],
+        showToast,
+        writeProjectFile: vi.fn(),
+        recordEdit: vi.fn(),
+        reloadPreview: vi.fn(),
+        previewIframeRef: { current: iframe },
+        pendingTimelineEditPathRef: { current: new Set<string>() },
+        uploadProjectFiles: vi.fn(),
+        canEdit: (element) =>
+          element.id === "member" ? { blocked: true, reason: "Reserved by an agent" } : true,
+      });
+      return null;
+    }
+    const { unmount } = mountHarness(<Harness />);
+    if (!hook) throw new Error("Expected hook to mount");
+
+    await act(async () => {
+      await hook!.setAudioGroupAttribute.setQuiet("hf-group", "data-volume", "0.5", "Set volume");
+      await flushAsyncWork();
+    });
+
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    expect(fetchMock).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("refuses a group write when its members live only inside a sub-composition", async () => {
+    // syncStoredGroupAttribute mirrors into domClipChildren for a group with
+    // no flat twin (timelineAudioGroupVolume.ts) — the resolver must check
+    // that array too, or a sub-comp-only group's write goes ungated.
+    const iframe = createPreviewIframe([]);
+    usePlayerStore.getState().setElements([]);
+    usePlayerStore.getState().setDomClipChildren([
+      {
+        id: "sub-member",
+        parentId: "host",
+        hostId: "host",
+        label: "Sub member",
+        stackingContextId: "root",
+        audioGroup: "hf-group",
+      },
+    ]);
+    const showToast = vi.fn();
+    const fetchMock = vi.fn(async () => {
+      throw new Error("must not be called: canEdit should have refused the write");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let hook: ReturnType<typeof useTimelineEditing> | null = null;
+    function Harness() {
+      hook = useTimelineEditing({
+        projectId: "p1",
+        activeCompPath: "index.html",
+        timelineElements: [],
+        showToast,
+        writeProjectFile: vi.fn(),
+        recordEdit: vi.fn(),
+        reloadPreview: vi.fn(),
+        previewIframeRef: { current: iframe },
+        pendingTimelineEditPathRef: { current: new Set<string>() },
+        uploadProjectFiles: vi.fn(),
+        canEdit: (element) =>
+          element.id === "sub-member" ? { blocked: true, reason: "Reserved by an agent" } : true,
+      });
+      return null;
+    }
+    const { unmount } = mountHarness(<Harness />);
+    if (!hook) throw new Error("Expected hook to mount");
+
+    await act(async () => {
+      await hook!.setAudioGroupAttribute.setQuiet("hf-group", "data-volume", "0.5", "Set volume");
+      await flushAsyncWork();
+    });
+
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    expect(fetchMock).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("refuses auto-grouping before it patches existing clips", async () => {
+    const iframe = document.createElement("iframe");
+    document.body.append(iframe);
+    const doc = iframe.contentDocument;
+    if (!doc) throw new Error("Expected iframe document");
+    doc.body.innerHTML =
+      '<audio id="voice-1" data-start="0" data-duration="5"></audio>' +
+      '<audio id="voice-2" data-start="5" data-duration="5"></audio>';
+    const voice1 = timelineElement({ id: "voice-1", tag: "audio", track: 0, zIndex: 0 });
+    const voice2 = timelineElement({ id: "voice-2", tag: "audio", track: 1, zIndex: 0 });
+    usePlayerStore.getState().setElements([voice1, voice2]);
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    const recordEdit = vi.fn(async () => {});
+    const showToast = vi.fn();
+    const fetchMock = stubProjectFetch(
+      '<audio id="voice-1" data-start="0" data-duration="5"></audio>' +
+        '<audio id="voice-2" data-start="5" data-duration="5"></audio>',
+    );
+    const hook = renderTimelineEditingHook({
+      timelineElements: [voice1, voice2],
+      iframe,
+      onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+      projectId: "p1",
+      writeProjectFile,
+      recordEdit,
+      showToast,
+      canEdit: (element) =>
+        element.id === "voice-2" ? { blocked: true, reason: "Reserved by an agent" } : true,
+    });
+
+    await expect(
+      hook.handleAutoGroupCarveSources(["voice-1", "voice-2"], "voiceover"),
+    ).rejects.toThrow("Timeline edit blocked");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(recordEdit).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    expect(doc.getElementById("voice-1")?.getAttribute("data-audio-group")).toBeNull();
+    expect(doc.getElementById("voiceover")).toBeNull();
+    hook.unmount();
+  });
+
+  it("reverts an optimistic group live value when the commit is refused", async () => {
+    const iframe = document.createElement("iframe");
+    document.body.append(iframe);
+    const doc = iframe.contentDocument;
+    if (!doc) throw new Error("Expected iframe document");
+    doc.body.innerHTML =
+      '<hf-audio-group id="voiceover" data-volume="1"></hf-audio-group>' +
+      '<audio id="voice-1" data-start="0" data-duration="5"></audio>';
+    const member = {
+      ...timelineElement({ id: "voice-1", tag: "audio", track: 0, zIndex: 0 }),
+      audioGroup: "voiceover",
+      audioGroupVolume: 1,
+    };
+    usePlayerStore.getState().setElements([member]);
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    const recordEdit = vi.fn(async () => {});
+    const showToast = vi.fn();
+    const hook = renderTimelineEditingHook({
+      timelineElements: [member],
+      iframe,
+      onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+      projectId: "p1",
+      writeProjectFile,
+      recordEdit,
+      showToast,
+      canEdit: () => ({ blocked: true, reason: "Reserved by an agent" }),
+    });
+
+    await act(async () => {
+      hook.setAudioGroupAttribute.setLive("voiceover", "data-volume", "0.4");
+    });
+    expect(doc.getElementById("voiceover")?.getAttribute("data-volume")).toBe("0.4");
+    expect(usePlayerStore.getState().elements[0]?.audioGroupVolume).toBe(0.4);
+
+    await act(async () => {
+      await hook.setAudioGroupAttribute.setQuiet("voiceover", "data-volume", "0.4", "Set volume");
+    });
+
+    expect(doc.getElementById("voiceover")?.getAttribute("data-volume")).toBe("1");
+    expect(usePlayerStore.getState().elements[0]?.audioGroupVolume).toBe(1);
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(recordEdit).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith("Reserved by an agent", "error");
+    hook.unmount();
+  });
+});
+
+// Regression: track()/guard() must return the same wrapped handler across
+// renders for the same fn, or a consumer using it as a memo/effect
+// dependency re-runs on every render for nothing.
+describe("useTimelineEditing: handler identity is stable across renders", () => {
+  it("returns the same handleTimelineElementMove reference on a re-render", () => {
+    const iframe = createPreviewIframe([{ id: "clip", track: 0 }]);
+    const clip = timelineElement({ id: "clip", track: 0, zIndex: 0 });
+    stubProjectFetch('<div id="clip" data-start="0" data-track-index="0"></div>');
+    // Every option below is hoisted (created once), matching a real caller's
+    // stable useCallback/selector inputs — a fresh vi.fn() per render would
+    // change handleTimelineElementMove's own identity regardless of the fix.
+    const timelineElements = [clip];
+    const showToast = vi.fn();
+    const writeProjectFile = vi.fn();
+    const recordEdit = vi.fn();
+    const reloadPreview = vi.fn();
+    const uploadProjectFiles = vi.fn();
+    const previewIframeRef = { current: iframe };
+    const pendingTimelineEditPathRef = { current: new Set<string>() };
+    const seen: unknown[] = [];
+    let bumpTick = 0;
+    let bump = () => {};
+    function Harness() {
+      const [, setTick] = React.useState(0);
+      bump = () => setTick((t) => t + 1);
+      bumpTick += 1;
+      const hook = useTimelineEditing({
+        projectId: "p1",
+        activeCompPath: "index.html",
+        timelineElements,
+        showToast,
+        writeProjectFile,
+        recordEdit,
+        reloadPreview,
+        previewIframeRef,
+        pendingTimelineEditPathRef,
+        uploadProjectFiles,
+      });
+      seen.push(hook.handleTimelineElementMove);
+      return null;
+    }
+    const { unmount } = mountHarness(<Harness />);
+    act(() => bump());
+    expect(bumpTick).toBeGreaterThan(1);
+    expect(seen[0]).toBe(seen[1]);
+    unmount();
   });
 });

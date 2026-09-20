@@ -13,7 +13,7 @@ import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { CommitMutationOptions } from "./gsapScriptCommitTypes";
 import { roundTo3 } from "../utils/rounding";
 import { classifyPropertyGroup } from "@hyperframes/core/gsap-parser";
-import { isInstantHold } from "./gsapShared";
+import { isInstantHold, idSelector, writeTargetSelector, tweenTargetsElement } from "./gsapShared";
 
 type RecordedKeyframe = {
   percentage: number;
@@ -87,6 +87,7 @@ interface UseGestureCommitParams {
   previewIframeRef: React.RefObject<HTMLIFrameElement | null>;
   showToast: (message: string, tone?: "error" | "info") => void;
   isGestureRecordingRef: React.MutableRefObject<boolean>;
+  readOnlyPreview: boolean;
 }
 
 export interface UseGestureCommitResult {
@@ -101,6 +102,7 @@ export function useGestureCommit({
   previewIframeRef,
   showToast,
   isGestureRecordingRef,
+  readOnlyPreview,
 }: UseGestureCommitParams): UseGestureCommitResult {
   const gestureRecording = useGestureRecording();
   const [gestureState, setGestureState] = useState<"idle" | "recording">("idle");
@@ -114,6 +116,20 @@ export function useGestureCommit({
 
   // Unmount: clear auto-stop interval
   useEffect(() => () => clearInterval(recordingAutoStopRef.current), []);
+
+  const cancelRecording = useCallback(() => {
+    clearInterval(recordingAutoStopRef.current);
+    gestureRecording.stopRecording();
+    gestureRecording.clearSamples();
+    gestureStateRef.current = "idle";
+    isGestureRecordingRef.current = false;
+    capturedSelectionRef.current = null;
+    setGestureState("idle");
+  }, [gestureRecording, isGestureRecordingRef]);
+
+  useEffect(() => {
+    if (readOnlyPreview && gestureStateRef.current === "recording") cancelRecording();
+  }, [cancelRecording, readOnlyPreview]);
 
   // fallow-ignore-next-line complexity
   const stopAndCommitRecording = useCallback(async () => {
@@ -168,9 +184,22 @@ export function useGestureCommit({
         if (!sortedPcts.includes(0)) sortedPcts.unshift(0);
       }
 
-      const selector = sel.id ? `#${sel.id}` : sel.selector;
+      // Two different jobs, two different selectors. `selector` is the string an
+      // ALREADY-AUTHORED tween is matched against (and retargeted with, so a
+      // tween aimed at a whole group stays aimed at it). `writeSelector` is what
+      // a NEW tween is authored with: the bare class the id-less case yields here
+      // would record the gesture onto every sibling sharing it.
+      const selector = sel.id ? idSelector(sel.id) : sel.selector;
       if (!selector) {
         showToast("Cannot save — element has no selector", "error");
+        return;
+      }
+      // A recorded gesture becomes a NEW tween, so its target must address one
+      // element; the selection's own selector would record the motion onto
+      // every sibling sharing its class (see writeTargetSelector).
+      const writeSelector = writeTargetSelector(sel);
+      if (!writeSelector) {
+        showToast("Cannot save: element has no unique selector", "error");
         return;
       }
       if (liveSession.commitMutation) {
@@ -186,7 +215,11 @@ export function useGestureCommit({
         );
         const allAnims = liveSession.selectedGsapAnimations ?? [];
         const existingPositionTween = hasPositionProps
-          ? allAnims.find((a) => a.propertyGroup === "position" && a.targetSelector === selector)
+          ? allAnims.find(
+              (a) =>
+                a.propertyGroup === "position" &&
+                tweenTargetsElement(a.targetSelector, selector, sel.element),
+            )
           : undefined;
         if (existingPositionTween) {
           if (isInstantHold(existingPositionTween)) {
@@ -261,7 +294,7 @@ export function useGestureCommit({
                 await liveSession.commitMutation(
                   {
                     type: "add-with-keyframes",
-                    targetSelector: selector,
+                    targetSelector: writeSelector,
                     position: roundTo3(recStart),
                     duration: roundTo3(duration),
                     keyframes: groupKfs,
@@ -287,7 +320,7 @@ export function useGestureCommit({
             await liveSession.commitMutation(
               {
                 type: "add-with-keyframes",
-                targetSelector: selector,
+                targetSelector: writeSelector,
                 position: roundTo3(recStart),
                 duration: roundTo3(duration),
                 keyframes: groupKfs,
@@ -318,9 +351,14 @@ export function useGestureCommit({
   // fallow-ignore-next-line complexity
   const handleToggleRecording = useCallback(() => {
     if (gestureStateRef.current === "recording") {
+      if (readOnlyPreview) {
+        cancelRecording();
+        return;
+      }
       void stopAndCommitRecording();
       return;
     }
+    if (readOnlyPreview) return;
     const sel = domEditSessionRef.current.domEditSelection;
     if (!sel) {
       showToast("Select an element first", "error");
@@ -356,9 +394,11 @@ export function useGestureCommit({
     gestureRecording,
     showToast,
     stopAndCommitRecording,
+    cancelRecording,
     previewIframeRef,
     domEditSessionRef,
     isGestureRecordingRef,
+    readOnlyPreview,
   ]);
 
   return { gestureState, gestureRecording, handleToggleRecording };

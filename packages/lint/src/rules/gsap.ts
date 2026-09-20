@@ -26,6 +26,11 @@ async function loadParseGsapScript(): Promise<(script: string) => LintParsedGsap
   const mod = await import("@hyperframes/parsers/gsap-parser-acorn");
   return mod.parseGsapScriptAcorn as unknown as (script: string) => LintParsedGsap;
 }
+
+async function loadGsapScriptMotionPathFirstUseIndex(): Promise<(script: string) => number | null> {
+  const mod = await import("@hyperframes/parsers/gsap-parser-acorn");
+  return mod.gsapScriptMotionPathFirstUseIndex;
+}
 import type { LintContext } from "../context";
 import type { HyperframeLintFinding, LintRule } from "../types";
 import type { OpenTag } from "../utils";
@@ -38,6 +43,7 @@ import {
   WINDOW_TIMELINE_ASSIGN_PATTERN,
   TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN,
 } from "../utils";
+import { collectAllDeclaredVariableIds } from "./composition";
 
 // ── GSAP-specific types ────────────────────────────────────────────────────
 
@@ -50,17 +56,12 @@ type GsapWindow = {
   propertyValues: Record<string, string | number>;
   fromPropertyValues?: Record<string, string | number>;
   overwriteAuto: boolean;
-  immediateRender: boolean;
+  /** Explicit immediateRender option; undefined keeps the GSAP method default. */
+  immediateRender?: boolean;
   method: string;
   /** True for an off-timeline `gsap.set(...)` (applied once at load). */
   global?: boolean;
   raw: string;
-};
-
-type CompositionRange = {
-  id: string;
-  start: number;
-  end: number;
 };
 
 const SCENE_BOUNDARY_EPSILON_SECONDS = 0.05;
@@ -82,23 +83,6 @@ function targetHasNoStableIdentity(selector: string, identity?: string): boolean
 }
 
 // ── GSAP parsing utilities ─────────────────────────────────────────────────
-
-function countClassUsage(tags: OpenTag[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const tag of tags) {
-    const classAttr = readAttr(tag.raw, "class");
-    if (!classAttr) continue;
-    for (const className of classAttr.split(/\s+/).filter(Boolean)) {
-      counts.set(className, (counts.get(className) || 0) + 1);
-    }
-  }
-  return counts;
-}
-
-function readRegisteredTimelineCompositionId(script: string): string | null {
-  const match = script.match(WINDOW_TIMELINE_ASSIGN_PATTERN);
-  return match?.[1] || match?.[2] || null;
-}
 
 /** Strip a `__raw:` prefix the parser adds to unresolvable values. */
 function unwrapRaw(value: unknown): string | number | undefined {
@@ -157,6 +141,7 @@ async function extractGsapWindows(script: string): Promise<GsapWindow[]> {
     const cycleCount = infiniteRepeat ? 1 : repeat > 0 ? repeat + 1 : 1;
     const effectiveDuration =
       animation.method === "set" ? 0 : (animation.duration ?? 0) * cycleCount;
+    const immediateRender = unwrapRaw(animation.extras?.immediateRender);
     windows.push({
       targetSelector: animation.targetSelector,
       targetIdentity: animation.targetIdentity,
@@ -169,7 +154,8 @@ async function extractGsapWindows(script: string): Promise<GsapWindow[]> {
       propertyValues: animation.properties,
       fromPropertyValues: animation.fromProperties,
       overwriteAuto: unwrapRaw(animation.extras?.overwrite) === "auto",
-      immediateRender: unwrapRaw(animation.extras?.immediateRender) === "true",
+      immediateRender:
+        immediateRender === "true" ? true : immediateRender === "false" ? false : undefined,
       method: animation.method,
       global: animation.global,
       raw: synthesizeWindowRaw(parsed.timelineVar, animation),
@@ -199,6 +185,44 @@ function zeroValue(value: string | number | undefined): boolean {
   return Number(value.trim()) === 0;
 }
 
+function isGsapColorProperty(property: string): boolean {
+  const normalized = property.toLowerCase();
+  return (
+    !normalized.startsWith("--") &&
+    (normalized.endsWith("color") || normalized === "fill" || normalized === "stroke")
+  );
+}
+
+function collectStaticCssVariableDefinitions(
+  tags: readonly OpenTag[],
+  styles: LintContext["styles"],
+): Set<string> {
+  const definitions = new Set<string>();
+  const sources = [
+    ...styles.map((style) => style.content),
+    ...tags.map((tag) => readDecodedAttr(tag.raw, "style") ?? ""),
+  ];
+  const definitionPattern = /(?:^|[;{])\s*(--[A-Za-z0-9_-]+)\s*:/gm;
+  for (const source of sources) {
+    const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, " ");
+    for (const match of withoutComments.matchAll(definitionPattern)) {
+      if (match[1]) definitions.add(match[1]);
+    }
+  }
+  for (const id of collectAllDeclaredVariableIds(tags) ?? []) definitions.add(`--${id}`);
+  return definitions;
+}
+
+function cssVariableReferencesWithoutFallback(value: unknown): string[] {
+  const text = unwrapRaw(value);
+  if (typeof text !== "string") return [];
+  const variables: string[] = [];
+  for (const match of text.matchAll(/var\(\s*(--[A-Za-z0-9_-]+)\s*(,)?/g)) {
+    if (match[1] && !match[2]) variables.push(match[1]);
+  }
+  return variables;
+}
+
 function isHiddenGsapState(values: Record<string, string | number>): boolean {
   const visibility = stringValue(values.visibility)?.toLowerCase();
   const display = stringValue(values.display)?.toLowerCase();
@@ -208,6 +232,19 @@ function isHiddenGsapState(values: Record<string, string | number>): boolean {
     visibility === "hidden" ||
     display === "none"
   );
+}
+
+function hiddenSetTargetSelectors(target: string, aliases: Map<string, string>): string[] {
+  const parts =
+    target.startsWith("[") && target.endsWith("]") ? target.slice(1, -1).split(",") : [target];
+  return parts
+    .flatMap((part) => {
+      const trimmed = part.trim();
+      const resolved = /^(["'`])([^"'`]+)\1$/.exec(trimmed)?.[2] ?? aliases.get(trimmed);
+      return resolved === undefined ? [] : resolved.split(",");
+    })
+    .map((selector) => selector.trim())
+    .filter((selector) => selector.length > 0);
 }
 
 function extractStandaloneHiddenSelectors(script: string): Set<string> {
@@ -220,17 +257,17 @@ function extractStandaloneHiddenSelectors(script: string): Set<string> {
   )) {
     aliases.set(match[1] ?? "", match[3] ?? "");
   }
-  const pattern = /gsap\.set\s*\(\s*([^,]+?)\s*,\s*\{([\s\S]*?)\}\s*\)/g;
+  const pattern =
+    /gsap\.set\s*\(\s*(\[[^[\]]*\]|"[^"]*"|'[^']*'|`[^`]*`|[^,()[\]]+?)\s*,\s*\{([\s\S]*?)\}\s*\)/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(source)) !== null) {
     // Skip callback/handler bodies; keep IIFEs (they run at parse time).
     if (indexInsideNonIifeRange(match.index, source, functionRanges)) continue;
-    const target = (match[1] ?? "").trim();
-    const selector = /^(["'`])([^"'`]+)\1$/.exec(target)?.[2] ?? aliases.get(target);
-    if (!selector) continue;
+    const targets = hiddenSetTargetSelectors((match[1] ?? "").trim(), aliases);
+    if (targets.length === 0) continue;
     const body = match[2] ?? "";
     if (/(?:opacity|autoAlpha)\s*:\s*0(?:\.0+)?\s*(?:,|$)/.test(body)) {
-      selectors.add(selector);
+      for (const selector of targets) selectors.add(selector);
     }
   }
   return selectors;
@@ -269,29 +306,6 @@ function makesOverlayVisible(win: GsapWindow): boolean {
   return isVisibleGsapState(win.propertyValues);
 }
 
-function isSceneBoundaryExit(win: GsapWindow): boolean {
-  if (win.end <= win.position) return false;
-  if (win.method !== "to" && win.method !== "fromTo") return false;
-  return isHiddenGsapState(win.propertyValues);
-}
-
-function isHardKillSet(win: GsapWindow, selector: string, boundary: number): boolean {
-  return (
-    win.method === "set" &&
-    win.targetSelector === selector &&
-    Math.abs(win.position - boundary) <= SCENE_BOUNDARY_EPSILON_SECONDS &&
-    isHiddenGsapState(win.propertyValues)
-  );
-}
-
-function hiddenStateLiteral(values: Record<string, string | number>): string {
-  if (zeroValue(values.autoAlpha)) return "{ autoAlpha: 0 }";
-  if (zeroValue(values.opacity)) return "{ opacity: 0 }";
-  if (stringValue(values.visibility)?.toLowerCase() === "hidden") return '{ visibility: "hidden" }';
-  if (stringValue(values.display)?.toLowerCase() === "none") return '{ display: "none" }';
-  return "{ opacity: 0 }";
-}
-
 function findTagEnd(source: string, tag: OpenTag): number {
   const escapedTagName = tag.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(`<\\/?${escapedTagName}\\b[^>]*>`, "gi");
@@ -311,29 +325,6 @@ function findTagEnd(source: string, tag: OpenTag): number {
   return source.length;
 }
 
-function collectCompositionRanges(source: string, tags: OpenTag[]): CompositionRange[] {
-  return tags
-    .map((tag) => {
-      const id = readDecodedAttr(tag.raw, "data-composition-id");
-      if (!id) return null;
-      return {
-        id,
-        start: tag.index,
-        end: findTagEnd(source, tag),
-      };
-    })
-    .filter((range) => range !== null);
-}
-
-function findContainingCompositionId(tag: OpenTag, ranges: CompositionRange[]): string | null {
-  let match: CompositionRange | null = null;
-  for (const range of ranges) {
-    if (tag.index < range.start || tag.index >= range.end) continue;
-    if (!match || range.start >= match.start) match = range;
-  }
-  return match?.id || null;
-}
-
 // A tag's `class` attribute, split into tokens, but only when it carries the
 // `clip` marker class — the common "is this a clip element?" filter used by
 // several rules that walk every tag looking for clips.
@@ -343,51 +334,6 @@ function getClipTagClasses(tag: OpenTag): ClipTagClasses | null {
   const classAttr = readAttr(tag.raw, "class") || "";
   const classes = classAttr.split(/\s+/).filter(Boolean);
   return classes.includes("clip") ? { classAttr, classes } : null;
-}
-
-function collectClipStartBoundariesByComposition(
-  source: string,
-  tags: OpenTag[],
-): Map<string, number[]> {
-  const ranges = collectCompositionRanges(source, tags);
-  const boundaries = new Map<string, Set<number>>();
-
-  for (const tag of tags) {
-    if (!getClipTagClasses(tag)) continue;
-    const compositionId = findContainingCompositionId(tag, ranges);
-    if (!compositionId) continue;
-    const start = numberValue(readAttr(tag.raw, "data-start") ?? undefined);
-    if (start == null || start <= 0) continue;
-    const compositionBoundaries = boundaries.get(compositionId) ?? new Set<number>();
-    compositionBoundaries.add(start);
-    boundaries.set(compositionId, compositionBoundaries);
-  }
-
-  return new Map(
-    [...boundaries.entries()].map(([compositionId, values]) => [
-      compositionId,
-      [...values].sort((a, b) => a - b),
-    ]),
-  );
-}
-
-function findMatchingSceneBoundary(time: number, boundaries: number[]): number | null {
-  for (const boundary of boundaries) {
-    if (Math.abs(time - boundary) <= SCENE_BOUNDARY_EPSILON_SECONDS) return boundary;
-  }
-  return null;
-}
-
-function isSuspiciousGlobalSelector(selector: string): boolean {
-  if (!selector) return false;
-  if (selector.includes("[data-composition-id=")) return false;
-  if (selector.startsWith("#")) return false;
-  return selector.startsWith(".") || /^[a-z]/i.test(selector);
-}
-
-function getSingleClassSelector(selector: string): string | null {
-  const match = selector.trim().match(/^\.(?<name>[A-Za-z0-9_-]+)$/);
-  return match?.groups?.name || null;
 }
 
 function readStyleProperty(style: string, property: string): string | null {
@@ -1059,10 +1005,44 @@ function collectCssOpacityZeroSelectors(
 
 // fallow-ignore-next-line complexity
 export const gsapRules: LintRule<LintContext>[] = [
-  // overlapping_gsap_tweens + gsap_animates_clip_element + unscoped_gsap_selector
-  // fallow-ignore-next-line complexity
-  async ({ source, tags, scripts, styles, rootCompositionId }) => {
+  // gsap_undefined_css_variable
+  async ({ tags, styles, scripts }) => {
+    const definedVariables = collectStaticCssVariableDefinitions(tags, styles);
     const findings: HyperframeLintFinding[] = [];
+    const reported = new Set<string>();
+    for (const script of scripts) {
+      for (const win of await cachedExtractGsapWindows(script.content)) {
+        for (const values of [win.fromPropertyValues, win.propertyValues]) {
+          for (const [property, value] of Object.entries(values ?? {})) {
+            if (!isGsapColorProperty(property)) continue;
+            for (const variable of cssVariableReferencesWithoutFallback(value)) {
+              if (definedVariables.has(variable)) continue;
+              const key = `${win.targetSelector}|${property}|${variable}`;
+              if (reported.has(key)) continue;
+              reported.add(key);
+              findings.push({
+                code: "gsap_undefined_css_variable",
+                severity: "warning",
+                message: `GSAP ${property} on "${win.targetSelector}" uses ${variable}, but no static CSS or composition-variable declaration defines it. The computed color may become invalid or transparent.`,
+                selector: win.targetSelector,
+                fixHint: `Define ${variable} in applicable CSS, declare "${variable.slice(2)}" in data-composition-variables, or add a var() fallback such as var(${variable}, #fff).`,
+                snippet: truncateSnippet(win.raw),
+              });
+            }
+          }
+        }
+      }
+    }
+    return findings;
+  },
+
+  // overlapping_gsap_tweens + gsap_animates_clip_element
+  // fallow-ignore-next-line complexity
+  async ({ tags, scripts, styles }) => {
+    const findings: HyperframeLintFinding[] = [];
+    const authoredHiddenSelectors = new Set(
+      scripts.flatMap((script) => [...extractStandaloneHiddenSelectors(script.content)]),
+    );
 
     // Build clip element selector map
     type ClipInfo = { tag: string; id: string; classes: string };
@@ -1083,16 +1063,11 @@ export const gsapRules: LintRule<LintContext>[] = [
       }
     }
 
-    const classUsage = countClassUsage(tags);
-    const clipStartBoundariesByComposition = collectClipStartBoundariesByComposition(source, tags);
     const styleRules = collectSimpleStyleRules(styles);
     const reportedVisibleOverlayKeys = new Set<string>();
 
     for (const script of scripts) {
-      const localTimelineCompId = readRegisteredTimelineCompositionId(script.content);
       const gsapWindows = await cachedExtractGsapWindows(script.content);
-      const clipStartBoundaries =
-        clipStartBoundariesByComposition.get(localTimelineCompId || rootCompositionId || "") ?? [];
 
       // overlapping_gsap_tweens
       for (let i = 0; i < gsapWindows.length; i++) {
@@ -1128,45 +1103,51 @@ export const gsapRules: LintRule<LintContext>[] = [
         }
       }
 
-      // gsap_exit_missing_hard_kill
-      if (clipStartBoundaries.length > 0) {
-        for (const win of gsapWindows) {
-          // Unresolved targets are unknown elements: you cannot assert a missing
-          // hard kill on one, and a `tl.set("__unresolved__", ...)` hint is meaningless.
-          if (win.targetSelector === UNRESOLVED_TARGET) continue;
-          if (!isSceneBoundaryExit(win)) continue;
-          const boundary = findMatchingSceneBoundary(win.end, clipStartBoundaries);
-          if (boundary == null) continue;
-          const hasHardKill = gsapWindows.some((candidate) =>
-            isHardKillSet(candidate, win.targetSelector, boundary),
+      // gsap_repeated_fromto_without_baseline
+      const fromToWindowsBySelector = new Map<string, GsapWindow[]>();
+      for (const win of gsapWindows) {
+        if (win.method !== "fromTo" || win.immediateRender === false) continue;
+        if (win.targetSelector === UNRESOLVED_TARGET) continue;
+        const windows = fromToWindowsBySelector.get(win.targetSelector) ?? [];
+        windows.push(win);
+        fromToWindowsBySelector.set(win.targetSelector, windows);
+      }
+
+      const repeatedFromToGroups = [...fromToWindowsBySelector.values()].filter(
+        (windows) => windows.length >= 2,
+      );
+      for (const fromToWindows of repeatedFromToGroups) {
+        const firstFromTo = fromToWindows[0];
+        if (!firstFromTo) continue;
+        const selector = firstFromTo.targetSelector;
+        const firstFromToIndex = gsapWindows.indexOf(firstFromTo);
+        const firstFromToPosition = Math.min(...fromToWindows.map((win) => win.position));
+        const hasTimelineBaseline = gsapWindows
+          .slice(0, firstFromToIndex)
+          .some(
+            (candidate) =>
+              candidate.method === "set" &&
+              !candidate.global &&
+              candidate.targetSelector === selector &&
+              candidate.position <= firstFromToPosition,
           );
-          if (hasHardKill) continue;
+        if (hasTimelineBaseline) continue;
 
-          // A tl.set hard kill on the exiting selector itself is the fix — unless
-          // that selector IS a clip element, in which case gsap_animates_clip_element
-          // (below) errors on that exact tl.set: the framework already owns
-          // visibility/display on clip elements. Point at the inner-wrapper
-          // pattern instead so the two rules' advice doesn't contradict.
-          const exitClipInfo =
-            clipIds.get(win.targetSelector) || clipClasses.get(win.targetSelector);
-          const fixHint = exitClipInfo
-            ? `"${win.targetSelector}" is a clip element — the framework already manages its visibility. ` +
-              "Wrap the scene's content in an inner non-clip <div>, move the exit tween and the hard kill " +
-              `(\`tl.set("<inner-selector>", ${hiddenStateLiteral(win.propertyValues)}, ${boundary.toFixed(2)})\`) onto that wrapper instead.`
-            : `Add \`tl.set("${win.targetSelector}", ${hiddenStateLiteral(win.propertyValues)}, ${boundary.toFixed(2)})\` ` +
-              "after the exit tween.";
-
-          findings.push({
-            code: "gsap_exit_missing_hard_kill",
-            severity: "error",
-            message:
-              `GSAP exit on "${win.targetSelector}" ends at the ${boundary.toFixed(2)}s clip start boundary ` +
-              "without a matching tl.set hard kill. Non-linear seeking can land after the fade and leave stale visibility state.",
-            selector: win.targetSelector,
-            fixHint,
-            snippet: truncateSnippet(win.raw),
-          });
-        }
+        findings.push({
+          code: "gsap_repeated_fromto_without_baseline",
+          severity: "warning",
+          message:
+            `${fromToWindows.length} tl.fromTo() calls target "${selector}" with no stable baseline. ` +
+            `The last-authored fromTo "from" values become the element's resting state for any seek before ` +
+            `the first tween actually runs, because GSAP applies fromTo from-values at authoring time ` +
+            `(immediateRender), not at tween position.`,
+          selector,
+          fixHint:
+            `Add \`immediateRender: false\` to the destination vars of each future fromTo, or set a safe ` +
+            `resting state with an earlier \`tl.set("${selector}", { ... }, 0)\`. Pre-first-tween seeks must not ` +
+            `inherit whichever fromTo call happened to author last.`,
+          snippet: truncateSnippet(fromToWindows.map((win) => win.raw).join("\n")),
+        });
       }
 
       // gsap_fullscreen_overlay_starts_visible
@@ -1190,9 +1171,12 @@ export const gsapRules: LintRule<LintContext>[] = [
           .sort((a, b) => a.position - b.position);
         const startsHiddenAtZero = visibilityWindows.some(
           (win) =>
-            win.position <= SCENE_BOUNDARY_EPSILON_SECONDS && isHiddenGsapState(win.propertyValues),
+            win.position <= SCENE_BOUNDARY_EPSILON_SECONDS &&
+            (isHiddenGsapState(win.propertyValues) ||
+              (win.fromPropertyValues !== undefined && isHiddenGsapState(win.fromPropertyValues))),
         );
         if (startsHiddenAtZero) continue;
+        if (selectors.some((selector) => authoredHiddenSelectors.has(selector))) continue;
         const firstVisible = visibilityWindows.find((win) => makesOverlayVisible(win));
         if (!firstVisible) continue;
         const selector =
@@ -1201,10 +1185,30 @@ export const gsapRules: LintRule<LintContext>[] = [
           ) ||
           selectors[0] ||
           tag.name;
+        // A window only re-hides the overlay if it is a DIFFERENT tween that ends
+        // hidden. Two exclusions matter:
+        //   - `win !== firstVisible`: the reveal counted itself.
+        //   - `method !== "from"`: a from-tween's recorded propertyValues are its
+        //     START state. `from({opacity: 0})` ENDS visible, so reading those values
+        //     as an end state made every from-reveal look like its own later hide.
+        // Together these are what made the `from` shape report at all.
         const laterHidden = visibilityWindows.some(
-          (win) => win.position >= firstVisible.position && isHiddenGsapState(win.propertyValues),
+          (win) =>
+            win !== firstVisible &&
+            win.method !== "from" &&
+            win.position >= firstVisible.position &&
+            isHiddenGsapState(win.propertyValues),
         );
-        if (firstVisible.method !== "from" && !laterHidden) continue;
+        // Only the later-hidden shape is a real defect. The `from` shape is not:
+        // gsap.from() seats its start values immediately, so on a paused timeline the
+        // overlay already measures opacity 0 at t=0 and never covers an early frame.
+        //
+        // Worse, it had no exit. Both fixHints below (authored CSS `opacity: 0`, or an
+        // immediate `gsap.set`) turn a working composition into a real defect that
+        // `gsap_from_opacity_noop` correctly errors on — and that rule's fixHint says to
+        // remove the very thing we just asked for, closing the loop. An agent applying
+        // either hint bounces between the two errors forever.
+        if (!laterHidden) continue;
 
         reportedVisibleOverlayKeys.add(overlayKey);
         findings.push({
@@ -1226,40 +1230,25 @@ export const gsapRules: LintRule<LintContext>[] = [
         });
       }
 
-      // gsap_animates_clip_element — only error when GSAP animates visibility/display
+      // gsap_animates_clip_element — GSAP must not compete with the framework's
+      // clip visibility window. autoAlpha owns visibility as well as opacity.
       for (const win of gsapWindows) {
         const sel = win.targetSelector;
         const clipInfo = clipIds.get(sel) || clipClasses.get(sel);
         if (!clipInfo) continue;
         const conflictingProps = win.properties.filter(
-          (p) => p === "visibility" || p === "display",
+          (p) => p === "visibility" || p === "display" || p === "autoAlpha",
         );
         if (conflictingProps.length === 0) continue;
         const elDesc = `<${clipInfo.tag}${clipInfo.id ? ` id="${clipInfo.id}"` : ""} class="${clipInfo.classes}">`;
         findings.push({
           code: "gsap_animates_clip_element",
           severity: "error",
-          message: `GSAP animation sets ${conflictingProps.join(", ")} on a clip element. Selector "${sel}" resolves to element ${elDesc}. The framework manages clip visibility via ${conflictingProps.join("/")} — do not animate these properties on clip elements.`,
+          message: `GSAP animation sets ${conflictingProps.join(", ")} on a clip element. Selector "${sel}" resolves to element ${elDesc}. The framework manages clip visibility, and autoAlpha writes visibility as well as opacity — do not animate these properties on clip elements.`,
           selector: sel,
           elementId: clipInfo.id || undefined,
           fixHint:
-            "Remove the visibility/display tween, or move the content into a child <div> and target that instead.",
-          snippet: truncateSnippet(win.raw),
-        });
-      }
-
-      // unscoped_gsap_selector
-      if (!localTimelineCompId || localTimelineCompId === rootCompositionId) continue;
-      for (const win of gsapWindows) {
-        if (!isSuspiciousGlobalSelector(win.targetSelector)) continue;
-        const className = getSingleClassSelector(win.targetSelector);
-        if (className && (classUsage.get(className) || 0) < 2) continue;
-        findings.push({
-          code: "unscoped_gsap_selector",
-          severity: "error",
-          message: `Timeline "${localTimelineCompId}" uses unscoped selector "${win.targetSelector}" that will target elements in ALL compositions when bundled, causing data loss (opacity, transforms, etc.).`,
-          selector: win.targetSelector,
-          fixHint: `Scope the selector: \`[data-composition-id="${localTimelineCompId}"] ${win.targetSelector}\` or use a unique id.`,
+            "Remove the visibility/display/autoAlpha tween, or move the content into a child <div> and target that instead.",
           snippet: truncateSnippet(win.raw),
         });
       }
@@ -1420,6 +1409,85 @@ export const gsapRules: LintRule<LintContext>[] = [
     ];
   },
 
+  // missing_gsap_plugin
+  async ({ scripts, rawSource, options }) => {
+    const canInheritPluginFromHost =
+      options.isSubComposition || rawSource.trimStart().toLowerCase().startsWith("<template");
+    if (canInheritPluginFromHost) return [];
+
+    const gsapScriptMotionPathFirstUseIndex = await loadGsapScriptMotionPathFirstUseIndex();
+    const motionPathUseIndices = scripts.map((script) =>
+      gsapScriptMotionPathFirstUseIndex(script.content),
+    );
+    const firstMotionPathScriptIndex = motionPathUseIndices.findIndex((index) => index !== null);
+    const firstMotionPathUseIndex = motionPathUseIndices[firstMotionPathScriptIndex] ?? null;
+    const firstUseScript = scripts[firstMotionPathScriptIndex];
+    const executionMode = (attrs: string): "blocking" | "defer" | "module" | "async" => {
+      const tag = `<script ${attrs}>`;
+      const isModule = (readDecodedAttr(tag, "type") ?? "").toLowerCase() === "module";
+      const hasSrc = readDecodedAttr(tag, "src") !== null;
+      const hasAsync = readDecodedAttr(tag, "async") !== null;
+      const hasDefer = readDecodedAttr(tag, "defer") !== null;
+      if ((isModule || hasSrc) && hasAsync) return "async";
+      if (isModule) return "module";
+      if (hasSrc && hasDefer) return "defer";
+      return "blocking";
+    };
+    const firstUseMode = firstUseScript ? executionMode(firstUseScript.attrs) : "blocking";
+    const hasMotionPathPlugin = scripts
+      .slice(0, firstMotionPathScriptIndex + 1)
+      .some((script, candidateIndex) => {
+        const candidateMode = executionMode(script.attrs);
+        const sameScript = candidateIndex === firstMotionPathScriptIndex;
+        const candidateIsPostParse = candidateMode === "defer" || candidateMode === "module";
+        const firstUseIsPostParse = firstUseMode === "defer" || firstUseMode === "module";
+        const executesBeforeFirstUse =
+          sameScript ||
+          candidateMode === "blocking" ||
+          (candidateIsPostParse && firstUseIsPostParse);
+        if (!executesBeforeFirstUse || (!sameScript && candidateMode === "async")) return false;
+        const src = readAttr(`<script ${script.attrs}>`, "src") ?? "";
+        const uncommented = stripJsComments(script.content);
+        const hasStaticImport =
+          /\bimport\s+(?:[\s\S]*?\sfrom\s*)?["'][^"']*\bMotionPathPlugin\b[^"']*["']/.test(
+            uncommented,
+          ) ||
+          /\bimport\s+(?:[\w$]+\s*,\s*)?\{[^}]*\bMotionPathPlugin\b[^}]*\}\s+from\s*["'][^"']+["']/.test(
+            uncommented,
+          ) ||
+          /\bimport\s+MotionPathPlugin\s+from\s*["'][^"']+["']/.test(uncommented);
+        const inlinedMarkerIndex = script.content.search(/\/\*\s*inlined:.*MotionPathPlugin/i);
+        const definitionIndex = uncommented.search(
+          /\b(?:const|let|var|class|function)\s+MotionPathPlugin\b/,
+        );
+        if (sameScript) {
+          if (hasStaticImport) return true;
+          if (firstMotionPathUseIndex === null) return false;
+          return (
+            (inlinedMarkerIndex >= 0 && inlinedMarkerIndex < firstMotionPathUseIndex) ||
+            (definitionIndex >= 0 && definitionIndex < firstMotionPathUseIndex)
+          );
+        }
+        return (
+          /MotionPathPlugin/i.test(src) ||
+          hasStaticImport ||
+          inlinedMarkerIndex >= 0 ||
+          definitionIndex >= 0
+        );
+      });
+    if (firstMotionPathScriptIndex < 0 || hasMotionPathPlugin) return [];
+    return [
+      {
+        code: "missing_gsap_plugin",
+        severity: "error",
+        message:
+          "A GSAP tween uses motionPath, but MotionPathPlugin is not loaded. Core GSAP ignores this plugin-specific property, so the intended motion will not render.",
+        fixHint:
+          "Load MotionPathPlugin before the animation script and register it with gsap.registerPlugin(MotionPathPlugin), or replace motionPath with core GSAP x/y tweens.",
+      },
+    ];
+  },
+
   // audio_reactive_single_tween_per_group
   // fallow-ignore-next-line complexity
   ({ scripts, styles }) => {
@@ -1466,8 +1534,12 @@ export const gsapRules: LintRule<LintContext>[] = [
   },
 
   // gsap_infinite_repeat
-  ({ scripts }) => {
+  ({ scripts, rootTag }) => {
     const findings: HyperframeLintFinding[] = [];
+    const declaredDuration = Number.parseFloat(
+      rootTag ? (readAttr(rootTag.raw, "data-duration") ?? "") : "",
+    );
+    const hasFiniteCompositionWindow = Number.isFinite(declaredDuration) && declaredDuration > 0;
     // Match repeat: -1 in GSAP tweens or timeline configs
     const pattern = /repeat\s*:\s*-1(?!\d)/g;
     for (const { snippet } of scanScriptsForRegexMatches(scripts, pattern, {
@@ -1477,14 +1549,16 @@ export const gsapRules: LintRule<LintContext>[] = [
     })) {
       findings.push({
         code: "gsap_infinite_repeat",
-        severity: "error",
-        message:
-          "GSAP tween uses `repeat: -1` (infinite). Infinite repeats break the deterministic " +
-          "capture engine which seeks to exact frame times. Use a finite repeat count calculated " +
-          "from the composition duration: `repeat: Math.floor(duration / cycleDuration) - 1`.",
-        fixHint:
-          "Replace `repeat: -1` with a finite count, e.g. `repeat: Math.floor(totalDuration / singleCycleDuration) - 1`. " +
-          "Use Math.floor (not Math.ceil) to ensure the animation fits within the total duration.",
+        severity: hasFiniteCompositionWindow ? "warning" : "error",
+        message: hasFiniteCompositionWindow
+          ? `GSAP tween uses \`repeat: -1\` (infinite), but the composition declares a finite ${declaredDuration}s window. ` +
+            "HyperFrames clips deterministic seeking and export to that explicit duration."
+          : "GSAP tween uses `repeat: -1` (infinite) without a finite composition `data-duration`. " +
+            "The timeline can report an unbounded duration and make render planning fail.",
+        fixHint: hasFiniteCompositionWindow
+          ? "Keep the explicit finite composition `data-duration`. Use a finite repeat count only when the loop itself must end before the composition does."
+          : "Add a finite composition `data-duration`, or replace `repeat: -1` with " +
+            "`repeat: Math.max(0, Math.floor(totalDuration / singleCycleDuration) - 1)`.",
         snippet: truncateSnippet(snippet),
       });
     }
@@ -1510,7 +1584,7 @@ export const gsapRules: LintRule<LintContext>[] = [
           "For example, Math.ceil(10.5 / 2) - 1 = 5 repeats → 6 cycles × 2s = 12s, exceeding 10.5s.",
         fixHint:
           "Use `Math.floor` instead of `Math.ceil` to ensure the animation fits within the duration: " +
-          "`repeat: Math.floor(totalDuration / cycleDuration) - 1`. " +
+          "`repeat: Math.max(0, Math.floor(totalDuration / cycleDuration) - 1)`. " +
           "Math.floor(10.5 / 2) - 1 = 4 repeats → 5 cycles × 2s = 10s ✓",
         snippet: truncateSnippet(snippet),
       });
@@ -1518,54 +1592,29 @@ export const gsapRules: LintRule<LintContext>[] = [
     return findings;
   },
 
-  // scene_layer_missing_visibility_kill
-  ({ scripts, tags }) => {
+  // gsap_repeat_floor_unclamped
+  ({ scripts }) => {
     const findings: HyperframeLintFinding[] = [];
-
-    // Detect multi-scene compositions: multiple elements with "scene" in their id
-    const sceneElements = tags.filter((t) => {
-      const id = readAttr(t.raw, "id") || "";
-      return /^scene\d+$/i.test(id);
-    });
-    if (sceneElements.length < 2) return findings;
-
-    for (const script of scripts) {
-      const content = stripJsComments(script.content);
-      // For each scene, check if there's a visibility:hidden set after exit tweens
-      for (const tag of sceneElements) {
-        const id = readAttr(tag.raw, "id") || "";
-        // Check if this scene has exit tweens (opacity: 0)
-        const exitPattern = new RegExp(`["']#${id}["'][^)]*opacity\\s*:\\s*0`);
-        const hasExit = exitPattern.test(content);
-        if (!hasExit) continue;
-
-        // Check if there's a hard visibility kill
-        const killPattern = new RegExp(`["']#${id}["'][^)]*visibility\\s*:\\s*["']hidden["']`);
-        const hasKill = killPattern.test(content);
-        if (!hasKill) {
-          // A tl.set on "#id" is only safe advice when the scene element isn't
-          // itself a clip — otherwise gsap_animates_clip_element errors on that
-          // exact tl.set, since the framework already owns visibility/display on
-          // clip elements. Point at the inner-wrapper pattern instead.
-          const classes = (readAttr(tag.raw, "class") || "").split(/\s+/).filter(Boolean);
-          const isClip = classes.includes("clip");
-          const fixHint = isClip
-            ? `"#${id}" is a clip element — the framework already manages its visibility. ` +
-              "Wrap the scene's content in an inner non-clip <div>, move the exit tween and the hard kill " +
-              '(`tl.set("<inner-selector>", { visibility: "hidden" }, <exit-end-time>)`) onto that wrapper instead.'
-            : `Add \`tl.set("#${id}", { visibility: "hidden" }, <exit-end-time>)\` after the scene's exit tweens.`;
-
-          findings.push({
-            code: "scene_layer_missing_visibility_kill",
-            severity: "error",
-            elementId: id,
-            message:
-              `Scene layer "#${id}" exits via opacity tween but has no visibility: hidden hard kill. ` +
-              "When scrubbing or when tweens conflict, the scene may remain partially visible and overlap the next scene.",
-            fixHint,
-          });
-        }
-      }
+    // A direct floor-minus-one expression becomes GSAP's infinite -1 sentinel when
+    // the visible duration is shorter than one full cycle. Math.max-wrapped forms
+    // intentionally do not match because `repeat:` is followed by Math.max, not Math.floor.
+    const pattern = /repeat\s*:\s*Math\.floor\s*\([^)]+\)\s*-\s*1/g;
+    for (const { snippet } of scanScriptsForRegexMatches(scripts, pattern, {
+      stripComments: false,
+      contextBefore: 40,
+      contextAfter: 40,
+    })) {
+      findings.push({
+        code: "gsap_repeat_floor_unclamped",
+        severity: "warning",
+        message:
+          "GSAP repeat calculation can evaluate to -1 when the composition is shorter than one cycle, " +
+          "which GSAP interprets as an infinite repeat.",
+        fixHint:
+          "Clamp the finite repeat count at zero: " +
+          "`repeat: Math.max(0, Math.floor(totalDuration / cycleDuration) - 1)`.",
+        snippet: truncateSnippet(snippet),
+      });
     }
     return findings;
   },
@@ -2112,6 +2161,61 @@ export const gsapRules: LintRule<LintContext>[] = [
     return findings;
   },
 
+  // gsap_timeline_return_used_as_tween — `tl.to()` returns the TIMELINE, not the tween it just
+  // created. `gsap.to()` returns a Tween, so the two read identically and behave nothing alike.
+  // Capturing the timeline's return and later treating it as an individual animation aims a
+  // tween-scoped call at the whole composition: `.kill()` on it interrupts the master timeline
+  // and detaches it from its parent, which stops a parent-driven seek dead while leaving an
+  // explicit `tl.progress()` still working -- so a render of the packaged defaults looks fine
+  // and only live playback breaks. A rebuild that collected these to discard them also leaves
+  // every previous keyframe in place and stacks the new ones on top.
+  ({ scripts }) => {
+    const findings: HyperframeLintFinding[] = [];
+    for (const script of scripts) {
+      const source = stripJsComments(script.content);
+      const timelineVars = collectTimelineVarNames(source);
+      if (timelineVars.length === 0) continue;
+      const receivers = timelineVars.map(escapeRegExp).join("|");
+      // Two capture shapes: collecting into an array, or binding to a name. Keying on the
+      // known timeline handles is what keeps `gsap.to()` -- and `Array.from()` -- out of it.
+      const pattern = new RegExp(
+        String.raw`(?:\.push\s*\(\s*|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)(?:${receivers})\s*\.\s*(to|from|fromTo|set|call|add)\s*\(`,
+        "g",
+      );
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(source)) !== null) {
+        const boundName = match[1];
+        const method = match[2]!;
+        // A bound name is only a problem once something tween-scoped is aimed at it; pushing
+        // into an array is already the collect-to-discard shape this exists to stop.
+        if (boundName) {
+          const treatedAsTween = new RegExp(
+            String.raw`\b${escapeRegExp(boundName)}\s*\.\s*(?:kill|revert|invalidate|pause|resume|restart|seek|progress|timeScale)\s*\(`,
+          );
+          if (!treatedAsTween.test(source)) continue;
+        }
+        const contextStart = Math.max(0, match.index - 40);
+        findings.push({
+          code: "gsap_timeline_return_used_as_tween",
+          severity: "error",
+          message:
+            `\`${match[0].includes(".push") ? "push" : boundName}\` captures the return of \`.${method}()\` on timeline \`${timelineVars[0]}\`, ` +
+            "but a timeline's `.to()`/`.from()`/`.set()` returns THE TIMELINE ITSELF, not the tween it created. " +
+            "Every captured value is the same master timeline, so a tween-scoped call on it — `.kill()` above all — " +
+            "hits the whole composition: it interrupts the timeline and detaches it from its parent, which freezes a " +
+            "parent-driven seek while an explicit `tl.progress()` keeps working. Only `gsap.to()` returns a tween.",
+          fixHint:
+            "To build a group of keyframes you can later discard, put them in a nested timeline: " +
+            "`const nested = gsap.timeline(); nested.to(...); tl.add(nested, 0);` — then `nested.kill()` " +
+            "replaces exactly those keyframes and cannot reach `tl`. Children keep their absolute times when the " +
+            "nest is added at 0. To hold a single real tween, create it with `gsap.to(...)` and place it with `tl.add(tween, at)`.",
+          snippet: truncateSnippet(source.slice(contextStart, match.index + match[0].length + 60)),
+        });
+      }
+    }
+    return findings;
+  },
+
   // gsap_group_selector_keyframes
   ({ scripts }) => {
     const findings: HyperframeLintFinding[] = [];
@@ -2263,7 +2367,7 @@ export const gsapRules: LintRule<LintContext>[] = [
       const initialHolds = firstTweenIndex < 0 ? windows : windows.slice(0, firstTweenIndex);
       for (const win of initialHolds) {
         if (!isInstantHold(win) || win.position !== 0) continue;
-        if (win.global || win.immediateRender) continue;
+        if (win.global || win.immediateRender === true) continue;
         if (targetHasNoStableIdentity(win.targetSelector, win.targetIdentity)) continue;
         const targetTokens = [...targetedSelectorTokens(win.targetSelector)];
         const hiddenByToken =

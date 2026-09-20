@@ -1,30 +1,30 @@
 import { memo } from "react";
 import { TimelineRuler } from "./TimelineRuler";
 import { PlayheadIndicator } from "./PlayheadIndicator";
-import { getTimelineEditCapabilities, type TimelineRangeSelection } from "./timelineEditing";
-import { getRenderedTimelineElement } from "./timelineTheme";
+import type { TimelineRangeSelection } from "./timelineEditing";
+import type { TimelineDropPlacement } from "./timelineCallbacks";
 import {
-  GUTTER,
-  TRACK_H,
   RULER_H,
   CLIP_Y,
   TRACKS_TOP_PAD,
   TRACKS_BOTTOM_PAD,
-  TRACKS_LEFT_PAD,
+  TRACK_H,
   PLAYHEAD_HEAD_W,
   getTimelinePlayheadLeft,
   getTimelineRowTop,
+  getTimelineRowHeight,
 } from "./timelineLayout";
 import { usePlayerStore } from "../store/playerStore";
 import type { ResizingClipState } from "./useTimelineClipDrag";
 import { type MultiDragPreviewInput } from "./timelineMultiDragPreview";
 import { useTimelineEditContextOptional } from "../../contexts/TimelineEditContext";
 import type { Rect } from "../../utils/marqueeGeometry";
-import { TimelineClip } from "./TimelineClip";
-import { TimelineLanes, type TimelineLaneBaseProps } from "./TimelineLanes";
-import { renderClipChildren } from "./timelineClipChildren";
-import { useTimelineRevealClip } from "./useTimelineRevealClip";
+import { TimelineLanes } from "./TimelineLanes";
+import type { TimelineLaneBaseProps } from "./timelineLaneProps";
 import type { TimelineLaneGapStrips } from "./useTimelineGapHighlights";
+import { getTimelineElementIdentity } from "../lib/timelineElementHelpers";
+import { TimelineGestureOverlay } from "./TimelineGestureOverlay";
+import { resolveSnapGuide } from "./timelineSnapping";
 
 interface TimelineCanvasProps extends TimelineLaneBaseProps {
   major: number[];
@@ -41,30 +41,45 @@ interface TimelineCanvasProps extends TimelineLaneBaseProps {
   playheadRef: React.RefObject<HTMLDivElement | null>;
   /** Gap strips: loud on gap-menu-row hover, quiet on the selected clip's lane. */
   laneGapStrips: TimelineLaneGapStrips[];
+  /** Landing spot of an outside drag in progress, or null. */
+  dropPreview: TimelineDropPlacement | null;
 }
 
+// A dropped clip's length is unknown until it lands; the preview shows a default.
+const DROP_PREVIEW_SECONDS = 3;
+
 export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvasProps) {
-  const { draggedClip, scrollRef, selectedElementIds, displayTrackOrder } = props;
-  const { onResizeElement, onMoveElement, onToggleTrackHidden, onRazorSplit, onRazorSplitAll } =
-    useTimelineEditContextOptional();
+  const { draggedClip, resizingClip, scrollRef, selectedElementIds, displayTrackOrder } = props;
+  const snapGuide = resolveSnapGuide(draggedClip, resizingClip);
+  const draggedRowIndex =
+    draggedClip?.started === true ? displayTrackOrder.indexOf(draggedClip.previewTrack) : -1;
+  const dropTrackIndex = props.dropPreview
+    ? displayTrackOrder.indexOf(props.dropPreview.track)
+    : -1;
+  // A track not in the order is a new track, drawn one row past the last lane.
+  const dropRowIndex = dropTrackIndex < 0 ? displayTrackOrder.length : dropTrackIndex;
+  const insertLineRow =
+    (draggedClip?.started ? draggedClip.insertRow : null) ?? props.dropPreview?.insertRow ?? null;
+  const draggedRowHeight = getTimelineRowHeight(draggedRowIndex, props.rowHeights);
+  // A clip bar in an EXPANDED row still renders at TRACK_H (the property lanes
+  // occupy the rest of the row — see TimelineLanes' clipHeight), so the drag
+  // ghost and drop placeholder must clamp to it or they stretch to the full
+  // expanded row height and stop matching the clip being dragged.
+  const draggedClipHeight = Math.min(draggedRowHeight, TRACK_H) - CLIP_Y * 2;
+  const {
+    onResizeElement,
+    onMoveElement,
+    onToggleTrackHidden,
+    onTogglePropertyGroupKeyframe,
+    onRazorSplit,
+    onRazorSplitAll,
+  } = useTimelineEditContextOptional();
   const beatDragging = usePlayerStore((s) => s.beatDragging);
-  // Scroll a clip into view when the sidebar (asset card) requests a reveal.
-  useTimelineRevealClip(scrollRef);
   const draggedElement = draggedClip?.element ?? null;
-  const activeDraggedElement =
-    draggedClip?.started === true && draggedElement
-      ? getRenderedTimelineElement({
-          element: draggedElement,
-          draggedElementId: draggedElement.key ?? draggedElement.id,
-          previewStart: draggedClip.previewStart,
-          previewTrack: draggedClip.previewTrack,
-        })
-      : null;
+  const draggedElementIdentity = draggedElement ? getTimelineElementIdentity(draggedElement) : null;
   // The drag ghost follows the cursor freely (both axes) — CapCut-style. The
   // "magnetic" affordance is a highlight on the destination lane (draggedRowIndex),
   // which flips at the MAGNETIC_TRACK_THRESHOLD point; the clip drops into it.
-  const draggedRowIndex =
-    draggedClip?.started === true ? displayTrackOrder.indexOf(draggedClip.previewTrack) : -1;
   // Live multi-selection drag: while a selected clip is dragged, ALL selected
   // clips move together as one rigid formation. The GRABBED clip is the free
   // ghost below; its co-selected "passengers" slide by the SAME group-clamped
@@ -73,35 +88,19 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
   // the wall together and never deforms. Matches what the commit will do — see
   // timelineMultiDragPreview + commit.
   const multiDragPreview: MultiDragPreviewInput | null =
-    draggedClip?.started === true && draggedElement
+    draggedClip?.started === true && draggedElement && draggedElementIdentity
       ? {
           dragStarted: true,
-          draggedKey: draggedElement.key ?? draggedElement.id,
+          draggedKey: draggedElementIdentity,
           draggedOriginStart: draggedElement.start,
           draggedPreviewStart: draggedClip.previewStart,
           selectedKeys: selectedElementIds,
         }
       : null;
-  const activeDraggedPosition =
-    draggedClip?.started === true && activeDraggedElement && scrollRef.current
-      ? {
-          left:
-            draggedClip.pointerClientX -
-            scrollRef.current.getBoundingClientRect().left +
-            scrollRef.current.scrollLeft -
-            draggedClip.pointerOffsetX,
-          top:
-            draggedClip.pointerClientY -
-            scrollRef.current.getBoundingClientRect().top +
-            scrollRef.current.scrollTop -
-            draggedClip.pointerOffsetY,
-        }
-      : null;
-
   return (
     <div
       className="relative"
-      style={{ height: props.totalH, width: GUTTER + TRACKS_LEFT_PAD + props.trackContentWidth }}
+      style={{ height: props.totalH, width: props.contentOrigin + props.trackContentWidth }}
     >
       <TimelineRuler
         major={props.major}
@@ -113,17 +112,21 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
         majorTickInterval={props.majorTickInterval}
         theme={props.theme}
         beatAnalysis={props.beatAnalysis}
+        contentOrigin={props.contentOrigin}
+        renderTimeRange={props.rowsVirtualized ? props.renderTimeRange : undefined}
       />
 
       {/* Breathing room between the sticky ruler and the first track lane — the
           top half of the CapCut-style padding (see TRACKS_TOP_PAD). */}
-      <div aria-hidden="true" style={{ height: TRACKS_TOP_PAD }} />
+      <div aria-hidden="true" style={{ height: props.rowsVirtualized ? 0 : TRACKS_TOP_PAD }} />
 
       <TimelineLanes
         {...props}
+        snapGuide={snapGuide}
         draggedElement={draggedElement}
         multiDragPreview={multiDragPreview}
         onToggleTrackHidden={onToggleTrackHidden}
+        onTogglePropertyGroupKeyframe={onTogglePropertyGroupKeyframe}
         onResizeElement={onResizeElement}
         onMoveElement={onMoveElement}
         onRazorSplit={onRazorSplit}
@@ -133,7 +136,7 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
       {/* Breathing room below the last track lane (~1.5 track heights) — a real
           scrollable surface, so a clip can be dragged into the void to create a
           new bottom track comfortably (see TRACKS_BOTTOM_PAD / getTimelineCanvasHeight). */}
-      <div aria-hidden="true" style={{ height: TRACKS_BOTTOM_PAD }} />
+      <div aria-hidden="true" style={{ height: props.rowsVirtualized ? 0 : TRACKS_BOTTOM_PAD }} />
 
       {/* Gap strips — loud dashed fill for the gap(s) a hovered "Close gap(s)"
           menu row would collapse; a quiet tint for every gap on the selected
@@ -143,13 +146,19 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
         const rowIndex = displayTrackOrder.indexOf(strip.track);
         if (rowIndex < 0) return null;
         const loud = strip.kind === "hover";
-        return strip.intervals.map((gap) => (
+        const visibleIntervals = props.rowsVirtualized
+          ? strip.intervals.filter(
+              (gap) =>
+                gap.start < props.renderTimeRange.end && gap.end > props.renderTimeRange.start,
+            )
+          : strip.intervals;
+        return visibleIntervals.map((gap) => (
           <div
             key={`gap-${strip.kind}-${strip.track}-${gap.start}`}
             className="pointer-events-none absolute"
             style={{
-              top: getTimelineRowTop(rowIndex) + CLIP_Y,
-              left: GUTTER + TRACKS_LEFT_PAD + gap.start * props.pps,
+              top: getTimelineRowTop(rowIndex, props.rowHeights) + CLIP_Y,
+              left: props.contentOrigin + gap.start * props.pps,
               width: Math.max((gap.end - gap.start) * props.pps, 2),
               height: TRACK_H - CLIP_Y * 2,
               background: loud ? "rgba(60,230,172,0.18)" : "rgba(60,230,172,0.055)",
@@ -166,12 +175,32 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
         <div
           className="absolute pointer-events-none"
           style={{
-            top: getTimelineRowTop(draggedRowIndex) + CLIP_Y,
-            left: GUTTER + TRACKS_LEFT_PAD + draggedClip.previewStart * props.pps,
+            top: getTimelineRowTop(draggedRowIndex, props.rowHeights) + CLIP_Y,
+            left: props.contentOrigin + draggedClip.previewStart * props.pps,
             width: Math.max(draggedClip.element.duration * props.pps, 4),
+            height: draggedClipHeight,
+            border: "1px solid color-mix(in srgb, var(--color-accent) 55%, transparent)",
+            background: "color-mix(in srgb, var(--color-accent) 12%, transparent)",
+            borderRadius: 4,
+            zIndex: 30,
+          }}
+        />
+      )}
+
+      {/* Drop preview: where an asset or file dragged in from outside will land
+          (a row past the last lane means a new track). */}
+      {props.dropPreview && props.dropPreview.insertRow == null && (
+        <div
+          aria-hidden="true"
+          data-testid="timeline-drop-preview"
+          className="absolute pointer-events-none"
+          style={{
+            top: getTimelineRowTop(dropRowIndex, props.rowHeights) + CLIP_Y,
+            left: props.contentOrigin + props.dropPreview.start * props.pps,
+            width: DROP_PREVIEW_SECONDS * props.pps,
             height: TRACK_H - CLIP_Y * 2,
-            border: "1px solid rgba(60,230,172,0.55)",
-            background: "rgba(60,230,172,0.12)",
+            border: "1px solid color-mix(in srgb, var(--color-accent) 55%, transparent)",
+            background: "color-mix(in srgb, var(--color-accent) 12%, transparent)",
             borderRadius: 4,
             zIndex: 30,
           }}
@@ -180,12 +209,13 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
 
       {/* Insertion line — a new track will be inserted at this boundary on drop.
           Shown while the pointer is near a lane boundary (insert mode). */}
-      {draggedClip?.started && draggedClip.insertRow != null && (
+      {insertLineRow != null && (
         <div
+          data-testid="timeline-insert-line"
           className="absolute pointer-events-none"
           style={{
-            top: getTimelineRowTop(draggedClip.insertRow) - 0.5,
-            left: GUTTER + TRACKS_LEFT_PAD,
+            top: getTimelineRowTop(insertLineRow, props.rowHeights) - 0.5,
+            left: props.contentOrigin,
             width: props.trackContentWidth,
             height: 1,
             background: "#3CE6AC",
@@ -195,18 +225,18 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
         />
       )}
 
-      {/* Snap guide for non-beat targets during clip drag */}
-      {draggedClip?.started && draggedClip.snapTime != null && draggedClip.snapType !== "beat" && (
+      {/* Snap guide for non-beat targets during a clip move or trim */}
+      {snapGuide && snapGuide.type !== "beat" && (
         <div
           className="absolute pointer-events-none"
           style={{
-            left: GUTTER + TRACKS_LEFT_PAD + draggedClip.snapTime * props.pps,
+            left: props.contentOrigin + snapGuide.time * props.pps,
             top: RULER_H,
             bottom: 0,
             width: 1,
-            background: draggedClip.snapType === "playhead" ? "#3CE6AC" : "rgba(255,255,255,0.6)",
+            background: snapGuide.type === "playhead" ? "#3CE6AC" : "rgba(255,255,255,0.6)",
             boxShadow:
-              draggedClip.snapType === "playhead"
+              snapGuide.type === "playhead"
                 ? "0 0 6px rgba(60,230,172,0.5)"
                 : "0 0 6px rgba(255,255,255,0.4)",
             zIndex: 60,
@@ -214,46 +244,18 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
         />
       )}
 
-      {/* Drag ghost */}
-      {activeDraggedElement && activeDraggedPosition && (
-        <div
-          className="absolute pointer-events-none"
-          style={{
-            top: activeDraggedPosition.top,
-            left: activeDraggedPosition.left,
-            width: Math.max(activeDraggedElement.duration * props.pps, 4),
-            height: TRACK_H - CLIP_Y * 2,
-            zIndex: 40,
-          }}
-        >
-          <TimelineClip
-            el={{ ...activeDraggedElement, start: 0 }}
-            pps={props.pps}
-            clipY={0}
-            isSelected={
-              props.selectedElementId === (activeDraggedElement.key ?? activeDraggedElement.id)
-            }
-            isHovered={false}
-            isDragging={true}
-            hasCustomContent={!!props.renderClipContent}
-            capabilities={getTimelineEditCapabilities(activeDraggedElement)}
-            theme={props.theme}
-            isComposition={!!activeDraggedElement.compositionSrc}
-            onHoverStart={() => {}}
-            onHoverEnd={() => {}}
-            onResizeStart={() => {}}
-            onClick={() => {}}
-            onDoubleClick={() => {}}
-          >
-            {renderClipChildren(
-              activeDraggedElement,
-              props.getTrackStyle(activeDraggedElement.tag),
-              props.renderClipContent,
-              props.renderClipOverlay,
-            )}
-          </TimelineClip>
-        </div>
-      )}
+      <TimelineGestureOverlay
+        drag={draggedClip}
+        scrollRef={scrollRef}
+        pixelsPerSecond={props.pps}
+        rowHeight={draggedClipHeight}
+        selectedElementId={props.selectedElementId}
+        currentTime={props.currentTime}
+        theme={props.theme}
+        getTrackStyle={props.getTrackStyle}
+        renderClipContent={props.renderClipContent}
+        renderClipOverlay={props.renderClipOverlay}
+      />
 
       {/* Marquee (rubber-band) multi-select rectangle — mirrors the canvas
           MarqueeOverlay look: semi-transparent accent fill + dashed border. */}
@@ -280,8 +282,7 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
           className="absolute pointer-events-none"
           style={{
             left:
-              GUTTER +
-              TRACKS_LEFT_PAD +
+              props.contentOrigin +
               Math.min(props.rangeSelection.start, props.rangeSelection.end) * props.pps,
             width: Math.abs(props.rangeSelection.end - props.rangeSelection.start) * props.pps,
             top: RULER_H,
@@ -297,13 +298,13 @@ export const TimelineCanvas = memo(function TimelineCanvas(props: TimelineCanvas
       {/* Playhead — hidden while dragging a beat so its guideline doesn't
           track the scrub and clutter the beat being moved. Explicit width +
           the half-head offset baked into getTimelinePlayheadLeft keep the
-          inner 1px line's CENTER exactly on GUTTER + t * pps (the ruler
+          inner 1px line's CENTER exactly on contentOrigin + t * pps (the ruler
           ticks' center), instead of relying on shrink-wrap sizing. */}
       <div
         ref={props.playheadRef}
         className="absolute top-0 bottom-0 pointer-events-none"
         style={{
-          left: `${getTimelinePlayheadLeft(0, 0)}px`,
+          left: `${getTimelinePlayheadLeft(0, 0, props.contentOrigin)}px`,
           width: PLAYHEAD_HEAD_W,
           zIndex: 100,
           display: beatDragging ? "none" : undefined,

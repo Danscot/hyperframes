@@ -6,9 +6,11 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import type { TimelineElement } from "../player";
 import { usePlayerStore } from "../player";
 import { addBlockToProject } from "../utils/blockInstaller";
+import { selectAndRevealTimelineElement } from "../player/components/timelineDropReveal";
 import type { BlockParam } from "@hyperframes/core/registry";
 import type { EditHistoryKind } from "../utils/editHistory";
 import type { RightPanelTab } from "../utils/studioHelpers";
+import type { MediaOverlayPlacement } from "../components/editor/propertyPanelTypes";
 
 interface BlockCtxDeps {
   activeCompPath: string | null;
@@ -46,6 +48,7 @@ export interface UseBlockHandlersResult {
   >;
   handleAddBlock: (blockName: string) => void;
   handleTimelineBlockDrop: (blockName: string, placement: { start: number; track: number }) => void;
+  handleAddMediaOverlay: (blockName: string, placement: MediaOverlayPlacement) => Promise<void>;
   handlePreviewBlockDrop: (blockName: string, position: { left: number; top: number }) => void;
 }
 
@@ -146,6 +149,27 @@ export function useBlockHandlers({
           previewIframe: previewIframeRef.current,
           currentTime: usePlayerStore.getState().currentTime,
         }),
+      ).then((result) => {
+        if (result) selectAndRevealTimelineElement(result.hostKey);
+      });
+    },
+    [projectId, blockCtx, previewIframeRef, runBlockInstall],
+  );
+
+  const handleAddMediaOverlay = useCallback(
+    async (blockName: string, placement: MediaOverlayPlacement) => {
+      if (!projectId) return;
+      const { compositionPath, ...timelinePlacement } = placement;
+      await runBlockInstall(blockName, () =>
+        addBlockToProject({
+          projectId,
+          blockName,
+          ...blockCtx,
+          activeCompPath: compositionPath ?? blockCtx.activeCompPath,
+          placement: timelinePlacement,
+          previewIframe: previewIframeRef.current,
+          currentTime: usePlayerStore.getState().currentTime,
+        }),
       );
     },
     [projectId, blockCtx, previewIframeRef, runBlockInstall],
@@ -163,7 +187,9 @@ export function useBlockHandlers({
           previewIframe: previewIframeRef.current,
           currentTime: usePlayerStore.getState().currentTime,
         }),
-      );
+      ).then((result) => {
+        if (result) selectAndRevealTimelineElement(result.hostKey);
+      });
     },
     [projectId, blockCtx, previewIframeRef, runBlockInstall],
   );
@@ -173,6 +199,7 @@ export function useBlockHandlers({
     setActiveBlockParams,
     handleAddBlock,
     handleTimelineBlockDrop,
+    handleAddMediaOverlay,
     handlePreviewBlockDrop,
   };
 }

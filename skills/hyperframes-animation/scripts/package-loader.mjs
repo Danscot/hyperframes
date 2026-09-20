@@ -12,7 +12,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, parse, resolve } from "node:path";
+import { basename, delimiter, dirname, join, parse, resolve, win32 as win32Path } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -145,7 +145,7 @@ export function hyperframesPackageSpec(packageName) {
   const version = readBundledHyperframesVersion();
   if (version) return `${packageName}@${version}`;
 
-  // Global skill installs (e.g. ~/.claude/skills) have no hyperframes package.json
+  // Global skill installs have no hyperframes package.json
   // in their ancestor chain, so the bundled version is unknowable. Fall back to
   // @latest instead of throwing: already-installed packages still import, and a
   // bootstrap install can still proceed (@latest satisfies the pinned-spec guard).
@@ -339,23 +339,54 @@ function ancestors(start) {
   return dirs;
 }
 
+export function resolveNpmSpawnCommand(
+  args,
+  platform = process.platform,
+  env = process.env,
+  nodeExecPath = process.execPath,
+  pathExists = existsSync,
+) {
+  if (platform !== "win32") {
+    return { cmd: "npm", args, opts: { stdio: "inherit" } };
+  }
+
+  const bundledNpmCli = win32Path.join(
+    win32Path.dirname(nodeExecPath),
+    "node_modules",
+    "npm",
+    "bin",
+    "npm-cli.js",
+  );
+  const npmCli = [env.npm_execpath, bundledNpmCli].find(
+    (candidate) => candidate && pathExists(candidate),
+  );
+  if (!npmCli) return null;
+  return {
+    cmd: env.npm_node_execpath || nodeExecPath,
+    args: [npmCli, ...args],
+    opts: { stdio: "inherit", windowsHide: true },
+  };
+}
+
 function bootstrapWithNpmInstall(packageNames) {
   const installRoot = mkdtempSync(join(tmpdir(), "hyperframes-skill-deps-"));
-  const installResult = spawnSync(
-    process.platform === "win32" ? "npm.cmd" : "npm",
-    [
-      "install",
-      "--silent",
-      "--no-audit",
-      "--no-fund",
-      "--ignore-scripts",
-      "--no-save",
-      "--prefix",
-      installRoot,
-      ...packageNames,
-    ],
-    { stdio: "inherit" },
-  );
+  const npmArgs = [
+    "install",
+    "--silent",
+    "--no-audit",
+    "--no-fund",
+    "--ignore-scripts",
+    "--no-save",
+    "--prefix",
+    installRoot,
+    ...packageNames,
+  ];
+  const npmCommand = resolveNpmSpawnCommand(npmArgs);
+  if (!npmCommand) {
+    rmSync(installRoot, { recursive: true, force: true });
+    throw new Error("Could not locate npm-cli.js for dependency bootstrap on Windows.");
+  }
+  const installResult = spawnSync(npmCommand.cmd, npmCommand.args, npmCommand.opts);
 
   if (installResult.error) throw installResult.error;
   if (installResult.status !== 0) {

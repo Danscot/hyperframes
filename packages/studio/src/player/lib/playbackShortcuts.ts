@@ -6,19 +6,19 @@
  * is active and the user is navigating caption segments).
  */
 
+import { isTypingTarget } from "../../utils/typingTarget";
+
 const PLAYBACK_FRAME_STEP_CODES = new Set(["ArrowLeft", "ArrowRight"]);
 
 const PLAYBACK_SHORTCUT_IGNORED_SELECTOR = [
-  "input",
-  "textarea",
-  "select",
   "button",
   "a[href]",
-  "[contenteditable='true']",
   "[role='button']",
   "[role='checkbox']",
   "[role='combobox']",
   "[role='menuitem']",
+  // Base UI's menu radio item is a `<div>`, so `button` above no longer catches it.
+  "[role='menuitemradio']",
   "[role='radio']",
   "[role='slider']",
   "[role='spinbutton']",
@@ -27,6 +27,9 @@ const PLAYBACK_SHORTCUT_IGNORED_SELECTOR = [
 ].join(",");
 
 export function shouldIgnorePlaybackShortcutTarget(target: EventTarget | null): boolean {
+  // Anything the user is typing into owns its keys outright, editable elements
+  // included: a letter claimed here never reaches the text.
+  if (isTypingTarget(target)) return true;
   if (!target || typeof target !== "object") return false;
   const candidate = target as { closest?: unknown };
   if (typeof candidate.closest !== "function") return false;

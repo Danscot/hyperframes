@@ -4,6 +4,8 @@
  * from here without creating circular dependencies.
  */
 
+import type { RuntimeTimelineClipIdentity } from "@hyperframes/core";
+
 export interface PlaybackAdapter {
   play: () => void;
   pause: () => void;
@@ -32,23 +34,12 @@ export interface TimelineLike {
   isActive: () => boolean;
 }
 
-export interface ClipManifestClip {
-  id: string | null;
-  label: string;
-  start: number;
-  duration: number;
-  track: number;
+export interface ClipManifestClip extends RuntimeTimelineClipIdentity {
   zIndex?: number;
   stackingContextId?: string | null;
-  kind: "video" | "audio" | "image" | "element" | "composition";
-  tagName: string | null;
-  compositionId: string | null;
   compositionAncestors?: string[];
-  parentCompositionId: string | null;
-  compositionSrc: string | null;
   playbackStart?: number;
   playbackRate?: number;
-  assetUrl: string | null;
 }
 
 export interface ClipManifest {
@@ -69,4 +60,11 @@ export type IframeWindow = Window & {
   __timeline?: TimelineLike;
   __timelines?: Record<string, TimelineLike>;
   __clipManifest?: ClipManifest;
+  /** Declared runtime-side in core's window.d.ts, which this package cannot see.
+   *  Every member stays optional and is optional-called, so a runtime that
+   *  predates the hook degrades to a no-op instead of throwing. */
+  __hf?: {
+    leasePausedMedia?: (el: HTMLMediaElement) => void;
+    releasePausedMedia?: (el: HTMLMediaElement) => void;
+  };
 };

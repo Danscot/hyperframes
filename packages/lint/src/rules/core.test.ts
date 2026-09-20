@@ -1,35 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { lintHyperframeHtml } from "../hyperframeLinter.js";
 
-function compositionWithHead(headContent: string): string {
-  return `
-<html>
-<head>
-${headContent}
-</head>
-<body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
-  <script>window.__timelines = {};</script>
-</body>
-</html>`;
-}
-
-function compositionWithHeadBoundary(boundaryContent: string): string {
-  return `
-<html>
-<head>
-  <style>
-    body { margin: 0; }
-  </style>
-</head>
-${boundaryContent}
-<body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
-  <script>window.__timelines = {};</script>
-</body>
-</html>`;
-}
-
 function compositionWithBodyPrefix(prefixContent: string, rootContent = ""): string {
   return `
 <html>
@@ -48,32 +19,22 @@ ${rootContent}
 </html>`;
 }
 
-function compositionWithImplicitBodyPrefix(prefixContent: string): string {
+/** A portrait root inside a document whose scaffold copies of the resolution
+ *  are supplied by the caller, so they can be aligned or left stale. */
+function portraitCompositionWithScaffold(bodyCss: string, viewportContent: string): string {
   return `
 <html>
 <head>
+  <meta name="viewport" content="${viewportContent}" />
   <style>
-    body { margin: 0; }
+    html, body { ${bodyCss} overflow: hidden; }
   </style>
 </head>
-${prefixContent}
-<div data-composition-id="c1" data-width="1920" data-height="1080"></div>
-<script>window.__timelines = {};</script>
+<body>
+  <div id="root" data-composition-id="c1" data-width="1080" data-height="1920"></div>
+  <script>window.__timelines = {};</script>
+</body>
 </html>`;
-}
-
-function templateCompositionWithHead(headContent: string): string {
-  return `
-<template>
-  <html>
-    <head>
-${headContent}
-    </head>
-    <body>
-      <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
-    </body>
-  </html>
-</template>`;
 }
 
 describe("core rules", () => {
@@ -172,6 +133,114 @@ describe("core rules", () => {
     expect(finding?.severity).toBe("error");
   });
 
+  it("reports root_dimensions_mismatch when html/body CSS and the viewport meta are still the scaffolded landscape size", async () => {
+    // GH#4001: the root is edited to portrait without `hyperframes init
+    // --resolution`, the only thing that otherwise keeps the scaffold's copies
+    // of the resolution in sync. The stale landscape body (overflow: hidden)
+    // then clips the correctly-sized root at its old height.
+    const html = portraitCompositionWithScaffold(
+      "width: 1920px; height: 1080px;",
+      "width=1920, height=1080",
+    );
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "root_dimensions_mismatch");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("warning");
+    expect(finding?.message).toContain("html/body CSS is 1920x1080");
+    expect(finding?.message).toContain("the viewport meta is 1920x1080");
+  });
+
+  it("reads a stale html/body size authored height-before-width", async () => {
+    const html = portraitCompositionWithScaffold(
+      "height: 1080px; width: 1920px;",
+      "width=1080, height=1920",
+    );
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "root_dimensions_mismatch");
+    expect(finding?.message).toContain("html/body CSS is 1920x1080");
+    expect(finding?.message).not.toContain("viewport");
+  });
+
+  it("does not report root_dimensions_mismatch when the scaffold agrees with the root", async () => {
+    const html = portraitCompositionWithScaffold(
+      "width: 1080px; height: 1920px;",
+      "width=1080, height=1920",
+    );
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "root_dimensions_mismatch")).toBeUndefined();
+  });
+
+  it("does not report root_dimensions_mismatch for a sub-composition fragment with no html/body/viewport to compare", async () => {
+    const html = `<div data-composition-id="c1" data-width="1080" data-height="1920"></div>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "root_dimensions_mismatch")).toBeUndefined();
+  });
+
+  it("does not report root_dimensions_mismatch for a full sub-composition document whose own viewport meta disagrees with its root", async () => {
+    // Matches the hf2550 flowchart-vertical fixture's shape: a full standalone
+    // document mounted as a sub-composition. See the rule's comment in core.ts
+    // for why its own <meta viewport> never reaches the rendering document.
+    const html = `
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=1440, height=2560" />
+</head>
+<body>
+  <div id="root" data-composition-id="c1" data-width="1080" data-height="1920"></div>
+  <script>window.__timelines = {};</script>
+</body>
+</html>`;
+    const result = await lintHyperframeHtml(html, { isSubComposition: true });
+    expect(result.findings.find((f) => f.code === "root_dimensions_mismatch")).toBeUndefined();
+  });
+
+  it("still reports root_dimensions_mismatch for the same shape linted as a top-level composition, with no-clipping-risk wording since there is no html/body CSS block at all", async () => {
+    const html = `
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=1440, height=2560" />
+</head>
+<body>
+  <div id="root" data-composition-id="c1" data-width="1080" data-height="1920"></div>
+  <script>window.__timelines = {};</script>
+</body>
+</html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "root_dimensions_mismatch");
+    expect(finding).toBeDefined();
+    // No html/body CSS block is present here at all (the real hf2550 fixture
+    // shape) -- distinct from the "present and matching" case covered below --
+    // so the "absent" and "matches" cases of describeSizeMismatch must both
+    // route to the same no-clipping-risk wording, not just the "matches" one.
+    expect(finding?.message).not.toContain("clips");
+    expect(finding?.message.toLowerCase()).toContain("no effect on capture");
+  });
+
+  it("uses no-clipping-risk wording when only the viewport meta disagrees and html/body CSS matches the root", async () => {
+    const html = portraitCompositionWithScaffold(
+      "width: 1080px; height: 1920px;",
+      "width=1440, height=2560",
+    );
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "root_dimensions_mismatch");
+    expect(finding).toBeDefined();
+    expect(finding?.message).toContain("the viewport meta is 1440x2560");
+    expect(finding?.message).not.toContain("clips");
+    expect(finding?.message.toLowerCase()).toContain("no effect on capture");
+  });
+
+  it("keeps the body-clipping wording when html/body CSS itself disagrees with the root", async () => {
+    const html = portraitCompositionWithScaffold(
+      "width: 1920px; height: 1080px;",
+      "width=1080, height=1920",
+    );
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "root_dimensions_mismatch");
+    expect(finding?.message).toContain("clips");
+  });
+
   it("accepts body as the composition root", async () => {
     const html = `
 <html><body data-composition-id="c1" data-width="1920" data-height="1080">
@@ -218,7 +287,7 @@ describe("core rules", () => {
     // Regression: a CSS comment referencing an SVG tag name (e.g. `/* <g> wrapper */`)
     // inside a <style> block reads as a real open tag to the flat TAG_PATTERN scan,
     // manufacturing a phantom root before the real composition root and firing
-    // root_missing_composition_id/root_missing_dimensions/head_leaked_text on an
+    // root_missing_composition_id/root_missing_dimensions on an
     // otherwise valid sub-composition.
     const html = `
 <html><body>
@@ -234,7 +303,6 @@ describe("core rules", () => {
     const result = await lintHyperframeHtml(html);
     expect(result.findings.find((f) => f.code === "root_missing_composition_id")).toBeUndefined();
     expect(result.findings.find((f) => f.code === "root_missing_dimensions")).toBeUndefined();
-    expect(result.findings.find((f) => f.code === "head_leaked_text")).toBeUndefined();
   });
 
   it("reports error when timeline registry is missing", async () => {
@@ -285,7 +353,15 @@ describe("core rules", () => {
     expect(finding).toBeDefined();
   });
 
-  it("reports error when timeline registry is assigned without initializing", async () => {
+  // The runtime creates `window.__timelines` at script-evaluation time
+  // (runtime/entry.ts), before any inline composition script runs, so a bare
+  // assignment needs no `window.__timelines = window.__timelines || {}` guard.
+  // Verified by rendering a composition whose only registration is the bare
+  // assignment: it renders and animates correctly. The old
+  // `timeline_registry_missing_init` error therefore failed a working file, and
+  // because a lint ERROR also suppresses the layout and contrast audits in
+  // `check`, it cost far more than the line it asked for.
+  it("accepts a bracket registry assignment with no init guard", async () => {
     const html = `
 <html><body>
   <div id="root" data-composition-id="c1" data-width="1920" data-height="1080">
@@ -298,13 +374,13 @@ describe("core rules", () => {
   </script>
 </body></html>`;
     const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "timeline_registry_missing_init");
-    expect(finding).toBeDefined();
-    expect(finding?.severity).toBe("error");
-    expect(finding?.message).toContain("without initializing");
+    expect(
+      result.findings.find((f) => f.code === "timeline_registry_missing_init"),
+    ).toBeUndefined();
+    expect(result.findings.find((f) => f.code === "missing_timeline_registry")).toBeUndefined();
   });
 
-  it("reports error when dot timeline registry is assigned without initializing", async () => {
+  it("accepts a dot registry assignment with no init guard", async () => {
     const html = `
 <html><body>
   <div id="root" data-composition-id="c1" data-width="1920" data-height="1080">
@@ -317,9 +393,10 @@ describe("core rules", () => {
   </script>
 </body></html>`;
     const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "timeline_registry_missing_init");
-    expect(finding).toBeDefined();
-    expect(finding?.severity).toBe("error");
+    expect(
+      result.findings.find((f) => f.code === "timeline_registry_missing_init"),
+    ).toBeUndefined();
+    expect(result.findings.find((f) => f.code === "missing_timeline_registry")).toBeUndefined();
   });
 
   it("does not flag timeline assignment when init guard is present", async () => {
@@ -343,165 +420,77 @@ describe("core rules", () => {
     expect(finding).toBeUndefined();
   });
 
-  it("reports error when CSS text is left outside a style block in the document head", async () => {
-    const html = compositionWithHead(`
-  <style>
-    body { margin: 0; }
-  </style>
-  </style>
-  /* Decorative Elements */
-  .particle {
-    position: absolute;
-    width: 4px;
-    height: 4px;
-    background: #fff;
-  }
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.severity).toBe("error");
-    expect(finding?.message).toContain("<head>");
-    expect(finding?.snippet).toContain(".particle");
-  });
-
-  it("reports error when CSS variables leak between head and body", async () => {
-    const html = compositionWithHeadBoundary(`
-  --bg-color: #F5F1E8;
-  --text-color: #212121;
-}
-
-body {
-  background-color: var(--bg-color);
-  color: var(--text-color);
-}
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.message).toContain("<head>");
-    expect(finding?.snippet).toContain("body");
-  });
-
-  it("reports error when stray close tags leak between head and body", async () => {
-    const html = compositionWithHeadBoundary(`
-  </style>
-  </script>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain("</style>");
-  });
-
-  it("reports error when markdown code fences leak between head and body", async () => {
-    const html = compositionWithHeadBoundary(`
-  \`\`\`css
-  .particle {
-    color: white;
-  }
-  \`\`\`
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain("```css");
-  });
-
-  it("reports error when CSS at-rules leak between head and body", async () => {
-    const html = compositionWithHeadBoundary(`
-  @media (min-width: 800px) {
-    .particle {
-      transform: scale(1.2);
-    }
-  }
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain("@media");
-  });
-
-  it("does not report leaked text for valid script and style blocks around the head boundary", async () => {
-    const html = compositionWithHeadBoundary(`
-  <script>
-    window.__headReady = true;
-  </script>
-  <template>
-    <style>
-      .template-only { color: red; }
-    </style>
-  </template>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeUndefined();
-  });
-
-  it("reports error when CSS text leaks before the composition root", async () => {
-    const html = compositionWithBodyPrefix(`
-  .orphan {
-    position: absolute;
-    inset: 0;
-  }
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain(".orphan");
-  });
-
-  it("reports error when CSS text leaks before the composition root without an explicit body", async () => {
-    const html = compositionWithImplicitBodyPrefix(`
-  .implicit-body-orphan {
-    position: absolute;
-    inset: 0;
-  }
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain(".implicit-body-orphan");
-  });
-
-  it("does not report leaked text for valid script and style blocks before the composition root", async () => {
-    const html = compositionWithBodyPrefix(`
-  <style>
-    .pre-root-helper { color: red; }
-  </style>
-  <script>
-    window.__preRootReady = true;
-  </script>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeUndefined();
-  });
-
-  it("does not report CSS-looking educational text inside the composition root", async () => {
+  it("reports error when an extra style closer dumps CSS as text", async () => {
     const html = compositionWithBodyPrefix(
       "",
       `
-    <pre>
-      body {
-        margin: 0;
-      }
-    </pre>
+    <style>
+      .editorial-block { color: #fff; }
+    </style>
+    </style>
+    .leftover { color: red; }
+    <div class="editorial-block">Hello</div>
 `,
     );
     const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
+    const finding = result.findings.find((f) => f.code === "unbalanced_style_tags");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("error");
+    expect(finding?.message).toContain("extra </style>");
+  });
 
-    expect(finding).toBeUndefined();
+  it("does not count style text inside a script closed with a spaced end tag", async () => {
+    const html = compositionWithBodyPrefix(
+      "",
+      `
+    <style>
+      .editorial-block { color: #fff; }
+    </style>
+    <script>
+      const marker = "</style>";
+    </script >
+    <div class="editorial-block">Hello</div>
+`,
+    );
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "unbalanced_style_tags")).toBeUndefined();
+  });
+
+  it("reports an extra closer written as </style >", async () => {
+    const html = compositionWithBodyPrefix(
+      "",
+      `
+    <style>
+      .editorial-block { color: #fff; }
+    </style >
+    </style >
+    .leftover { color: red; }
+    <div class="editorial-block">Hello</div>
+`,
+    );
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "unbalanced_style_tags")?.severity).toBe("error");
+  });
+
+  it("does not count a closer that only appears inside an html comment", async () => {
+    const html = compositionWithBodyPrefix(
+      "",
+      `
+    <style>
+      .editorial-block { color: #fff; }
+    </style>
+    <!-- dropped the second sheet: </style> -->
+    <div class="editorial-block">Hello</div>
+`,
+    );
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "unbalanced_style_tags")).toBeUndefined();
+  });
+
+  it("does not report paired style blocks", async () => {
+    const html = compositionWithBodyPrefix("", `<div class="editorial-block">Hello</div>`);
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "unbalanced_style_tags")).toBeUndefined();
   });
 
   it("reports error when CSS block comment syntax leaks into visible markup", async () => {
@@ -583,175 +572,6 @@ body {
     const finding = result.findings.find((f) => f.code === "visible_markup_comment");
 
     expect(finding).toBeUndefined();
-  });
-
-  it("reports error when a stray style close tag is left in the document head", async () => {
-    const html = compositionWithHead(`
-  <style>
-    body { margin: 0; }
-  </style>
-  </style>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain("</style>");
-  });
-
-  it("reports error when a stray script close tag is left in the document head", async () => {
-    const html = compositionWithHead(`
-  <script>
-    window.__headReady = true;
-  </script>
-  </script>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain("</script>");
-  });
-
-  it("does not report leaked head text for valid closing tags with trailing whitespace", async () => {
-    const html = compositionWithHead(`
-  <style>
-    body { margin: 0; }
-  </style data-parser-error-close>
-  <script>
-    window.__headReady = true;
-  </script
-    data-parser-error-close>
-  <title>Particle Field</title	>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeUndefined();
-  });
-
-  it("reports error when markdown code fences leak into the document head", async () => {
-    const withLanguage = compositionWithHead(`
-  \`\`\`css
-  .particle {
-    position: absolute;
-  }
-  \`\`\`
-`);
-    const withoutLanguage = compositionWithHead(`
-  \`\`\`
-  .particle {
-    position: absolute;
-  }
-  \`\`\`
-`);
-    const withTsxLanguage = compositionWithHead(`
-  \`\`\`tsx
-  export function Particle() {
-    return <div className="particle" />;
-  }
-  \`\`\`
-`);
-    const withLanguageResult = await lintHyperframeHtml(withLanguage);
-    const withoutLanguageResult = await lintHyperframeHtml(withoutLanguage);
-    const withTsxLanguageResult = await lintHyperframeHtml(withTsxLanguage);
-    const languageFinding = withLanguageResult.findings.find((f) => f.code === "head_leaked_text");
-    const unlabeledFinding = withoutLanguageResult.findings.find(
-      (f) => f.code === "head_leaked_text",
-    );
-    const tsxLanguageFinding = withTsxLanguageResult.findings.find(
-      (f) => f.code === "head_leaked_text",
-    );
-
-    expect(languageFinding).toBeDefined();
-    expect(languageFinding?.snippet).toContain("```css");
-    expect(unlabeledFinding).toBeDefined();
-    expect(unlabeledFinding?.snippet).toContain("```");
-    expect(tsxLanguageFinding).toBeDefined();
-    expect(tsxLanguageFinding?.snippet).toContain("```tsx");
-  });
-
-  it("reports error when CSS at-rules leak into the document head", async () => {
-    const html = compositionWithHead(`
-  @media (min-width: 800px) {
-    .particle {
-      transform: scale(1.2);
-    }
-  }
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain("@media");
-  });
-
-  it("reports leaked CSS when a style block is unclosed in the document head", async () => {
-    const html = compositionWithHead(`
-  <style>
-    .particle {
-      color: white;
-    }
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain(".particle");
-  });
-
-  it("does not report leaked head text for commented CSS", async () => {
-    const html = compositionWithHead(`
-  <!-- .particle { color: red; } -->
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeUndefined();
-  });
-
-  it("does not report leaked head text for valid noscript content", async () => {
-    const html = compositionWithHead(`
-  <noscript>
-    .no-js { display: block; }
-  </noscript>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeUndefined();
-  });
-
-  it("does not report orphan CSS for valid head metadata and style blocks", async () => {
-    const html = compositionWithHead(`
-  <title>Particle Field</title>
-  <meta name="description" content="Particle field">
-  <link rel="preconnect" href="https://fonts.gstatic.com">
-  <base href="https://example.com/">
-  <style>
-    .particle {
-      position: absolute;
-      width: 4px;
-      height: 4px;
-    }
-  </style>
-`);
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeUndefined();
-  });
-
-  it("reports leaked head text inside template-wrapped sub-compositions", async () => {
-    const html = templateCompositionWithHead(`
-      </style>
-      .particle { color: white; }
-`);
-    const result = await lintHyperframeHtml(html, { isSubComposition: true });
-    const finding = result.findings.find((f) => f.code === "head_leaked_text");
-
-    expect(finding).toBeDefined();
-    expect(finding?.snippet).toContain(".particle");
   });
 
   describe("timeline_id_mismatch", () => {
@@ -848,6 +668,108 @@ body {
     });
   });
 
+  describe("repeated_id_descendant_selector", () => {
+    it("reports a selector that nests the same id inside itself", async () => {
+      const html = `<div id="scene_01" data-composition-id="root" data-width="1920" data-height="1080">
+        <style>#scene_01 #scene_01 .headline { color: red; }</style>
+      </div>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "repeated_id_descendant_selector");
+      expect(finding?.severity).toBe("error");
+      expect(finding?.selector).toBe("#scene_01 #scene_01 .headline");
+    });
+
+    it("does not report distinct descendant ids", async () => {
+      const html = `<div id="scene_01" data-composition-id="root" data-width="1920" data-height="1080">
+        <style>#scene_01 #headline { color: red; }</style>
+      </div>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "repeated_id_descendant_selector"),
+      ).toBeUndefined();
+    });
+
+    it.each(["#scene_01 > #scene_01", "#scene_01 .wrapper #scene_01"])(
+      "reports repeated ids across descendant combinators: %s",
+      async (selector) => {
+        const html = `<div data-composition-id="root" data-width="1920" data-height="1080">
+          <style>${selector} { color: red; }</style>
+        </div>`;
+        const result = await lintHyperframeHtml(html);
+        expect(
+          result.findings.find((f) => f.code === "repeated_id_descendant_selector"),
+        ).toBeDefined();
+      },
+    );
+
+    it.each([
+      ":is(#scene_01) #scene_01",
+      ":where(#scene_01) #scene_01",
+      "#scene_01 :is(#scene_01)",
+    ])("reports repeated ids required by selector pseudos: %s", async (selector) => {
+      const html = `<div data-composition-id="root" data-width="1920" data-height="1080">
+          <style>${selector} { color: red; }</style>
+        </div>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "repeated_id_descendant_selector"),
+      ).toBeDefined();
+    });
+
+    it.each([
+      ":is(#scene_01, .scene) #scene_01",
+      ":not(#scene_01) #scene_01",
+      ":has(#scene_01) #scene_01",
+    ])("does not report ids that are not required by a selector pseudo: %s", async (selector) => {
+      const html = `<div data-composition-id="root" data-width="1920" data-height="1080">
+          <style>${selector} { color: red; }</style>
+        </div>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "repeated_id_descendant_selector"),
+      ).toBeUndefined();
+    });
+
+    it.each(["& #scene_01 .headline", "#scene_01 .headline"])(
+      "reports repeated ids created by nested CSS: %s",
+      async (nestedSelector) => {
+        const html = `<div data-composition-id="root" data-width="1920" data-height="1080">
+          <style>#scene_01 { ${nestedSelector} { color: red; } }</style>
+        </div>`;
+        const result = await lintHyperframeHtml(html);
+        const finding = result.findings.find(
+          (candidate) => candidate.code === "repeated_id_descendant_selector",
+        );
+        expect(finding).toBeDefined();
+        expect(finding?.selector).toContain("#scene_01 #scene_01");
+      },
+    );
+
+    it("preserves dollar sequences while resolving nested selectors", async () => {
+      const html = `<div data-composition-id="root" data-width="1920" data-height="1080">
+        <style>#scene_01[data-query="$1"] { & #scene_01 { color: red; } }</style>
+      </div>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find(
+        (candidate) => candidate.code === "repeated_id_descendant_selector",
+      );
+      expect(finding?.selector).toBe('#scene_01[data-query="$1"] #scene_01');
+    });
+
+    it.each(['[data-query="#scene_01 #scene_01"]', String.raw`#scene_01 #scene_01\:child`])(
+      "does not report non-repeated parsed ids: %s",
+      async (selector) => {
+        const html = `<div data-composition-id="root" data-width="1920" data-height="1080">
+        <style>${selector} { color: red; }</style>
+      </div>`;
+        const result = await lintHyperframeHtml(html);
+        expect(
+          result.findings.find((f) => f.code === "repeated_id_descendant_selector"),
+        ).toBeUndefined();
+      },
+    );
+  });
+
   it("warns when a timeline-visible element has no stable id for Studio editing", async () => {
     const html = `
 <html><body>
@@ -878,6 +800,25 @@ body {
   });
 
   describe("non_deterministic_code", () => {
+    it("gives randomness guidance for crypto and clock guidance for wall time", async () => {
+      const result = await lintHyperframeHtml(`<html><body>
+        <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+        <script>
+          crypto.getRandomValues(new Uint32Array(1));
+          Date.now();
+          window.__timelines = { c1: gsap.timeline({ paused: true }) };
+        </script>
+      </body></html>`);
+      const crypto = result.findings.find((finding) =>
+        finding.message.includes("crypto.getRandomValues"),
+      );
+      const clock = result.findings.find((finding) => finding.message.includes("Date.now"));
+      expect(crypto).toMatchObject({ code: "non_deterministic_code", severity: "error" });
+      expect(crypto?.fixHint).toContain("seeded PRNG");
+      expect(crypto?.fixHint).not.toContain("time-dependent");
+      expect(clock?.fixHint).toContain("wall-clock time");
+    });
+
     it("detects Math.random() in script content", async () => {
       const html = `
 <html><body>
@@ -995,63 +936,204 @@ body {
     });
   });
 
-  describe("composition_self_attribute_selector", () => {
-    it("warns when inline CSS targets the root composition id", async () => {
-      const html = `
+  describe("non_deterministic_code — determinism is about execution, not text", () => {
+    const comp = (script: string) => `
 <html><body>
-  <div id="scene" data-composition-id="scene" data-width="1920" data-height="1080">
-    <style>
-      [data-composition-id="scene"] .title { opacity: 0; }
-      [data-composition-id="other"] .title { color: red; }
-    </style>
-    <h1 class="title">Hello</h1>
-  </div>
-  <script>window.__timelines = {};</script>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="5"></div>
+  <script src="gsap.min.js"></script>
+  <script>const tl = gsap.timeline({ paused: true }); ${script} window.__timelines = { main: tl };</script>
 </body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const findings = result.findings.filter(
-        (f) => f.code === "composition_self_attribute_selector",
+
+    it("does not flag new Date() with a fixed timestamp", async () => {
+      // Deterministic, and the fixHint ("remove time-dependent code") cannot be
+      // applied without deleting the label the composition renders.
+      const result = await lintHyperframeHtml(
+        comp(`const label = new Date("2026-01-01T00:00:00Z").toISOString();`),
+      );
+      expect(result.findings.find((f) => f.code === "non_deterministic_code")).toBeUndefined();
+    });
+
+    it("does not flag non-deterministic APIs quoted inside a string literal", async () => {
+      // Code-display compositions render source they never execute.
+      const result = await lintHyperframeHtml(comp(`const SNIPPET = "const x = Math.random();";`));
+      expect(result.findings.find((f) => f.code === "non_deterministic_code")).toBeUndefined();
+    });
+
+    it("still flags a bare new Date()", async () => {
+      const result = await lintHyperframeHtml(comp(`const now = new Date();`));
+      expect(result.findings.find((f) => f.code === "non_deterministic_code")).toBeDefined();
+    });
+
+    it("still flags Math.random() in executed code", async () => {
+      const result = await lintHyperframeHtml(comp(`const r = Math.random();`));
+      expect(result.findings.find((f) => f.code === "non_deterministic_code")).toBeDefined();
+    });
+  });
+
+  describe("timeline_id_mismatch — only top-level registry keys are composition ids", () => {
+    const comp = (script: string) => `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="5"></div>
+  <script src="gsap.min.js"></script>
+  <script>${script}</script>
+</body></html>`;
+
+    it("does not flag the one-liner registration form", async () => {
+      // The inlined options object is not a registration. Reading `paused` as a
+      // composition id produced an error whose fixHint named a registration that
+      // did not exist, so it could never be applied.
+      const result = await lintHyperframeHtml(
+        comp(`window.__timelines = { main: gsap.timeline({ paused: true }) };`),
+      );
+      expect(result.findings.find((f) => f.code === "timeline_id_mismatch")).toBeUndefined();
+    });
+
+    it("still flags a genuinely mismatched id", async () => {
+      const result = await lintHyperframeHtml(
+        comp(`window.__timelines = { wrongid: gsap.timeline({ paused: true }) };`),
+      );
+      expect(result.findings.find((f) => f.code === "timeline_id_mismatch")).toBeDefined();
+    });
+  });
+
+  describe("runtime_hidden_style_opacity", () => {
+    const comp = (css: string, extraMarkup = "") => `
+<html><head><style>${css}</style></head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <video id="footage" src="clip.mp4" data-start="0" data-duration="5" muted playsinline></video>
+    ${extraMarkup}
+  </div>
+  <script>window.__timelines = { main: gsap.timeline({ paused: true }) };</script>
+</body></html>`;
+
+    it("errors when a broad hidden-style selector forces replacement-frame opacity to zero", async () => {
+      const result = await lintHyperframeHtml(
+        comp(`[style*="visibility: hidden"] { opacity: 0 !important; }`),
+      );
+      const finding = result.findings.find((item) => item.code === "runtime_hidden_style_opacity");
+
+      expect(finding?.severity).toBe("error");
+      expect(finding?.selector).toBe(`[style*="visibility: hidden"]`);
+      expect(finding?.message).toContain("replacement frame");
+      expect(finding?.fixHint).toContain("data-composition-src");
+    });
+
+    it("errors when composition scoping still leaves the hidden-style selector on video", async () => {
+      const result = await lintHyperframeHtml(
+        comp(`#root > video[style*="visibility: hidden"] { opacity: 0; }`),
       );
 
-      expect(findings).toHaveLength(1);
-      expect(findings[0]?.severity).toBe("warning");
-      expect(findings[0]?.selector).toBe('[data-composition-id="scene"] .title');
-      expect(findings[0]?.fixHint).toContain("#scene");
-      expect(findings[0]?.fixHint).not.toContain("#556");
+      expect(
+        result.findings.find((item) => item.code === "runtime_hidden_style_opacity")?.selector,
+      ).toBe(`#root > video[style*="visibility: hidden"]`);
     });
 
-    it("warns when external CSS targets the root composition id", async () => {
-      const html = `
-<html><body>
-  <div id="scene" data-composition-id="scene" data-width="1920" data-height="1080"></div>
-  <script>window.__timelines = {};</script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html, {
-        externalStyles: [
-          {
-            href: "scene.css",
-            content: '[data-composition-id="scene"] .title { opacity: 0; }',
-          },
-        ],
-      });
-      const finding = result.findings.find((f) => f.code === "composition_self_attribute_selector");
-
-      expect(finding).toBeDefined();
-      expect(finding?.selector).toBe('[data-composition-id="scene"] .title');
-    });
-
-    it("does not warn when CSS targets a different composition id", async () => {
-      const html = `
-<html><body>
-  <div id="scene" data-composition-id="scene" data-width="1920" data-height="1080">
-    <style>[data-composition-id="other"] .title { opacity: 0; }</style>
+    it("errors when the root stylesheet can affect video mounted from a sub-composition", async () => {
+      const result = await lintHyperframeHtml(`
+<html><head><style>[style*="visibility: hidden"] { opacity: 0; }</style></head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <div data-composition-id="scene" data-composition-src="scene.html"></div>
   </div>
-  <script>window.__timelines = {};</script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "composition_self_attribute_selector");
+  <script>window.__timelines = { main: gsap.timeline({ paused: true }) };</script>
+</body></html>`);
 
-      expect(finding).toBeUndefined();
+      expect(
+        result.findings.find((item) => item.code === "runtime_hidden_style_opacity")?.severity,
+      ).toBe("error");
+    });
+
+    it("allows hidden-style opacity guards scoped to sub-composition hosts", async () => {
+      const result = await lintHyperframeHtml(
+        comp(
+          `[data-composition-src][style*="visibility: hidden"],
+           [data-composition-file][style*="visibility: hidden"] { opacity: 0 !important; }`,
+          `<div data-composition-id="scene-a" data-composition-src="scene-a.html"></div>
+           <div data-composition-id="scene-b" data-composition-file="scene-b.html"></div>`,
+        ),
+      );
+
+      expect(
+        result.findings.find((item) => item.code === "runtime_hidden_style_opacity"),
+      ).toBeUndefined();
+    });
+
+    it("allows broad hidden-style selectors that do not change opacity", async () => {
+      const result = await lintHyperframeHtml(
+        comp(`[style*="visibility: hidden"] { pointer-events: none; }`),
+      );
+
+      expect(
+        result.findings.find((item) => item.code === "runtime_hidden_style_opacity"),
+      ).toBeUndefined();
+    });
+  });
+
+  describe("unclosed_tag_swallowed_element", () => {
+    it("flags an <img> tag whose unclosed start tag swallows a nested <div> as bogus attribute text", async () => {
+      const html = compositionWithBodyPrefix(
+        `<img class="browser-img" src="a.png" <div class="hl"></div></figure>`,
+      );
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "unclosed_tag_swallowed_element");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.snippet).toContain("<img");
+    });
+
+    it("does not flag a normal <img> tag", async () => {
+      const html = compositionWithBodyPrefix(`<img class="browser-img" src="a.png" />`);
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "unclosed_tag_swallowed_element"),
+      ).toBeUndefined();
+    });
+
+    it.each([
+      ["adjacent", `<span>A</span><span>B</span>`],
+      ["spaces", `<span>A</span   ><span>B</span>`],
+      ["newline", `<span>A</span\n    ><span>B</span>`],
+    ])(
+      "does not flag valid sibling spans when the closing tag uses %s whitespace",
+      async (_label, body) => {
+        const result = await lintHyperframeHtml(compositionWithBodyPrefix(body));
+        expect(
+          result.findings.find((f) => f.code === "unclosed_tag_swallowed_element"),
+        ).toBeUndefined();
+      },
+    );
+
+    it.each([`<span class="first" <span>B</span>`, `<span data-label=first <strong>B</strong>`])(
+      "still flags a malformed span start tag that swallows its next element",
+      async (body) => {
+        const result = await lintHyperframeHtml(compositionWithBodyPrefix(body));
+        const finding = result.findings.find((f) => f.code === "unclosed_tag_swallowed_element");
+        expect(finding?.severity).toBe("error");
+        expect(finding?.snippet).toContain("<span");
+      },
+    );
+
+    it("does not flag a legitimate attribute value containing a raw <", async () => {
+      const html = compositionWithBodyPrefix(`<div data-expr="x < y">hi</div>`);
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "unclosed_tag_swallowed_element"),
+      ).toBeUndefined();
+    });
+  });
+
+  describe("css_parse_error — malformed CSS is reported instead of silently swallowed", () => {
+    it("reports a css_parse_error finding for unparseable CSS", async () => {
+      const html = `<html><body>
+        <style>.stage { transform: xPercent: -10; }</style>
+        <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="5"></div>
+        <script src="gsap.min.js"></script>
+        <script>window.__timelines = { main: gsap.timeline({ paused: true }) };</script>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "css_parse_error");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toContain("Missed semicolon");
     });
   });
 });

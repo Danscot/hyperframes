@@ -2,9 +2,20 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const trackEvent = vi.fn();
 const flush = vi.fn(() => Promise.resolve());
+const shouldTrack = vi.fn(() => true);
 vi.mock("./client.js", () => ({
   trackEvent: (...args: unknown[]) => trackEvent(...args),
   flush: () => flush(),
+  shouldTrack: () => shouldTrack(),
+}));
+
+// Power state shells out to `pmset`; spy so tests can assert it is NOT
+// sampled for opted-out installs (the fields are built at the call site,
+// before trackEvent's own shouldTrack guard).
+const getPowerState = vi.fn(() => ({ on_battery: true, low_power_mode: false }));
+vi.mock("./system.js", async () => ({
+  ...(await vi.importActual<typeof import("./system.js")>("./system.js")),
+  getPowerState: () => getPowerState(),
 }));
 
 // identifyUser reads the install anonymousId; pin it so the $identify alias is
@@ -179,11 +190,502 @@ describe("render telemetry events", () => {
     flush.mockClear();
   });
 
+  // The catalog join. Counts must be present at zero: the no-catalog cohort is
+  // what the with-catalog cohort is compared against, and an absent property is
+  // indistinguishable from an older CLI that never sent one.
+  it("reports zero catalog counts for a project with no registry items", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      catalogUsage: { installed: [], usedBlocks: [], manifestUnreadable: false },
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.registry_item_count).toBe(0);
+    expect(props.registry_blocks_used_count).toBe(0);
+    expect(props.registry_items).toBeUndefined();
+  });
+
+  it("names the installed items and the subset the render reached", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      catalogUsage: {
+        installed: ["bar-chart-race", "data-chart"],
+        usedBlocks: ["data-chart"],
+        manifestUnreadable: false,
+      },
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.registry_items).toBe("bar-chart-race,data-chart");
+    expect(props.registry_item_count).toBe(2);
+    expect(props.registry_blocks_used).toBe("data-chart");
+    expect(props.registry_blocks_used_count).toBe(1);
+  });
+
+  // A count is one integer with no cardinality risk. Capping it would lose the
+  // real number with no way downstream to tell 40 installs from 400.
+  it("caps the item names but reports the true counts past the cap", () => {
+    const installed = Array.from({ length: 45 }, (_, i) => `b${String(i + 1).padStart(2, "0")}`);
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      catalogUsage: { installed, usedBlocks: installed.slice(-5), manifestUnreadable: false },
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.registry_item_count).toBe(45);
+    expect(props.registry_blocks_used_count).toBe(5);
+    expect(String(props.registry_items).split(",")).toHaveLength(40);
+    // The names are a window, and a query joining on them would otherwise read
+    // this project as 45 abandoned items: every used block sits past the cap,
+    // so `registry_blocks_used` is absent against a count of 5.
+    expect(props.registry_items_truncated).toBe(true);
+    expect(props.registry_blocks_used).toBeUndefined();
+  });
+
+  it("does not claim truncation when every name fits", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      catalogUsage: {
+        installed: ["bar-chart-race", "data-chart"],
+        usedBlocks: ["data-chart"],
+        manifestUnreadable: false,
+      },
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.registry_items_truncated).toBeUndefined();
+  });
+
+  // Sliced independently the two lists come out disjoint, which breaks the one
+  // relationship any drop-off query relies on.
+  it("keeps the used names a subset of the reported installed names", () => {
+    const installed = Array.from({ length: 45 }, (_, i) => `b${String(i + 1).padStart(2, "0")}`);
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      catalogUsage: { installed, usedBlocks: installed.slice(-5), manifestUnreadable: false },
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    const reported = new Set(String(props.registry_items).split(","));
+    const used =
+      props.registry_blocks_used === undefined ? [] : String(props.registry_blocks_used).split(",");
+    expect(used.every((name) => reported.has(name))).toBe(true);
+  });
+
+  // The control cohort is the one that must not silently absorb failures: a
+  // project whose manifest cannot be read is not a project without a catalog.
+  it("flags an unreadable manifest instead of reporting it as zero catalog items", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      catalogUsage: { installed: [], usedBlocks: [], manifestUnreadable: true },
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.registry_manifest_unreadable).toBe(true);
+    expect(props.registry_item_count).toBeUndefined();
+  });
+
+  // A caller that built render options by hand makes no catalog claim, rather
+  // than claiming zero items.
+  it("omits the catalog props entirely when usage was never resolved", () => {
+    trackRenderComplete({ durationMs: 1, fps: 30, quality: "draft", docker: false, gpu: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.registry_item_count).toBeUndefined();
+    expect(props.registry_blocks_used_count).toBeUndefined();
+  });
+
+  // Output-shape request facts are resolved from CLI flags before the
+  // pipeline starts, so both render_complete and render_error must carry
+  // them: a failure before perfSummary exists is exactly the case these
+  // fields (unlike the perfSummary-derived ones) still need to cover.
+  it("carries output-shape request facts on render_complete", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      outputResolutionPreset: "landscape-4k",
+      outputFormat: "gif",
+      hdrMode: "force-sdr",
+      videoFrameFormat: "png",
+      gifFpsCapped: true,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.output_resolution_preset).toBe("landscape-4k");
+    expect(props.output_format).toBe("gif");
+    expect(props.hdr_mode).toBe("force-sdr");
+    expect(props.video_frame_format).toBe("png");
+    expect(props.gif_fps_capped).toBe(true);
+  });
+
+  it("carries output-shape request facts on render_error", () => {
+    trackRenderError({
+      fps: 30,
+      quality: "high",
+      docker: false,
+      outputResolutionPreset: "portrait",
+      outputFormat: "mp4",
+      hdrMode: "auto",
+      videoFrameFormat: "auto",
+      gifFpsCapped: false,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.output_resolution_preset).toBe("portrait");
+    expect(props.output_format).toBe("mp4");
+    expect(props.hdr_mode).toBe("auto");
+    expect(props.video_frame_format).toBe("auto");
+    expect(props.gif_fps_capped).toBe(false);
+  });
+
+  it("omits output-shape request facts when the caller never resolved them", () => {
+    trackRenderComplete({ durationMs: 1, fps: 30, quality: "draft", docker: false, gpu: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.output_resolution_preset).toBeUndefined();
+    expect(props.output_format).toBeUndefined();
+    expect(props.hdr_mode).toBeUndefined();
+    expect(props.video_frame_format).toBeUndefined();
+    expect(props.gif_fps_capped).toBeUndefined();
+  });
+
+  // Local-preflight toolchain majors; absent on Docker renders (the
+  // container runs its own preflight, never surfaced to the host CLI).
+  it("carries local toolchain majors on render_complete", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      ffmpegVersionMajor: 7,
+      browserVersionMajor: 119,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.ffmpeg_version_major).toBe(7);
+    expect(props.browser_version_major).toBe(119);
+  });
+
+  it("carries local toolchain majors on render_error", () => {
+    trackRenderError({
+      fps: 30,
+      quality: "high",
+      docker: false,
+      ffmpegVersionMajor: 6,
+      browserVersionMajor: 118,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.ffmpeg_version_major).toBe(6);
+    expect(props.browser_version_major).toBe(118);
+  });
+
+  it("carries the browser install path facts on both render events, never the path", () => {
+    const browserInstall = {
+      build: "152.0.7928.2",
+      pathAscii: false,
+      pathLength: "200_to_259",
+      drive: "windows_other",
+    } as const;
+    trackRenderComplete({
+      durationMs: 1,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      browserInstall,
+    });
+    trackRenderError({ fps: 30, quality: "draft", docker: false, browserInstall });
+    for (const call of trackEvent.mock.calls) {
+      const props = call[1] as Record<string, unknown>;
+      expect(props).toMatchObject({
+        browser_build: "152.0.7928.2",
+        browser_path_ascii: false,
+        browser_path_length: "200_to_259",
+        browser_path_drive: "windows_other",
+      });
+      expect(Object.keys(props)).not.toContain("browser_path");
+    }
+  });
+
+  it("omits toolchain majors on a Docker render", () => {
+    trackRenderComplete({ durationMs: 1, fps: 30, quality: "draft", docker: true, gpu: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.ffmpeg_version_major).toBeUndefined();
+    expect(props.browser_version_major).toBeUndefined();
+  });
+
+  it("reports which step resolved authoring-skill attribution", () => {
+    trackRenderComplete({
+      durationMs: 1,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      authoringSkill: "product-launch-video",
+      authoringSkillSource: "flag",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.authoring_skill).toBe("product-launch-video");
+    expect(props.authoring_skill_source).toBe("flag");
+    expect(props.authoring_skill_invalid).toBeUndefined();
+  });
+
+  it("carries a malformed --skill value on render_error without a resolved source", () => {
+    trackRenderError({
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      authoringSkillInvalid: "Not A Skill!",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.authoring_skill_invalid).toBe("Not A Skill!");
+    expect(props.authoring_skill_source).toBeUndefined();
+  });
+
+  it("carries the root/body scaffold-mismatch measurement from perfSummary on render_complete", () => {
+    trackRenderComplete({
+      durationMs: 1,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      rootBodyMismatch: true,
+      rootBodyDeltaPxBucket: "51+",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.root_body_mismatch).toBe(true);
+    expect(props.root_body_delta_px_bucket).toBe("51+");
+  });
+
+  it("falls back to the live capture-observability measurement on render_error (no perfSummary)", () => {
+    trackRenderError({
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      captureRootBodyMismatch: false,
+      captureRootBodyDeltaPxBucket: "0",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.root_body_mismatch).toBe(false);
+    expect(props.root_body_delta_px_bucket).toBe("0");
+  });
+
+  it("carries the names of HF/HYPERFRAMES env overrides present at plan time", () => {
+    trackRenderComplete({
+      durationMs: 1,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      hfEnvOverrides: ["HF_DE_VERIFY", "HYPERFRAMES_FONT_CACHE_DIR"],
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.hf_env_overrides).toEqual(["HF_DE_VERIFY", "HYPERFRAMES_FONT_CACHE_DIR"]);
+  });
+
+  it("reports an empty array, not an absent field, when no override was resolved", () => {
+    trackRenderError({ fps: 30, quality: "draft", docker: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.hf_env_overrides).toEqual([]);
+  });
+
+  it("names the runtime adapters a render exercised", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      adaptersUsed: ["gsap", "three"],
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.adapters_used).toEqual(["gsap", "three"]);
+  });
+
+  // adaptersUsed is a live+static UNION with no gating role (unlike
+  // compositionElementCount), so "no adapter detected" is a real measurement
+  // and must be reported as one: an absent property is indistinguishable from
+  // an older CLI that never sent it.
+  it("reports an empty adapter list rather than dropping the property", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      adaptersUsed: [],
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.adapters_used).toEqual([]);
+  });
+
+  it("omits adapters_used entirely when the caller never resolved it", () => {
+    trackRenderComplete({ durationMs: 1000, fps: 30, quality: "high", docker: false, gpu: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.adapters_used).toBeUndefined();
+  });
+
+  it("carries the composition scan's element/attribute counts and hasLut flag", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      audioCount: 3,
+      imageCount: 5,
+      subCompositionCount: 1,
+      audioGroupCount: 2,
+      colorGradingCount: 4,
+      hasLut: true,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.audio_count).toBe(3);
+    expect(props.image_count).toBe(5);
+    expect(props.sub_composition_count).toBe(1);
+    expect(props.audio_group_count).toBe(2);
+    expect(props.color_grading_count).toBe(4);
+    expect(props.has_lut).toBe(true);
+  });
+
+  it("reports zero counts and hasLut false rather than dropping the properties", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      audioCount: 0,
+      imageCount: 0,
+      subCompositionCount: 0,
+      audioGroupCount: 0,
+      colorGradingCount: 0,
+      hasLut: false,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.audio_count).toBe(0);
+    expect(props.image_count).toBe(0);
+    expect(props.sub_composition_count).toBe(0);
+    expect(props.audio_group_count).toBe(0);
+    expect(props.color_grading_count).toBe(0);
+    expect(props.has_lut).toBe(false);
+  });
+
+  // emitStudioRenderComplete never resolves perfSummary.drawElement, only the
+  // observability capture fields (captureAudioCount/captureRootBodyMismatch/etc),
+  // so these must fall back to the capture value or a studio render reports none
+  // of them despite having computed and sent it.
+  it("falls back to the observability capture value for a studio render, which never resolves the direct field", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      source: "studio",
+      captureAudioCount: 2,
+      captureImageCount: 1,
+      captureRootBodyMismatch: true,
+      captureRootBodyDeltaPxBucket: "11-50",
+      captureAdaptersUsed: ["gsap"],
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.audio_count).toBe(2);
+    expect(props.image_count).toBe(1);
+    expect(props.root_body_mismatch).toBe(true);
+    expect(props.root_body_delta_px_bucket).toBe("11-50");
+    expect(props.adapters_used).toEqual(["gsap"]);
+  });
+
+  it("prefers the direct drawElement-sourced value over the capture fallback when both are present", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      audioCount: 3,
+      captureAudioCount: 99,
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.audio_count).toBe(3);
+  });
+
   it("flushes immediately after render_complete and render_error (exit races the lazy flush)", () => {
     trackRenderComplete({ durationMs: 1000, fps: 30, quality: "draft", docker: false, gpu: false });
     expect(flush).toHaveBeenCalledTimes(1);
     trackRenderError({ fps: 30, quality: "draft", docker: false });
     expect(flush).toHaveBeenCalledTimes(2);
+  });
+
+  // The enforcement decision for the advisory heap budget reads these fleet
+  // props (see computeWorkerSizing) — a silent drop in the summary→event hop
+  // would invalidate that decision without anyone noticing.
+  it("carries every worker-sizing provenance prop on render_complete", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      workers: 6,
+      workersBoundBy: "max_workers",
+      workersCpuBased: 16,
+      workersMemoryBased: 8,
+      workersHeapBased: 4,
+      workersFrameBased: 24,
+      workersHeapLimitMb: 4096,
+      workersExceedHeapAdvisory: true,
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "render_complete",
+      expect.objectContaining({
+        workers: 6,
+        workers_bound_by: "max_workers",
+        workers_cpu_based: 16,
+        workers_memory_based: 8,
+        workers_heap_based: 4,
+        workers_frame_based: 24,
+        workers_heap_limit_mb: 4096,
+        workers_exceed_heap_advisory: true,
+      }),
+      undefined,
+    );
+  });
+
+  it("ties feedback to its report and recent renders via feedback_id + recent_render_ids", () => {
+    trackRenderFeedback({
+      rating: 3,
+      comment: "hook scene blank",
+      feedbackId: "feedback-uuid",
+      recentRenderIds: ["render-a", "render-b"],
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "cli_render_feedback",
+      expect.objectContaining({
+        feedback_id: "feedback-uuid",
+        recent_render_ids: "render-a,render-b",
+      }),
+    );
   });
 
   it("redacts paths and URL query strings from render error messages", () => {
@@ -204,6 +706,89 @@ describe("render telemetry events", () => {
       }),
       undefined,
     );
+  });
+
+  it("maps Chrome memory and capture path observability onto render_error", () => {
+    trackRenderError({
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      captureChromeBrowserRssPeakMb: 210,
+      captureChromeRendererRssPeakMb: 1900,
+      captureChromeRssLastMb: 2400,
+      captureChromeGpuProcessSeenLastSample: true,
+      captureChromeMemorySamples: 42,
+      captureCapturePath: "streaming",
+      captureSegmentIndex: 3,
+      captureSegmentRetries: 1,
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "render_error",
+      expect.objectContaining({
+        chrome_browser_rss_peak_mb: 210,
+        chrome_renderer_rss_peak_mb: 1900,
+        chrome_rss_last_mb: 2400,
+        gpu_process_seen_last_sample: true,
+        chrome_memory_samples: 42,
+        capture_path: "streaming",
+        segment_index: 3,
+        segment_retries: 1,
+      }),
+      undefined,
+    );
+  });
+
+  it("prefers the aggregate Chrome memory over the live sample on render_complete", () => {
+    // The live observability values are the last session's; the perf summary
+    // aggregates every worker. On success both are present and the aggregate
+    // must win, or a multi-worker render reports one worker's peak as the
+    // fleet's.
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      captureChromeBrowserRssPeakMb: 100,
+      captureChromeRendererRssPeakMb: 800,
+      captureChromeRssLastMb: 900,
+      captureChromeMemorySamples: 5,
+      chromeBrowserRssPeakMb: 210,
+      chromeRendererRssPeakMb: 1900,
+      chromeRssLastMb: 2400,
+      chromeGpuProcessSeenLastSample: true,
+      chromeMemorySamples: 42,
+    });
+
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props).toMatchObject({
+      chrome_browser_rss_peak_mb: 210,
+      chrome_renderer_rss_peak_mb: 1900,
+      chrome_rss_last_mb: 2400,
+      gpu_process_seen_last_sample: true,
+      chrome_memory_samples: 42,
+    });
+  });
+
+  it("falls back to the live Chrome memory sample when no aggregate exists", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      captureChromeBrowserRssPeakMb: 100,
+      captureChromeMemorySamples: 5,
+      captureCapturePath: "disk",
+    });
+
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props).toMatchObject({
+      chrome_browser_rss_peak_mb: 100,
+      chrome_memory_samples: 5,
+      capture_path: "disk",
+    });
   });
 
   it("carries the DE parallel-router/inversion cohort on render_error (hard failure, not just self-verify revert)", () => {
@@ -451,7 +1036,7 @@ describe("trackRenderFeedback", () => {
 
     const [, props] = trackEvent.mock.calls[0] as [string, Record<string, unknown>];
     expect(props).not.toHaveProperty("render_duration_ms");
-    expect(props.$survey_response).toBe(4);
+    expect(props.rating).toBe(4);
     expect(props.rating_scale).toBe(10);
   });
 
@@ -459,7 +1044,7 @@ describe("trackRenderFeedback", () => {
     trackRenderFeedback({ rating: 5, renderDurationMs: 6000 });
 
     expect(trackEvent).toHaveBeenCalledWith(
-      "survey sent",
+      "cli_render_feedback",
       expect.objectContaining({ render_duration_ms: 6000 }),
     );
   });
@@ -651,5 +1236,30 @@ describe("auth login telemetry events", () => {
   it("identifyUser is a no-op when there is no identity to attach", () => {
     identifyUser("");
     expect(trackEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("power-state sampling respects the telemetry opt-out", () => {
+  beforeEach(() => {
+    getPowerState.mockClear();
+    shouldTrack.mockReturnValue(true);
+  });
+
+  it("samples power state for a tracked render", () => {
+    trackRenderComplete({ durationMs: 1, fps: 30, quality: "high", docker: false, gpu: false });
+    expect(getPowerState).toHaveBeenCalled();
+    const props = trackEvent.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(props.on_battery).toBe(true);
+    expect(props.low_power_mode).toBe(false);
+  });
+
+  it("does NOT spawn pmset when telemetry is disabled", () => {
+    // Regression: powerStateFields() is spread into the properties object at
+    // the call site, so it runs BEFORE trackEvent's `if (!shouldTrack())`
+    // guard — an opted-out install would otherwise pay two blocking
+    // subprocess spawns per render for an event that is then discarded.
+    shouldTrack.mockReturnValue(false);
+    trackRenderComplete({ durationMs: 1, fps: 30, quality: "high", docker: false, gpu: false });
+    expect(getPowerState).not.toHaveBeenCalled();
   });
 });

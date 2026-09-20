@@ -36,6 +36,7 @@ import {
   useGsapSaveFailureTelemetry,
   useSafeGsapCommitMutation,
 } from "./useSafeGsapCommitMutation";
+import { studioWriteHeaders } from "../utils/studioFileVersion";
 
 async function mutateGsapScript(
   projectId: string,
@@ -46,7 +47,7 @@ async function mutateGsapScript(
     `/api/projects/${encodeURIComponent(projectId)}/gsap-mutations/${encodeURIComponent(sourceFile)}`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
       body: JSON.stringify(mutation),
     },
   );
@@ -65,7 +66,7 @@ async function mutateGsapScriptBatch(
     `/api/projects/${encodeURIComponent(projectId)}/gsap-mutations-batch/${encodeURIComponent(sourceFile)}`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
       body: JSON.stringify({ mutations }),
     },
   );
@@ -76,6 +77,17 @@ async function mutateGsapScriptBatch(
 }
 
 type ShowToast = (message: string, tone?: "error" | "info") => void;
+
+function showUnchangedMutationFeedback(
+  mutations: Record<string, unknown>[],
+  result: MutationResult,
+  showToast: ShowToast | undefined,
+): void {
+  if (result.changed !== false || mutations.length !== 1) return;
+  if (mutations[0]?.type === "move-keyframe") {
+    showToast?.("A keyframe already exists at that time", "info");
+  }
+}
 
 async function runMutationRequest(
   mutations: Record<string, unknown>[],
@@ -94,7 +106,9 @@ async function runMutationRequest(
     );
   }
   try {
-    return await request();
+    const result = await request();
+    showUnchangedMutationFeedback(mutations, result, showToast);
+    return result;
   } catch (error) {
     if (error instanceof GsapMutationHttpError) {
       showToast?.(formatGsapMutationRejectionToast(error), "error");
@@ -112,7 +126,10 @@ function finishUnchangedMutation(
   reloadPreview: () => void,
 ): boolean {
   if (result.changed !== false) return false;
-  if (!options.skipReload && options.instantPatch) {
+  if (
+    !options.skipReload &&
+    (instantPatchesFor(options).length > 0 || options.previewFallbackLatch?.pending)
+  ) {
     applyPreviewSync(iframe, result, options, reloadPreview);
   }
   return true;
@@ -173,6 +190,9 @@ function syncCommittedGsapMutation({
       targetPath,
       selection.id ?? undefined,
       mutation,
+      // The live preview document is what resolves a class / descendant tween to
+      // the elements it really animates; without it only whole-id selectors do.
+      iframe?.contentDocument,
     );
   }
   refreshMutationPreview(iframe, result, options, reloadPreview, onCacheInvalidate);
@@ -232,19 +252,37 @@ export function applyPreviewSync(
   options: CommitMutationOptions,
   reloadPreview: () => void,
 ): void {
-  if (options.instantPatch) {
-    const patched = patchRuntimeTweenInPlace(
-      iframe,
-      options.instantPatch.selector,
-      options.instantPatch.change,
+  const patches = instantPatchesFor(options);
+  let needsFallback = options.previewFallbackLatch?.pending === true;
+  if (patches.length > 0) {
+    const deferSeek = options.deferPreviewSync === true;
+    const missed = patches.find(
+      (patch, index) =>
+        !patchRuntimeTweenInPlace(
+          iframe,
+          patch.selector,
+          patch.change,
+          undefined,
+          deferSeek || index < patches.length - 1,
+        ),
     );
-    // Patched in place — element is already correct on screen; no reload needed.
-    if (patched) return;
-    // The instant path couldn't patch in place — record the fallback so we can
-    // track how often the fast path misses before the soft/full reload below.
-    trackStudioEvent("gsap_instant_patch_fallback", { selector: options.instantPatch.selector });
-    // Fall through to the soft/full reload path below.
+    if (missed) {
+      // The instant path couldn't patch in place — record the fallback so we can
+      // track how often the fast path misses before the soft/full reload below.
+      trackStudioEvent("gsap_instant_patch_fallback", { selector: missed.selector });
+      needsFallback = true;
+    }
+    // Patched in place — elements are already correct on screen; no reload needed
+    // unless an earlier deferred batch left one member unpatched.
+    if (!needsFallback) return;
   }
+  // Written, but the caller has more writes to make and will render after the last.
+  if (options.deferPreviewSync && options.previewFallbackLatch) {
+    options.previewFallbackLatch.pending = needsFallback;
+    return;
+  }
+  if (options.deferPreviewSync && !needsFallback) return;
+  if (options.previewFallbackLatch) options.previewFallbackLatch.pending = false;
   if (options.softReload && result.scriptText) {
     // A soft-reloadable edit escalates to a full iframe remount ONLY on the
     // PERMANENT "cannot-soft-reload" result (the preview is genuinely stale/
@@ -264,9 +302,18 @@ export function applyPreviewSync(
   }
 }
 
+function instantPatchesFor(
+  options: CommitMutationOptions,
+): NonNullable<CommitMutationOptions["instantPatches"]> {
+  return [
+    ...(options.instantPatches ?? []),
+    ...(options.instantPatch ? [options.instantPatch] : []),
+  ];
+}
+
 // oxfmt-ignore
 // fallow-ignore-next-line complexity
-export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIframeRef, editHistory, domEditSaveTimestampRef, reloadPreview, onCacheInvalidate, onFileContentChanged, showToast, sdkSession, publishSdkSession, writeProjectFile, forceReloadSdkSession }: GsapScriptCommitsParams) {
+export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIframeRef, editHistory, reloadPreview, onCacheInvalidate, onFileContentChanged, showToast, sdkSession, publishSdkSession, writeProjectFile, forceReloadSdkSession }: GsapScriptCommitsParams) {
   const activeProjectId = projectIdRef.current;
   const activeCompPathRef = useRef(activeCompPath);
   activeCompPathRef.current = activeCompPath;
@@ -301,7 +348,6 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
       }
       return;
     }
-    if (previewIsActive) domEditSaveTimestampRef.current = Date.now();
     await recordMutationEdit(targetPath, result, options);
     // The durable mutation belongs to the project captured when it was queued.
     // A later project must never receive its file state or preview refresh.
@@ -318,13 +364,14 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
       reloadPreview,
       onCacheInvalidate,
     });
-  }, [projectIdRef, previewIframeRef, domEditSaveTimestampRef, reloadPreview, onCacheInvalidate, onFileContentChanged, forceReloadSdkSession, recordMutationEdit]);
+  }, [projectIdRef, previewIframeRef, reloadPreview, onCacheInvalidate, onFileContentChanged, forceReloadSdkSession, recordMutationEdit]);
 
   const runCommit = useCallback(async (pid: string, compositionPath: string | null, targetPath: string, selection: DomEditSelection, mutation: Record<string, unknown>, options: CommitMutationOptions) => {
     const result = await runMutationRequest([mutation], options, showToast, () =>
       mutateGsapScript(pid, targetPath, mutation),
     );
     if (!result) return;
+    options.onResult?.(result);
     await finalizeSuccessfulMutation(pid, compositionPath, selection, mutation, targetPath, result, options);
   }, [showToast, finalizeSuccessfulMutation]);
 
@@ -337,7 +384,14 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
       mutateGsapScriptBatch(pid, targetPath, mutations),
     );
     if (!result) return;
-    await finalizeSuccessfulMutation(pid, compositionPath, last.selection, last.mutation, targetPath, result, options);
+    options.onResult?.(result);
+    // Each call brings its own fast-path patch; the batch wrote them all, so the
+    // preview sync applies them all rather than just the last call's.
+    const instantPatches = calls
+      .map(({ options: callOptions }) => callOptions.instantPatch)
+      .filter((patch) => patch !== undefined);
+    const { instantPatch: _instantPatch, ...batchOptions } = options;
+    await finalizeSuccessfulMutation(pid, compositionPath, last.selection, last.mutation, targetPath, result, instantPatches.length > 0 ? { ...batchOptions, instantPatches } : batchOptions);
   }, [showToast, finalizeSuccessfulMutation]);
 
   // Every GSAP-script commit is a read-modify-write of one file. Overlapping
@@ -439,7 +493,6 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
             editHistory: { recordEdit: editHistory.recordEdit },
             writeProjectFile,
             reloadPreview,
-            domEditSaveTimestampRef,
             refresh: sdkRefresh,
             compositionPath: activeCompPath,
             readProjectFile: readProjectFileContent,
@@ -450,7 +503,6 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
       editHistory.recordEdit,
       writeProjectFile,
       reloadPreview,
-      domEditSaveTimestampRef,
       sdkRefresh,
       activeCompPath,
       readProjectFileContent,

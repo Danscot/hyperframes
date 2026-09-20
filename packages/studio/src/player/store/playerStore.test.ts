@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { usePlayerStore, liveTime, type TimelineElement } from "./playerStore";
 
@@ -22,9 +23,135 @@ describe("usePlayerStore", () => {
       expectResettableDefaults(state);
       expect(state.playbackRate).toBe(1);
       expect(state.audioMuted).toBe(false);
+      expect(state.audioVolume).toBe(1);
       expect(state.loopEnabled).toBe(false);
       expect(state.zoomMode).toBe("fit");
       expect(state.manualZoomPercent).toBe(100);
+      expect(state.expandedClipIds).toEqual(new Set());
+    });
+  });
+
+  describe("thumbnail content revision", () => {
+    it("advances once per accepted persisted file event", () => {
+      const before = usePlayerStore.getState().thumbnailContentRevision;
+
+      usePlayerStore.getState().bumpThumbnailContentRevision();
+
+      expect(usePlayerStore.getState().thumbnailContentRevision).toBe(before + 1);
+    });
+
+    it("remains monotonic across soft resets while project identity stays with the session epoch", () => {
+      const store = usePlayerStore.getState();
+      store.beginTimelineSession("project-a");
+      store.bumpThumbnailContentRevision();
+      const revision = usePlayerStore.getState().thumbnailContentRevision;
+      const firstEpoch = usePlayerStore.getState().timelineSessionEpoch;
+
+      store.reset();
+      expect(usePlayerStore.getState().thumbnailContentRevision).toBe(revision);
+      store.beginTimelineSession("project-b");
+      expect(usePlayerStore.getState().thumbnailContentRevision).toBe(revision);
+      expect(usePlayerStore.getState().timelineSessionEpoch).toBe(firstEpoch + 1);
+    });
+  });
+
+  describe("expandedClipIds", () => {
+    it("toggles clip membership", () => {
+      const store = usePlayerStore.getState();
+
+      store.toggleClipExpanded("clip-1");
+      expect(usePlayerStore.getState().expandedClipIds).toEqual(new Set(["clip-1"]));
+
+      store.toggleClipExpanded("clip-1");
+      expect(usePlayerStore.getState().expandedClipIds).toEqual(new Set());
+    });
+
+    it("sets clip membership idempotently", () => {
+      const store = usePlayerStore.getState();
+
+      store.setClipExpanded("clip-1", true);
+      store.setClipExpanded("clip-1", true);
+      expect(usePlayerStore.getState().expandedClipIds).toEqual(new Set(["clip-1"]));
+
+      store.setClipExpanded("clip-1", false);
+      store.setClipExpanded("clip-1", false);
+      expect(usePlayerStore.getState().expandedClipIds).toEqual(new Set());
+    });
+  });
+
+  describe("focused ease requests", () => {
+    it("stamps the current project session and only lets its nonce clear it", () => {
+      const store = usePlayerStore.getState();
+      store.beginTimelineSession("project-a");
+      store.setSelectedElementId("index.html#hero");
+      store.setFocusedEaseSegment({
+        elementId: "index.html#hero",
+        animationId: "animation-a",
+        tweenPercentage: 50,
+      });
+      const first = usePlayerStore.getState().focusedEaseSegment;
+      if (!first) throw new Error("expected focused ease request");
+      expect(first.projectId).toBe("project-a");
+      expect(first.sessionEpoch).toBeGreaterThan(0);
+      expect(first.nonce).toBeGreaterThan(0);
+
+      store.setFocusedEaseSegment({
+        elementId: "index.html#hero",
+        animationId: "animation-a",
+        tweenPercentage: 75,
+      });
+      const second = usePlayerStore.getState().focusedEaseSegment;
+      if (!second) throw new Error("expected replacement request");
+      expect(second.nonce).toBe(first.nonce + 1);
+
+      store.clearFocusedEaseSegment(first.nonce);
+      expect(usePlayerStore.getState().focusedEaseSegment).toBe(second);
+      store.clearFocusedEaseSegment(second.nonce);
+      expect(usePlayerStore.getState().focusedEaseSegment).toBeNull();
+    });
+
+    it("clears a pending request when the project session changes", () => {
+      const store = usePlayerStore.getState();
+      store.beginTimelineSession("project-a");
+      store.setFocusedEaseSegment({
+        elementId: "index.html#hero",
+        animationId: "animation-a",
+        tweenPercentage: 50,
+      });
+
+      store.beginTimelineSession("project-b");
+      expect(usePlayerStore.getState().focusedEaseSegment).toBeNull();
+    });
+
+    it("does not revive an old request after selecting away and back", () => {
+      const store = usePlayerStore.getState();
+      store.setSelectedElementId("index.html#a");
+      store.setFocusedEaseSegment({
+        elementId: "index.html#a",
+        animationId: "animation-a",
+        tweenPercentage: 50,
+      });
+
+      store.setSelectedElementId("index.html#b");
+      expect(usePlayerStore.getState().focusedEaseSegment).toBeNull();
+      store.setSelectedElementId("index.html#a");
+      expect(usePlayerStore.getState().focusedEaseSegment).toBeNull();
+    });
+
+    it("invalidates on a genuine selection-anchor change but not a same-anchor echo", () => {
+      const store = usePlayerStore.getState();
+      store.setSelection(new Set(["index.html#a", "index.html#b"]), "index.html#a");
+      store.setFocusedEaseSegment({
+        elementId: "index.html#a",
+        animationId: "animation-a",
+        tweenPercentage: 50,
+      });
+      const request = usePlayerStore.getState().focusedEaseSegment;
+
+      store.setSelectionAnchor("index.html#a");
+      expect(usePlayerStore.getState().focusedEaseSegment).toBe(request);
+      store.setSelectionAnchor("index.html#b");
+      expect(usePlayerStore.getState().focusedEaseSegment).toBeNull();
     });
   });
 
@@ -72,6 +199,19 @@ describe("usePlayerStore", () => {
     it("updates audioMuted", () => {
       usePlayerStore.getState().setAudioMuted(true);
       expect(usePlayerStore.getState().audioMuted).toBe(true);
+    });
+  });
+
+  describe("setAudioVolume", () => {
+    it("updates and clamps audioVolume", () => {
+      usePlayerStore.getState().setAudioVolume(0.35);
+      expect(usePlayerStore.getState().audioVolume).toBe(0.35);
+
+      usePlayerStore.getState().setAudioVolume(2);
+      expect(usePlayerStore.getState().audioVolume).toBe(1);
+
+      usePlayerStore.getState().setAudioVolume(-1);
+      expect(usePlayerStore.getState().audioVolume).toBe(0);
     });
   });
 
@@ -180,6 +320,47 @@ describe("usePlayerStore", () => {
     it("updates timelineReady", () => {
       usePlayerStore.getState().setTimelineReady(true);
       expect(usePlayerStore.getState().timelineReady).toBe(true);
+    });
+  });
+
+  describe("requestTimelineReady", () => {
+    function stalledVideoDoc(): { doc: Document; video: HTMLVideoElement } {
+      const doc = document.implementation.createHTMLDocument("composition");
+      const video = doc.createElement("video");
+      Object.defineProperty(video, "readyState", { value: 0, configurable: true });
+      doc.body.appendChild(video);
+      return { doc, video };
+    }
+
+    it("resolves timelineReady once the doc's media settles", async () => {
+      const { doc, video } = stalledVideoDoc();
+      usePlayerStore.getState().requestTimelineReady(doc);
+      expect(usePlayerStore.getState().timelineReady).toBe(false);
+
+      video.dispatchEvent(new Event("canplay"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(usePlayerStore.getState().timelineReady).toBe(true);
+    });
+
+    it("a stale wait from a project switched away from never marks the new project ready", async () => {
+      // beginTimelineSession no-ops when projectId is unchanged, so pin a
+      // known starting project first rather than relying on reset()'s
+      // leftover timelineProjectId from whatever test ran before this one.
+      usePlayerStore.getState().beginTimelineSession("readiness-test-project-a");
+      const { doc: docA, video: videoA } = stalledVideoDoc();
+      usePlayerStore.getState().requestTimelineReady(docA);
+
+      // Switches projects mid-wait — beginTimelineSession resets timelineReady
+      // to false for project B, whose own media has not been checked at all.
+      usePlayerStore.getState().beginTimelineSession("readiness-test-project-b");
+      expect(usePlayerStore.getState().timelineReady).toBe(false);
+
+      // A's wait settles late; it must not resolve into B's readiness.
+      videoA.dispatchEvent(new Event("canplay"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(usePlayerStore.getState().timelineReady).toBe(false);
     });
   });
 
@@ -383,39 +564,63 @@ describe("usePlayerStore", () => {
       expect(usePlayerStore.getState().manualZoomPercent).toBe(10);
     });
 
-    it("clamps to the maximum supported zoom percent", () => {
-      usePlayerStore.getState().setManualZoomPercent(5000);
-      expect(usePlayerStore.getState().manualZoomPercent).toBe(2000);
+    it("clamps to the frame-level zoom for the current fit scale", () => {
+      usePlayerStore.getState().setTimelineScale(12, 12);
+      usePlayerStore.getState().setManualZoomPercent(100_000);
+      expect(usePlayerStore.getState().manualZoomPercent).toBe(12_000);
+      usePlayerStore.getState().setTimelineScale(100, 100);
     });
   });
 
-  describe("clipRevealRequest", () => {
-    it("starts null and carries the requested element id", () => {
-      expect(usePlayerStore.getState().clipRevealRequest).toBeNull();
-      usePlayerStore.getState().requestClipReveal("el-1");
-      expect(usePlayerStore.getState().clipRevealRequest?.elementId).toBe("el-1");
-    });
+  describe("timelineFocus", () => {
+    it("stamps project scope and carries the requested logical id", () => {
+      usePlayerStore.getState().beginTimelineSession("project-a");
+      usePlayerStore.getState().requestTimelineFocus("clip:el-1");
+      expect(usePlayerStore.getState().timelineFocus).toMatchObject({
+        id: "clip:el-1",
+        projectId: "project-a",
+        sessionEpoch: usePlayerStore.getState().timelineSessionEpoch,
+      });
+      const store = usePlayerStore.getState();
+      store.requestTimelineFocus("clip:el-1");
+      const first = usePlayerStore.getState().timelineFocus;
+      if (!first) throw new Error("expected timeline focus request");
+      store.clearTimelineFocus(first.nonce);
+      store.reset();
+      store.requestTimelineFocus("clip:el-1");
+      const second = usePlayerStore.getState().timelineFocus;
+      expect(second?.nonce).toBe(first.nonce + 1);
 
-    it("bumps the nonce on repeat requests for the same clip", () => {
-      usePlayerStore.getState().requestClipReveal("el-1");
-      const first = usePlayerStore.getState().clipRevealRequest;
-      usePlayerStore.getState().requestClipReveal("el-1");
-      const second = usePlayerStore.getState().clipRevealRequest;
-      expect(second?.nonce).not.toBe(first?.nonce);
-    });
-
-    it("clears via clearClipRevealRequest and on reset", () => {
-      usePlayerStore.getState().requestClipReveal("el-1");
-      usePlayerStore.getState().clearClipRevealRequest();
-      expect(usePlayerStore.getState().clipRevealRequest).toBeNull();
-
-      usePlayerStore.getState().requestClipReveal("el-2");
-      usePlayerStore.getState().reset();
-      expect(usePlayerStore.getState().clipRevealRequest).toBeNull();
+      store.beginTimelineSession("project-a");
+      store.requestTimelineFocus("clip:el-1");
+      const stale = usePlayerStore.getState().timelineFocus;
+      if (!stale) throw new Error("expected timeline focus request");
+      store.requestTimelineFocus("clip:el-2");
+      const replacement = usePlayerStore.getState().timelineFocus;
+      if (!replacement) throw new Error("expected replacement timeline focus request");
+      store.clearTimelineFocus(stale.nonce);
+      expect(usePlayerStore.getState().timelineFocus).toBe(replacement);
+      store.beginTimelineSession("project-b");
+      expect(usePlayerStore.getState().timelineFocus).toBeNull();
     });
   });
 
   describe("reset", () => {
+    it("increments the session epoch only for a hard project switch", () => {
+      usePlayerStore.getState().beginTimelineSession("project-a");
+      const firstEpoch = usePlayerStore.getState().timelineSessionEpoch;
+
+      usePlayerStore.getState().reset();
+      expect(usePlayerStore.getState().timelineSessionEpoch).toBe(firstEpoch);
+
+      usePlayerStore.getState().beginTimelineSession("project-a");
+      expect(usePlayerStore.getState().timelineSessionEpoch).toBe(firstEpoch);
+
+      usePlayerStore.getState().beginTimelineSession("project-b");
+      expect(usePlayerStore.getState().timelineSessionEpoch).toBe(firstEpoch + 1);
+      expect(usePlayerStore.getState().timelineProjectId).toBe("project-b");
+    });
+
     it("resets all state to defaults", () => {
       // Mutate everything
       const store = usePlayerStore.getState();
@@ -432,10 +637,26 @@ describe("usePlayerStore", () => {
       expectResettableDefaults(usePlayerStore.getState());
     });
 
-    it("does not reset playbackRate, audioMuted, loopEnabled, zoomMode, or manualZoomPercent", () => {
+    it("drops an automation time selection on reset and on a project switch", () => {
+      const sel = { elementKey: "bgm", target: "volume", t0: 1, t1: 2 };
+
+      usePlayerStore.getState().setAutomationSelection(sel);
+      usePlayerStore.getState().reset();
+      expect(usePlayerStore.getState().automationSelection).toBeNull();
+
+      // The switch matters more than reset(): a stale elementKey can match a
+      // same-keyed clip in the new project and redirect a paste to its old t0.
+      usePlayerStore.getState().beginTimelineSession("project-a");
+      usePlayerStore.getState().setAutomationSelection(sel);
+      usePlayerStore.getState().beginTimelineSession("project-b");
+      expect(usePlayerStore.getState().automationSelection).toBeNull();
+    });
+
+    it("does not reset playbackRate, audioMuted, audioVolume, loopEnabled, zoomMode, or manualZoomPercent", () => {
       const store = usePlayerStore.getState();
       store.setPlaybackRate(2);
       store.setAudioMuted(true);
+      store.setAudioVolume(0.4);
       store.setLoopEnabled(true);
       store.setZoomMode("manual");
       store.setManualZoomPercent(200);
@@ -446,6 +667,7 @@ describe("usePlayerStore", () => {
       // reset() only resets the fields explicitly listed in the reset function
       expect(state.playbackRate).toBe(2);
       expect(state.audioMuted).toBe(true);
+      expect(state.audioVolume).toBe(0.4);
       expect(state.loopEnabled).toBe(true);
       expect(state.zoomMode).toBe("manual");
       expect(state.manualZoomPercent).toBe(200);

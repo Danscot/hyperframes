@@ -57,6 +57,8 @@ export interface GsapAnimation {
   properties: Record<string, number | string>;
   fromProperties?: Record<string, number | string>;
   duration?: number;
+  /** A `duration` was authored but is not a static number: unknown, not the 0.5s default. */
+  durationUnresolved?: boolean;
   ease?: string;
   /** Non-editable GSAP config (stagger, yoyo, repeat, etc.) preserved for round-trips. */
   extras?: Record<string, unknown>;
@@ -90,11 +92,55 @@ export interface GsapPercentageKeyframe {
   ease?: string;
 }
 
+export interface WritableGsapPercentageKeyframe extends GsapPercentageKeyframe {
+  auto?: boolean;
+}
+
+/**
+ * A keyframe that still knows which tween emitted it, and where inside that
+ * tween it sat. Merging several tweens onto one timeline row drops that
+ * provenance unless it rides along on the keyframe, and an editor needs it to
+ * route an edit back to the animation the user actually clicked. Required, not
+ * optional: a keyframe that reaches a merge without it cannot be attributed at
+ * all, and silently treating that as "no collision" is how an edit lands on the
+ * wrong tween.
+ */
+export interface SourcedGsapPercentageKeyframe extends GsapPercentageKeyframe {
+  animationId: string;
+  tweenPercentage: number;
+}
+
+/**
+ * Collapse duplicate percentage entries before serializing an object literal.
+ * Matches addKeyframeToScript's merge contract: later properties/ease win while
+ * unrelated authored properties and an earlier ease survive. An explicit later
+ * `auto` value wins, and output is always sorted by percentage.
+ */
+export function mergePercentageKeyframes(
+  keyframes: readonly WritableGsapPercentageKeyframe[],
+): WritableGsapPercentageKeyframe[] {
+  const byPercentage = new Map<number, WritableGsapPercentageKeyframe>();
+  for (const keyframe of keyframes) {
+    const existing = byPercentage.get(keyframe.percentage);
+    if (!existing) {
+      byPercentage.set(keyframe.percentage, {
+        ...keyframe,
+        properties: { ...keyframe.properties },
+      });
+      continue;
+    }
+    existing.properties = { ...existing.properties, ...keyframe.properties };
+    if (keyframe.ease !== undefined) existing.ease = keyframe.ease;
+    if (keyframe.auto !== undefined) existing.auto = keyframe.auto;
+  }
+  return [...byPercentage.values()].sort((a, b) => a.percentage - b.percentage);
+}
+
 export type GsapKeyframeFormat = "percentage" | "object-array" | "simple-array";
 
-export interface GsapKeyframesData {
+export interface GsapKeyframesData<K extends GsapPercentageKeyframe = GsapPercentageKeyframe> {
   format: GsapKeyframeFormat;
-  keyframes: GsapPercentageKeyframe[];
+  keyframes: K[];
   ease?: string;
   easeEach?: string;
 }
@@ -178,6 +224,12 @@ export interface SplitAnimationsResult {
 
 // ── Serialization ───────────────────────────────────────────────────────────
 
+/**
+ * Construct executable JavaScript from trusted composition-author inputs.
+ * __raw: values, preamble, postamble, and timelineVar are code-bearing inputs
+ * and are deliberately not sanitized. Never populate them from untrusted data.
+ * Quoting ordinary values does not sandbox authored code or its side effects.
+ */
 export function serializeGsapAnimations(
   animations: GsapAnimation[],
   timelineVar = "tl",
@@ -192,7 +244,7 @@ export function serializeGsapAnimations(
   });
   // fallow-ignore-next-line complexity
   const lines = sorted.map((anim) => {
-    const selector = `"${anim.targetSelector}"`;
+    const selector = JSON.stringify(anim.targetSelector);
     const props: Record<string, number | string> = { ...anim.properties };
     if (anim.duration !== undefined) props.duration = anim.duration;
     if (anim.ease) props.ease = anim.ease;
@@ -206,7 +258,7 @@ export function serializeGsapAnimations(
         propsStr = propsStr.slice(0, -2) + `, ${extrasStr} }`;
       }
     }
-    const posStr = typeof anim.position === "string" ? `"${anim.position}"` : anim.position;
+    const posStr = JSON.stringify(anim.position);
     switch (anim.method) {
       case "set":
         // A global set is a base `gsap.set` — off the timeline, no position arg.

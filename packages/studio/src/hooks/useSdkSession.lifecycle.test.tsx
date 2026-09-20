@@ -12,6 +12,17 @@ vi.mock("@hyperframes/sdk", () => ({
 import type { Composition } from "@hyperframes/sdk";
 import { useSdkSession, type SdkSessionHandle } from "./useSdkSession";
 
+vi.mock("../utils/studioTelemetry", () => ({ trackStudioEvent: vi.fn() }));
+
+import { trackStudioEvent } from "../utils/studioTelemetry";
+
+const trackMock = vi.mocked(trackStudioEvent);
+
+function Probe({ projectId }: { projectId: string }) {
+  useSdkSession(projectId, "index.html");
+  return null;
+}
+
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 function fakeSession(): Composition {
@@ -133,5 +144,115 @@ describe("useSdkSession ownership", () => {
 
     await act(async () => root.unmount());
     expect(published.dispose).toHaveBeenCalledOnce();
+  });
+});
+
+describe("useSdkSession unavailable telemetry", () => {
+  beforeEach(() => {
+    openComposition.mockReset();
+    trackMock.mockClear();
+    class FakeEventSource {
+      addEventListener(): void {}
+      close(): void {}
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // Every cutover chokepoint silently takes the server path when there is no
+  // session, and the shadow never runs either — so a missing session is a total,
+  // otherwise-invisible SDK bypass. These exits are its only origin.
+  //
+  // `stage: read` carries a reason because it was the largest remaining class
+  // and a single opaque string: 56 users hit it in a 7-day window and never
+  // landed one successful SDK edit between them, with no way to tell a genuinely
+  // absent file from a request that never reached one.
+  it("reports the HTTP status when the read fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) }) as Response),
+    );
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Probe projectId="project-a" />));
+    await flushAsyncEffects();
+
+    expect(trackMock).toHaveBeenCalledWith("sdk_session_unavailable", {
+      stage: "read",
+      reason: "http_error",
+      status: 404,
+    });
+    await act(async () => root.unmount());
+  });
+
+  it("separates an unexpected response shape from a failed request", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({}) }) as Response),
+    );
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Probe projectId="project-a" />));
+    await flushAsyncEffects();
+
+    expect(trackMock).toHaveBeenCalledWith("sdk_session_unavailable", {
+      stage: "read",
+      reason: "missing_content",
+    });
+    await act(async () => root.unmount());
+  });
+
+  // `optional=1` answers a file that is not on disk with 200 + an empty string,
+  // so this is what "the composition genuinely is not there" looks like on the
+  // wire — previously indistinguishable from a broken request. The shim and a
+  // real 0-byte file are the same response, hence the name.
+  it("separates a file that is not on disk", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: "" }) }) as Response),
+    );
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Probe projectId="project-a" />));
+    await flushAsyncEffects();
+
+    expect(trackMock).toHaveBeenCalledWith("sdk_session_unavailable", {
+      stage: "read",
+      reason: "absent_or_empty",
+    });
+    await act(async () => root.unmount());
+  });
+
+  it("reports a parse failure with its message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => response("PROJECT_A")),
+    );
+    openComposition.mockRejectedValue(new Error("unparseable composition"));
+
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Probe projectId="project-a" />));
+    await flushAsyncEffects();
+
+    expect(trackMock).toHaveBeenCalledWith("sdk_session_unavailable", {
+      stage: "open",
+      error: "unparseable composition",
+    });
+    await act(async () => root.unmount());
+  });
+
+  it("stays silent on the happy path", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => response("PROJECT_A")),
+    );
+    openComposition.mockResolvedValue(fakeSession());
+
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Probe projectId="project-a" />));
+    await flushAsyncEffects();
+
+    expect(trackMock).not.toHaveBeenCalledWith("sdk_session_unavailable", expect.anything());
+    await act(async () => root.unmount());
   });
 });

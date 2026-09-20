@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { MagnetStraight, GridFour, Path } from "@phosphor-icons/react";
+import { MagnetStraight, GridFour, Path, Ruler, FrameCorners } from "@phosphor-icons/react";
 import { readStudioUiPreferences, writeStudioUiPreferences } from "../../utils/studioUiPreferences";
 import { usePlayerStore } from "../../player/store/playerStore";
+import { usePreviewGuidesStore } from "./previewGuidesStore";
 
 const SNAP_DEFAULTS = {
   snapEnabled: true,
@@ -39,6 +40,7 @@ export const SnapToolbar = memo(function SnapToolbar({ onSnapChange }: SnapToolb
   const motionPathCreateAvailable = usePlayerStore((s) => s.motionPathCreateAvailable);
   const motionPathArmed = usePlayerStore((s) => s.motionPathArmed);
   const setMotionPathArmed = usePlayerStore((s) => s.setMotionPathArmed);
+  const guides = usePreviewGuidesStore();
   const popoverRef = useRef<HTMLDivElement>(null);
   const gridButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -102,7 +104,7 @@ export const SnapToolbar = memo(function SnapToolbar({ onSnapChange }: SnapToolb
       {motionPathCreateAvailable && (
         <button
           type="button"
-          className={`rounded-md p-1.5 transition-colors ${
+          className={`rounded-md p-1.5 transition-colors active:scale-[0.95] ${
             motionPathArmed
               ? "bg-studio-accent/20 text-studio-accent"
               : "bg-black/40 text-white/60 hover:bg-black/60 hover:text-white/80"
@@ -116,9 +118,31 @@ export const SnapToolbar = memo(function SnapToolbar({ onSnapChange }: SnapToolb
           <Path size={16} weight={motionPathArmed ? "fill" : "regular"} />
         </button>
       )}
+      {(
+        [
+          ["rulerVisible", "Ruler", Ruler],
+          ["safeMarginsVisible", "Safe margins", FrameCorners],
+        ] as const
+      ).map(([key, label, Icon]) => (
+        <button
+          key={key}
+          type="button"
+          className={`rounded-md p-1.5 transition-colors active:scale-[0.95] ${
+            guides[key]
+              ? "bg-studio-accent/20 text-studio-accent"
+              : "bg-black/40 text-white/60 hover:bg-black/60 hover:text-white/80"
+          }`}
+          onClick={() => guides.toggle(key)}
+          title={`${label} ${guides[key] ? "on" : "off"}`}
+          aria-label={`Toggle ${label.toLowerCase()}`}
+          aria-pressed={guides[key]}
+        >
+          <Icon size={16} weight={guides[key] ? "fill" : "regular"} />
+        </button>
+      ))}
       <button
         type="button"
-        className={`rounded-md p-1.5 transition-colors ${
+        className={`rounded-md p-1.5 transition-colors active:scale-[0.95] ${
           prefs.snapEnabled
             ? "bg-studio-accent/20 text-studio-accent"
             : "bg-black/40 text-white/60 hover:bg-black/60 hover:text-white/80"
@@ -134,7 +158,7 @@ export const SnapToolbar = memo(function SnapToolbar({ onSnapChange }: SnapToolb
         <button
           ref={gridButtonRef}
           type="button"
-          className={`rounded-md p-1.5 transition-colors ${
+          className={`rounded-md p-1.5 transition-colors active:scale-[0.95] ${
             prefs.gridVisible
               ? "bg-studio-accent/20 text-studio-accent"
               : "bg-black/40 text-white/60 hover:bg-black/60 hover:text-white/80"
@@ -144,10 +168,26 @@ export const SnapToolbar = memo(function SnapToolbar({ onSnapChange }: SnapToolb
             e.preventDefault();
             setGridPopoverOpen((v) => !v);
           }}
-          title={prefs.gridVisible ? "Grid visible (G)" : "Grid hidden (G)"}
+          title={
+            prefs.gridVisible
+              ? "Grid visible (G) — right-click for spacing options"
+              : "Grid hidden (G) — right-click for spacing options"
+          }
           aria-label="Toggle grid"
         >
           <GridFour size={16} weight={prefs.gridVisible ? "fill" : "regular"} />
+        </button>
+        <button
+          type="button"
+          className="absolute -right-0.5 -bottom-0.5 rounded-sm p-0.5 text-white/50 hover:text-white/90 bg-black/50"
+          onClick={() => setGridPopoverOpen((v) => !v)}
+          title="Grid options"
+          aria-label="Grid options"
+          aria-expanded={gridPopoverOpen}
+        >
+          <svg width="7" height="7" viewBox="0 0 8 8" fill="currentColor" aria-hidden="true">
+            <path d="M1 2.5l3 3 3-3z" />
+          </svg>
         </button>
 
         {gridPopoverOpen && (
@@ -169,7 +209,7 @@ export const SnapToolbar = memo(function SnapToolbar({ onSnapChange }: SnapToolb
                     updatePrefs({ gridSpacing: val });
                   }
                 }}
-                className="w-16 rounded bg-neutral-900 border border-neutral-600 px-1.5 py-0.5 text-xs text-white text-right tabular-nums outline-none focus:border-studio-accent"
+                className="w-16 rounded-sm bg-neutral-900 border border-neutral-600 px-1.5 py-0.5 text-xs text-white text-right tabular-nums outline-hidden focus:border-studio-accent"
               />
             </label>
             <label className="flex items-center gap-2 text-xs text-white/80 cursor-pointer">

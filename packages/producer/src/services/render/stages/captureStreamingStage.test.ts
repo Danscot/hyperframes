@@ -1,10 +1,19 @@
-import { describe, expect, it, mock } from "bun:test";
+// fallow-ignore-file code-duplication
+import { afterAll, describe, expect, it, mock } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const fixtureRoot = mkdtempSync(join(tmpdir(), "hf-stage-test-"));
+const framesDir = join(fixtureRoot, "frames");
+afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 import { getCaptureStageBrowserConsole } from "../captureStageError.js";
 import { createCapturePlan } from "../capturePlan.js";
 
 type MinimalEngineConfig = {
   forceScreenshot: boolean;
   ffmpegStreamingTimeout: number;
+  lowMemoryMode?: boolean;
 };
 
 const writeFrame = mock((_buffer: Buffer) => true);
@@ -18,8 +27,16 @@ const spawnStreamingEncoder = mock(async () => ({
 let failCaptureFrameToBuffer = false;
 let failInitializeSession = false;
 let hangParallelUntilAbort = false;
+// Which phase the wedged worker reports. frame_capture = past init, wedged in
+// a capture call (the watchdog's job); session_init = still booting (not).
+let hangParallelPhase: "session_init" | "frame_capture" = "frame_capture";
+let failWorkerTransient = false;
+let injectedWorkerFailure: Error | null = null;
+const reorderAbortCalls: unknown[] = [];
 let hangSequentialUntilStall = false;
 let sessionWorkerEncodeEnabled = false;
+let captureSessionMode: "drawelement" | "screenshot" = "drawelement";
+let failPrepareCaptureSessionForReuse = false;
 let initializeSessionErrorMessage = "initialize failed";
 const browserConsoleBuffer = ["[FrameCapture:ERROR] page.goto failed"];
 const closeCaptureSession = mock(async () => {});
@@ -57,11 +74,14 @@ mock.module("@hyperframes/engine", () => ({
     browserConsoleBuffer,
     options: { captureBeyondViewport: false },
     workerEncodeEnabled: sessionWorkerEncodeEnabled,
+    captureMode: captureSessionMode,
   }),
   createFrameReorderBuffer: () => ({
     waitForFrame: async () => {},
     advanceTo: () => {},
-    abort: () => {},
+    abort: (reason: unknown) => {
+      reorderAbortCalls.push(reason);
+    },
   }),
   distributeFrames: () => [],
   distributeFramesInterleaved: () => [],
@@ -73,8 +93,44 @@ mock.module("@hyperframes/engine", () => ({
     _opts: unknown,
     _hook: unknown,
     signal?: AbortSignal,
+    onProgress?: (progress: unknown) => void,
+    _onFrameBuffer?: unknown,
+    _config?: unknown,
+    hooks?: { onWorkerFailure?: (failure: Error) => void },
   ) => {
+    if (failWorkerTransient) {
+      // One worker's Chrome died. The engine reports the ORIGINAL failure
+      // through the hook, then the pool rejects with its flattened summary.
+      // That ordering is the engine's contract, pinned without a browser by
+      // parallelCoordinator.test.ts "createPoolFailureHandler"; this mock
+      // only replays it.
+      injectedWorkerFailure = Object.assign(
+        new Error("Protocol error (Page.captureScreenshot): Target closed"),
+        { kind: "transient_browser" },
+      );
+      hooks?.onWorkerFailure?.(injectedWorkerFailure);
+      throw new Error(
+        "[Parallel] Capture failed: Worker 1: Protocol error (Page.captureScreenshot): Target closed",
+      );
+    }
     if (hangParallelUntilAbort) {
+      onProgress?.({
+        totalFrames: 100,
+        capturedFrames: 0,
+        activeWorkers: 2,
+        workerProgress: new Map([
+          [0, 0],
+          [1, 0],
+        ]),
+        latestWorkerPhase: {
+          workerId: 0,
+          phase: hangParallelPhase,
+          browserExecutable: "C:/Chrome/chrome.exe",
+          browserVersion: "Chrome/152.0.7977.30",
+          canvasDrawElement: true,
+          gpuBackend: "d3d11/nvidia",
+        },
+      });
       // Simulate a wedged worker: make no frame progress, then reject with the
       // pool's generic string once aborted (by the parent or the watchdog).
       await new Promise<void>((_resolve, reject) => {
@@ -100,7 +156,11 @@ mock.module("@hyperframes/engine", () => ({
     pixelFormat: "yuv420p",
   }),
   initTransparentBackground: async () => {},
-  prepareCaptureSessionForReuse: () => {},
+  prepareCaptureSessionForReuse: () => {
+    if (failPrepareCaptureSessionForReuse) {
+      throw new Error("prepare reuse failed: ENOSPC");
+    }
+  },
   recaptureDrawElementFrameForVerify: async () => Buffer.from("frame"),
   spawnStreamingEncoder,
   writeCapturedFrame: async () => {},
@@ -117,6 +177,9 @@ mock.module("../../renderOrchestrator.js", () => ({
   closeHdrVideoFrameSource: () => {},
   createHdrPerfCollector: () => ({}),
   executeDiskCaptureWithAdaptiveRetry: async () => [],
+  findMissingFrameRanges: () => [],
+  isTransientCaptureRetryEligible: () => false,
+  sampleDirectoryBytes: () => 0,
   resolveCompositeTransfer: () => "srgb",
 }));
 
@@ -126,8 +189,13 @@ mock.module("../../hdrCompositor.js", () => ({
 }));
 
 mock.module("./captureHdrResources.js", () => ({
+  cleanupHdrVideoFrameSource: () => {},
   decodeHdrImageBuffers: () => new Map(),
-  extractHdrVideoFrames: async () => new Map(),
+  extractHdrVideoFrames: async () => ({
+    sources: new Map(),
+    estimatedBytes: 0,
+    releaseReservation: () => {},
+  }),
   planHdrResources: () => ({
     hdrVideoStartTimes: new Map(),
     nativeHdrVideos: [],
@@ -159,7 +227,7 @@ function createInput(cfg: MinimalEngineConfig) {
       addPreHeadScript: () => {},
     },
     workDir: "/tmp/hf-test-work",
-    framesDir: "/tmp/hf-test-frames",
+    framesDir: framesDir,
     videoOnlyPath: "/tmp/hf-test-video-only.mp4",
     job: {
       id: "streaming-config-test",
@@ -245,6 +313,7 @@ describe("runCaptureStreamingStage", () => {
       ...baseInput,
       totalFrames: 100,
       plan: { ...baseInput.plan, workerCount: 2, forceParallelStream: true },
+      parallelCaptureLabel: "screenshot",
     };
 
     let caught: unknown;
@@ -260,10 +329,92 @@ describe("runCaptureStreamingStage", () => {
 
     expect(caught).toBeInstanceOf(Error);
     // A stalled render must surface as a stall (→ pinned fallback), never as
-    // the raw "[Parallel] Capture failed" or a cancellation.
+    // the raw "[Parallel] Capture failed" or a cancellation. Typed, so the
+    // orchestrator's retry gate recognises it on any routing.
+    expect((caught as Error).name).toBe("ParallelCaptureStallError");
     expect((caught as Error).message).toContain("stalled");
+    // The label is the caller's capture mode, not a hard-coded "drawElement":
+    // screenshot-cohort stalls were being triaged as drawElement bugs.
+    expect((caught as Error).message).toContain("Parallel screenshot capture stalled");
+    expect((caught as Error).message).not.toContain("drawElement");
+    expect((caught as Error).message).toContain("phase=frame_capture");
+    expect((caught as Error).message).toContain("Chrome/152.0.7977.30");
     // Parent signal never fired, so the orchestrator won't read this as a cancel.
     expect(input.abortSignal).toBeUndefined();
+  });
+
+  it("does not arm the watchdog while every worker is still initialising", async () => {
+    // Browsers launching and sub-composition timelines settling can take
+    // longer than the stall window on a heavy composition. Counting that as
+    // no-progress made the watchdog fail exactly the long renders it guards.
+    hangParallelUntilAbort = true;
+    hangParallelPhase = "session_init";
+    const prev = process.env.HF_DE_STALL_MS;
+    process.env.HF_DE_STALL_MS = "50";
+    const controller = new AbortController();
+    const { runCaptureStreamingStage } = await import("./captureStreamingStage.js");
+    const cfg = { forceScreenshot: false, ffmpegStreamingTimeout: 3_600_000 };
+    const baseInput = createInput(cfg);
+    const input = {
+      ...baseInput,
+      totalFrames: 100,
+      plan: { ...baseInput.plan, workerCount: 2, forceParallelStream: true },
+      abortSignal: controller.signal,
+    };
+
+    let caught: unknown;
+    const run = runCaptureStreamingStage(input).catch((error: unknown) => {
+      caught = error;
+    });
+    // Five stall windows with no frame and no phase change past init.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    controller.abort();
+    await run;
+
+    hangParallelUntilAbort = false;
+    hangParallelPhase = "frame_capture";
+    if (prev === undefined) delete process.env.HF_DE_STALL_MS;
+    else process.env.HF_DE_STALL_MS = prev;
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).not.toContain("stalled");
+  });
+
+  it("releases the writer with the dead worker's own error, not a stall", async () => {
+    // A transient Chrome death in one interleaved worker. Before, peers parked
+    // in the ordered writer until the watchdog relabelled it a stall a minute
+    // later; the original transient error — the one the orchestrator knows how
+    // to retry — was lost.
+    failWorkerTransient = true;
+    reorderAbortCalls.length = 0;
+    const prev = process.env.HF_DE_STALL_MS;
+    process.env.HF_DE_STALL_MS = "600000";
+    const { runCaptureStreamingStage } = await import("./captureStreamingStage.js");
+    const cfg = { forceScreenshot: false, ffmpegStreamingTimeout: 3_600_000 };
+    const baseInput = createInput(cfg);
+    const input = {
+      ...baseInput,
+      totalFrames: 100,
+      plan: { ...baseInput.plan, workerCount: 2, forceParallelStream: true },
+    };
+
+    let caught: unknown;
+    try {
+      await runCaptureStreamingStage(input);
+    } catch (error) {
+      caught = error;
+    } finally {
+      failWorkerTransient = false;
+      if (prev === undefined) delete process.env.HF_DE_STALL_MS;
+      else process.env.HF_DE_STALL_MS = prev;
+    }
+
+    // The exact failure object the engine reported — not the pool's flattened
+    // "[Parallel] Capture failed: …" string, and not a stall.
+    expect(caught).toBe(injectedWorkerFailure);
+    expect((caught as Error).message).not.toContain("stalled");
+    // Parked peers were released with that same error.
+    expect(reorderAbortCalls).toEqual([injectedWorkerFailure]);
   });
 
   it("does not relabel a genuine parent-abort as a stall", async () => {
@@ -345,6 +496,44 @@ describe("runCaptureStreamingStage", () => {
     expect((caught as Error).message).toContain("stalled");
   });
 
+  it("reports the actual screenshot mode and closes a wedged low-memory session", async () => {
+    hangSequentialUntilStall = true;
+    captureSessionMode = "screenshot";
+    closeCaptureSession.mockClear();
+    const prev = process.env.HF_DE_STALL_MS;
+    process.env.HF_DE_STALL_MS = "50";
+    const { runCaptureStreamingStage } = await import("./captureStreamingStage.js");
+    const cfg = {
+      forceScreenshot: true,
+      ffmpegStreamingTimeout: 3_600_000,
+      lowMemoryMode: true,
+    };
+    const baseInput = createInput(cfg);
+    const input = {
+      ...baseInput,
+      totalFrames: 10,
+      plan: { ...baseInput.plan, forceScreenshot: true },
+    };
+
+    let caught: unknown;
+    try {
+      await runCaptureStreamingStage(input);
+    } catch (error) {
+      caught = error;
+    } finally {
+      hangSequentialUntilStall = false;
+      captureSessionMode = "drawelement";
+      if (prev === undefined) delete process.env.HF_DE_STALL_MS;
+      else process.env.HF_DE_STALL_MS = prev;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error & { cause?: Error }).cause?.name).toBe("SequentialCaptureStallError");
+    expect((caught as Error).message).toContain("Sequential screenshot capture stalled");
+    expect((caught as Error).message).not.toContain("drawElement");
+    expect(closeCaptureSession).toHaveBeenCalledTimes(1);
+  });
+
   it("still honors the pre-rename HF_DE_PARALLEL_STALL_MS env var for one release", async () => {
     hangSequentialUntilStall = true;
     const prevNew = process.env.HF_DE_STALL_MS;
@@ -405,6 +594,53 @@ describe("runCaptureStreamingStage", () => {
 });
 
 describe("runCaptureStage", () => {
+  it("closes a reused probe session when reuse preparation fails", async () => {
+    failCaptureFrameToBuffer = false;
+    failInitializeSession = false;
+    failPrepareCaptureSessionForReuse = true;
+    closeCaptureSession.mockClear();
+    const { createCaptureSession } = await import("@hyperframes/engine");
+    const { runCaptureStage } = await import("./captureStage.js");
+    const cfg = { forceScreenshot: false, ffmpegStreamingTimeout: 3_600_000 };
+    const probeSession = await createCaptureSession(
+      "http://127.0.0.1:4173",
+      framesDir,
+      {},
+      null,
+      cfg,
+    );
+
+    let caught: unknown;
+    try {
+      await runCaptureStage({
+        ...createInput(cfg),
+        plan: createCapturePlan({
+          workerCount: 1,
+          forceScreenshot: false,
+          useStreamingEncode: false,
+          useLayeredComposite: false,
+          usePageSideCompositing: false,
+          hasHdrContent: false,
+          needsAlpha: false,
+        }),
+        probeSession,
+        videoOnlyPath: undefined,
+        outputFormat: undefined,
+        streamingEncoderOptions: undefined,
+        captureAttempts: [],
+      });
+    } catch (error) {
+      caught = error;
+    } finally {
+      failPrepareCaptureSessionForReuse = false;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("prepare reuse failed: ENOSPC");
+    expect(closeCaptureSession).toHaveBeenCalledTimes(1);
+    expect(closeCaptureSession).toHaveBeenCalledWith(probeSession);
+  });
+
   it("wraps sequential capture failures with the browser console buffer", async () => {
     failCaptureFrameToBuffer = false;
     failInitializeSession = true;
@@ -480,7 +716,7 @@ describe("runCaptureHdrStage", () => {
         },
         projectDir: "/tmp/hf-test-project",
         compiledDir: "/tmp/hf-test-compiled",
-        framesDir: "/tmp/hf-test-frames",
+        framesDir: framesDir,
         videoOnlyPath: "/tmp/hf-test-video-only.mp4",
         width: 1920,
         height: 1080,

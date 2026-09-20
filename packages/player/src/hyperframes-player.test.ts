@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from "vitest";
 import { formatTime, formatSpeed, SPEED_PRESETS } from "./controls.js";
 
 // Install a stubbed contentDocument getter on the given iframe element. The
@@ -10,6 +10,15 @@ function stubIframeContentDocument(iframe: HTMLIFrameElement, doc: Document): vo
     configurable: true,
     get: () => doc,
   });
+}
+
+// Bare test docs never run a runtime, so only paintAndIdleReadinessInput
+// is ever pending — drain real rAF frames past its quiet-frame minimum
+// on the given window (the iframe's own, not the test's global one).
+async function awaitPaintAndIdle(win: Window = window): Promise<void> {
+  for (let i = 0; i < 6; i++) {
+    await new Promise<void>((resolve) => win.requestAnimationFrame(() => resolve()));
+  }
 }
 
 function createForeignFrameMediaDocument(): {
@@ -152,9 +161,9 @@ describe("HyperframesPlayer parent-frame media", () => {
       load: vi.fn(),
     };
 
-    vi.spyOn(globalThis, "Audio").mockImplementation(
-      () => mockAudio as unknown as HTMLAudioElement,
-    );
+    vi.spyOn(globalThis, "Audio").mockImplementation(function () {
+      return mockAudio as unknown as HTMLAudioElement;
+    });
 
     player = document.createElement("hyperframes-player") as PlayerElement;
   });
@@ -525,6 +534,7 @@ describe("HyperframesPlayer shader transition options", () => {
     const player = document.createElement("hyperframes-player") as PlayerWithIframe;
     player.setAttribute("shader-capture-scale", "0.5");
     player.setAttribute("shader-loading", "player");
+    document.body.appendChild(player);
     player.setAttribute("src", "/api/projects/demo/preview?x=1#stage");
 
     const url = new URL(player.iframeElement.src);
@@ -539,6 +549,7 @@ describe("HyperframesPlayer shader transition options", () => {
     const player = document.createElement("hyperframes-player") as PlayerWithIframe;
     player.setAttribute("shader-capture-scale", "0.5");
     player.setAttribute("shader-loading", "player");
+    document.body.appendChild(player);
     player.setAttribute(
       "srcdoc",
       '<!doctype html><html><head><script src="composition.js"></script></head><body></body></html>',
@@ -826,9 +837,9 @@ describe("HyperframesPlayer parent-proxy time-mirror coalescing", () => {
       pause: vi.fn(),
       load: vi.fn(),
     };
-    vi.spyOn(globalThis, "Audio").mockImplementation(
-      () => mockAudio as unknown as HTMLAudioElement,
-    );
+    vi.spyOn(globalThis, "Audio").mockImplementation(function () {
+      return mockAudio as unknown as HTMLAudioElement;
+    });
 
     const fresh = document.createElement("hyperframes-player") as PlayerInternal;
     fresh.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
@@ -983,6 +994,7 @@ describe("HyperframesPlayer seek() sync path", () => {
     stopMedia: () => void;
     iframe: HTMLIFrameElement;
     _currentTime: number;
+    duration: number;
     _parentMedia: Array<{
       el: { pause: ReturnType<typeof vi.fn>; src: string };
       start: number;
@@ -1102,6 +1114,35 @@ describe("HyperframesPlayer seek() sync path", () => {
     expect(timeline.seek).toHaveBeenCalledTimes(1);
     // suppressEvents=false so onUpdate fires (imperative-visibility compositions repaint).
     expect(timeline.seek).toHaveBeenCalledWith(2, false);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("rebinds when a same-origin composition replaces its registered timeline", () => {
+    const first: TimelineStub = {
+      duration: vi.fn(() => 5),
+      time: vi.fn(() => 0),
+      seek: vi.fn(),
+      play: vi.fn(),
+      pause: vi.fn(),
+    };
+    const second: TimelineStub = {
+      duration: vi.fn(() => 8),
+      time: vi.fn(() => 0),
+      seek: vi.fn(),
+      play: vi.fn(),
+      pause: vi.fn(),
+    };
+    const timelines = { main: first };
+    const post = vi.fn();
+    stubContentWindow({ __timelines: timelines, postMessage: post });
+
+    player.seek(1);
+    timelines.main = second;
+    player.seek(6);
+
+    expect(first.seek).toHaveBeenCalledTimes(1);
+    expect(second.seek).toHaveBeenCalledWith(6, false);
+    expect(player.duration).toBe(8);
     expect(post).not.toHaveBeenCalled();
   });
 
@@ -1462,6 +1503,51 @@ describe("HyperframesPlayer srcdoc attribute", () => {
       | undefined;
     expect(ctor).toBeDefined();
     expect(ctor!.observedAttributes).toContain("srcdoc");
+    expect(ctor!.observedAttributes).toContain("runtime-src");
+  });
+
+  it("uses a configured runtime source for loopback srcdoc", () => {
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("srcdoc", "<!doctype html><html><head></head><body></body></html>");
+    player.setAttribute("runtime-src", "http://127.0.0.1:8900/hyperframe.runtime.iife.js");
+
+    expect(player.iframe.hasAttribute("srcdoc")).toBe(false);
+
+    document.body.appendChild(player);
+
+    expect(player.iframe.getAttribute("srcdoc")).toContain(
+      '<script src="http://127.0.0.1:8900/hyperframe.runtime.iife.js"></script>',
+    );
+
+    player.remove();
+  });
+
+  it("falls back to the pinned runtime for a foreign-origin runtime source", () => {
+    // A srcdoc frame inherits the embedder's origin under the default `allow-same-origin`,
+    // so an attacker-controlled host would be script execution in the embedding page.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("runtime-src", "https://evil.example.com/hyperframe.runtime.iife.js");
+    player.setAttribute("srcdoc", "<!doctype html><html><head></head><body></body></html>");
+    document.body.appendChild(player);
+
+    const srcdoc = player.iframe.getAttribute("srcdoc") ?? "";
+    expect(srcdoc).not.toContain("evil.example.com");
+    expect(srcdoc).toContain("hyperframe.runtime.iife.js");
+
+    player.remove();
+  });
+
+  it("falls back to the pinned runtime for an unsafe runtime source", () => {
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("runtime-src", 'javascript:alert("no")');
+    player.setAttribute("srcdoc", "<!doctype html><html><head></head><body></body></html>");
+    document.body.appendChild(player);
+
+    const srcdoc = player.iframe.getAttribute("srcdoc") ?? "";
+    expect(srcdoc).not.toContain("javascript:");
+    expect(srcdoc).toContain("hyperframe.runtime.iife.js");
+
+    player.remove();
   });
 
   it("forwards an initial srcdoc attribute to the iframe on connect", () => {
@@ -1473,7 +1559,41 @@ describe("HyperframesPlayer srcdoc attribute", () => {
     player.setAttribute("srcdoc", html);
     document.body.appendChild(player);
 
-    expect(player.iframe.getAttribute("srcdoc")).toBe(html);
+    // Not byte-identical: srcdoc now also carries the runtime, injected ahead
+    // of body scripts so a pasted component can read its variables during
+    // parse. The composition itself must still arrive intact.
+    expect(player.iframe.getAttribute("srcdoc")).toContain("<body>hello</body>");
+    expect(player.iframe.getAttribute("srcdoc")).toContain("hyperframe.runtime.iife.js");
+
+    player.remove();
+  });
+
+  it("does not navigate initial srcdoc before the runtime listener is connected", () => {
+    // React assigns custom-element attributes before inserting the element. If the observed
+    // attribute callback navigates the child iframe immediately, a fast srcdoc runtime can post
+    // its one-shot `ready` message before connectedCallback subscribes to `window.message`.
+    // Retained runtime data then waits forever and a caption style appears stuck on its bootstrap
+    // frame. The connect path owns the first navigation; attributeChangedCallback owns only
+    // subsequent swaps.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("srcdoc", "<!doctype html><html><body>deferred</body></html>");
+
+    expect(player.iframe.hasAttribute("srcdoc")).toBe(false);
+
+    document.body.appendChild(player);
+    expect(player.iframe.getAttribute("srcdoc")).toContain("<body>deferred</body>");
+
+    player.remove();
+  });
+
+  it("does not navigate initial src before the runtime listener is connected", () => {
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("src", "/api/projects/deferred/preview");
+
+    expect(player.iframe.hasAttribute("src")).toBe(false);
+
+    document.body.appendChild(player);
+    expect(player.iframe.getAttribute("src")).toBe("/api/projects/deferred/preview");
 
     player.remove();
   });
@@ -1487,7 +1607,8 @@ describe("HyperframesPlayer srcdoc attribute", () => {
     const html = "<!doctype html><html><body>after connect</body></html>";
     player.setAttribute("srcdoc", html);
 
-    expect(player.iframe.getAttribute("srcdoc")).toBe(html);
+    expect(player.iframe.getAttribute("srcdoc")).toContain("<body>after connect</body>");
+    expect(player.iframe.getAttribute("srcdoc")).toContain("hyperframe.runtime.iife.js");
 
     player.remove();
   });
@@ -1548,7 +1669,9 @@ describe("HyperframesPlayer srcdoc attribute", () => {
     document.body.appendChild(player);
 
     expect(player.iframe.getAttribute("src")).toBe("/api/projects/foo/preview");
-    expect(player.iframe.getAttribute("srcdoc")).toBe("<!doctype html><html></html>");
+    // srcdoc carries the runtime now; what matters here is that both
+    // attributes are present so the browser can arbitrate.
+    expect(player.iframe.getAttribute("srcdoc")).toContain("<html>");
 
     player.remove();
   });
@@ -1588,9 +1711,9 @@ describe("HyperframesPlayer volume and mute", () => {
       play: vi.fn().mockResolvedValue(undefined),
       pause: vi.fn(),
     };
-    vi.spyOn(globalThis, "Audio").mockImplementation(
-      () => mockAudio as unknown as HTMLAudioElement,
-    );
+    vi.spyOn(globalThis, "Audio").mockImplementation(function () {
+      return mockAudio as unknown as HTMLAudioElement;
+    });
 
     player = document.createElement("hyperframes-player") as typeof player;
   });
@@ -1892,11 +2015,13 @@ describe("HyperframesPlayer runtime ready handshake", () => {
     paused: boolean;
     iframe: HTMLIFrameElement;
     _onMessage: (event: MessageEvent) => void;
+    _onIframeLoad: () => void;
+    _runtimeBridgeReady: boolean;
   }
 
   let player: PlayerInternal;
   let frameWindow: Window;
-  let postSpy: ReturnType<typeof vi.spyOn>;
+  let postSpy: MockInstance<typeof window.postMessage>;
 
   function readyMessage() {
     return new MessageEvent("message", {
@@ -2033,6 +2158,26 @@ describe("HyperframesPlayer runtime ready handshake", () => {
     expect(findControlCalls("set-muted")).toHaveLength(2);
   });
 
+  it("does not erase a DOMContentLoaded runtime handshake when iframe load follows it", () => {
+    player._onMessage(readyMessage());
+    expect(player._runtimeBridgeReady).toBe(true);
+
+    player._onIframeLoad();
+
+    expect(player._runtimeBridgeReady).toBe(true);
+  });
+
+  it("drops the runtime handshake when a shader-option change navigates the frame", () => {
+    // The navigating sandbox path already clears readiness. This path navigates too, so a
+    // delivery issued afterwards must not be posted into the document being replaced.
+    player._onMessage(readyMessage());
+    expect(player._runtimeBridgeReady).toBe(true);
+
+    player.setAttribute("shader-capture-scale", "0.5");
+
+    expect(player._runtimeBridgeReady).toBe(false);
+  });
+
   it("ignores ready events from a different window", () => {
     postSpy.mockClear();
     const otherSource = {} as Window;
@@ -2060,11 +2205,22 @@ describe("HyperframesPlayer runtime ready handshake", () => {
     expect(readyEvents).toEqual([{ duration: 4 }]);
   });
 
-  it("honors autoplay after cross-origin runtime timeline readiness", () => {
+  it("honors autoplay after cross-origin runtime timeline readiness", async () => {
+    // A bare iframe fires its own async `load` a few ms after append, which
+    // resets pending-play state (see createConnectedPlayer's comment below) —
+    // await it first so it can't land mid-test during the readiness wait.
+    await new Promise<void>((resolve) => {
+      player.iframe.addEventListener("load", () => resolve(), { once: true });
+    });
     player.setAttribute("autoplay", "");
     postSpy.mockClear();
 
     player._onMessage(timelineMessage(120));
+    // The same-origin doc under test has no pending media, but play() is now
+    // gated on paint-and-idle too — it queues until that settles. The gate
+    // polls the real (unstubbed) iframe document's own window, not the
+    // stubbed contentWindow used for postMessage.
+    await awaitPaintAndIdle(player.iframe.contentDocument!.defaultView!);
 
     expect(player.paused).toBe(false);
     expect(findControlCalls("play")).toHaveLength(1);
@@ -2236,9 +2392,9 @@ describe("HyperframesPlayer playback rate", () => {
       play: vi.fn().mockResolvedValue(undefined),
       pause: vi.fn(),
     };
-    vi.spyOn(globalThis, "Audio").mockImplementation(
-      () => mockAudio as unknown as HTMLAudioElement,
-    );
+    vi.spyOn(globalThis, "Audio").mockImplementation(function () {
+      return mockAudio as unknown as HTMLAudioElement;
+    });
 
     player = document.createElement("hyperframes-player") as typeof player;
   });
@@ -2378,5 +2534,710 @@ describe("HyperframesPlayer composition dimension attributes", () => {
     player.setAttribute("width", "1280");
     player.removeAttribute("width");
     expect(player._compositionWidth).toBe(1920);
+  });
+});
+
+describe("HyperframesPlayer retained runtime data", () => {
+  interface RuntimeDataPlayer extends HTMLElement {
+    iframeElement: HTMLIFrameElement;
+    setRuntimeData: (channel: string, payload: unknown) => void;
+    clearRuntimeData: (channel: string) => void;
+    _onMessage: (event: MessageEvent) => void;
+  }
+
+  let player: RuntimeDataPlayer;
+  let postSpy: MockInstance<typeof window.postMessage>;
+
+  const readyMessage = () =>
+    new MessageEvent("message", {
+      source: window,
+      data: { source: "hf-preview", type: "ready" },
+    });
+
+  const runtimeCalls = () =>
+    postSpy.mock.calls.filter((call) => {
+      const message = call[0] as { action?: string };
+      return message.action === "set-runtime-data" || message.action === "clear-runtime-data";
+    });
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as RuntimeDataPlayer;
+    postSpy = vi.spyOn(window, "postMessage").mockImplementation(() => undefined);
+    Object.defineProperty(player.iframeElement, "contentWindow", {
+      configurable: true,
+      get: () => window,
+    });
+    delete (window as Window & { __hyperframes?: unknown }).__hyperframes;
+    document.body.appendChild(player);
+  });
+
+  afterEach(() => {
+    player.remove();
+    delete (window as Window & { __hyperframes?: unknown }).__hyperframes;
+    vi.restoreAllMocks();
+  });
+
+  it("retains data set before load and replays it exactly once after runtime ready", () => {
+    player.setRuntimeData("captions", { words: ["before"] });
+    expect(runtimeCalls()).toHaveLength(0);
+
+    player._onMessage(readyMessage());
+
+    expect(runtimeCalls()).toHaveLength(1);
+    expect(runtimeCalls()[0]?.[0]).toMatchObject({
+      action: "set-runtime-data",
+      channel: "captions",
+      payload: { words: ["before"] },
+    });
+  });
+
+  it("delivers after readiness and replays only the latest value after a source swap", () => {
+    player._onMessage(readyMessage());
+    player.setRuntimeData("captions", { words: ["first"] });
+    postSpy.mockClear();
+
+    player.setAttribute("srcdoc", "<!doctype html><html><body></body></html>");
+    player.setRuntimeData("captions", { words: ["latest"] });
+    expect(runtimeCalls()).toHaveLength(0);
+    player._onMessage(readyMessage());
+
+    expect(runtimeCalls()).toHaveLength(1);
+    expect(runtimeCalls()[0]?.[0]).toMatchObject({ payload: { words: ["latest"] } });
+  });
+
+  it("clears the current channel and does not replay it", () => {
+    player._onMessage(readyMessage());
+    player.setRuntimeData("captions", { words: [] });
+    player.clearRuntimeData("captions");
+    expect(runtimeCalls().at(-1)?.[0]).toMatchObject({
+      action: "clear-runtime-data",
+      channel: "captions",
+    });
+    postSpy.mockClear();
+    player.setAttribute("srcdoc", "<!doctype html><html></html>");
+    player._onMessage(readyMessage());
+    expect(runtimeCalls()).toHaveLength(0);
+  });
+
+  it("uses the same-origin registry directly and falls back to postMessage otherwise", () => {
+    const direct = vi.fn();
+    (window as Window & { __hyperframes?: unknown }).__hyperframes = {
+      setRuntimeData: direct,
+    };
+    player._onMessage(readyMessage());
+    postSpy.mockClear();
+
+    player.setRuntimeData("captions", { words: ["direct"] });
+
+    expect(direct).toHaveBeenCalledWith("captions", { words: ["direct"] }, expect.any(Number));
+    expect(runtimeCalls()).toHaveLength(0);
+  });
+
+  it("does not deliver while disconnected and preserves the standard sandbox", () => {
+    player._onMessage(readyMessage());
+    postSpy.mockClear();
+    player.remove();
+    player.setRuntimeData("captions", { words: ["offline"] });
+    expect(runtimeCalls()).toHaveLength(0);
+    expect(player.iframeElement.sandbox.contains("allow-scripts")).toBe(true);
+    expect(player.iframeElement.sandbox.contains("allow-same-origin")).toBe(true);
+    expect(player.iframeElement.sandbox.contains("allow-top-navigation")).toBe(false);
+    expect(player.iframeElement.referrerPolicy).toBe("no-referrer");
+  });
+
+  it("supports an opaque-origin sandbox for hosts that do not need direct iframe DOM access", () => {
+    player.setAttribute("sandbox-origin", "opaque");
+    expect(player.iframeElement.sandbox.contains("allow-scripts")).toBe(true);
+    expect(player.iframeElement.sandbox.contains("allow-same-origin")).toBe(false);
+    expect(player.iframeElement.sandbox.contains("allow-top-navigation")).toBe(false);
+
+    player.removeAttribute("sandbox-origin");
+    expect(player.iframeElement.sandbox.contains("allow-same-origin")).toBe(true);
+  });
+
+  it("treats every non-null sandbox-origin value as restrictive", () => {
+    player.setAttribute("sandbox-origin", "opaqu");
+    expect(player.iframeElement.sandbox.contains("allow-same-origin")).toBe(false);
+  });
+
+  it("rejects payloads that structuredClone cannot transfer", () => {
+    expect(() => player.setRuntimeData("captions", () => undefined)).toThrow();
+  });
+
+  it("fails closed when structuredClone is unavailable", () => {
+    const original = globalThis.structuredClone;
+    Object.defineProperty(globalThis, "structuredClone", {
+      configurable: true,
+      value: undefined,
+    });
+    try {
+      expect(() => player.setRuntimeData("captions", { words: ["unsafe"] })).toThrow(
+        /requires structuredClone support/,
+      );
+      player._onMessage(readyMessage());
+      expect(runtimeCalls()).toHaveLength(0);
+    } finally {
+      Object.defineProperty(globalThis, "structuredClone", {
+        configurable: true,
+        value: original,
+      });
+    }
+  });
+
+  it("reports postMessage delivery failures instead of silently dropping runtime data", () => {
+    player._onMessage(readyMessage());
+    postSpy.mockImplementation(() => {
+      throw new DOMException("payload cannot be cloned", "DataCloneError");
+    });
+    const errors: CustomEvent[] = [];
+    player.addEventListener("runtimedataerror", (event) => errors.push(event as CustomEvent));
+
+    player.setRuntimeData("captions", { words: ["value"] });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.detail).toMatchObject({
+      channel: "captions",
+      requestId: expect.any(Number),
+      message: "payload cannot be cloned",
+    });
+  });
+
+  it("reports a null iframe window as a delivery failure", () => {
+    player._onMessage(readyMessage());
+    Object.defineProperty(player.iframeElement, "contentWindow", {
+      configurable: true,
+      get: () => null,
+    });
+    const errors: CustomEvent[] = [];
+    player.addEventListener("runtimedataerror", (event) => errors.push(event as CustomEvent));
+
+    player.setRuntimeData("captions", { words: ["value"] });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.detail).toMatchObject({
+      channel: "captions",
+      requestId: expect.any(Number),
+      message: "Composition iframe is unavailable",
+    });
+  });
+
+  it("reports a bounded error when the runtime never responds", () => {
+    vi.useFakeTimers();
+    try {
+      player._onMessage(readyMessage());
+      const errors: CustomEvent[] = [];
+      player.addEventListener("runtimedataerror", (event) => errors.push(event as CustomEvent));
+
+      player.setRuntimeData("captions", { words: ["value"] });
+      vi.advanceTimersByTime(10_000);
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.detail).toMatchObject({
+        channel: "captions",
+        requestId: expect.any(Number),
+        message: "Runtime data delivery timed out after 10000ms",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a superseded completion and correlates the latest application", () => {
+    player._onMessage(readyMessage());
+    postSpy.mockClear();
+    const applied: CustomEvent[] = [];
+    player.addEventListener("runtimedataapplied", (event) => applied.push(event as CustomEvent));
+
+    player.setRuntimeData("captions", { words: ["first"] });
+    player.setRuntimeData("captions", { words: ["latest"] });
+    const requests = runtimeCalls().map((call) => (call[0] as { requestId: number }).requestId);
+
+    player._onMessage(
+      new MessageEvent("message", {
+        source: window,
+        data: {
+          source: "hf-preview",
+          type: "runtime-data-applied",
+          channel: "captions",
+          requestId: requests[0],
+        },
+      }),
+    );
+    expect(applied).toHaveLength(0);
+
+    player._onMessage(
+      new MessageEvent("message", {
+        source: window,
+        data: {
+          source: "hf-preview",
+          type: "runtime-data-applied",
+          channel: "captions",
+          requestId: requests[1],
+        },
+      }),
+    );
+    expect(applied).toHaveLength(1);
+    expect(applied[0]?.detail).toEqual({ channel: "captions", requestId: requests[1] });
+  });
+});
+
+describe("HyperframesPlayer asset-ready gate", () => {
+  type PlayerInternal = HTMLElement & {
+    iframe: HTMLIFrameElement;
+    _ready: boolean;
+    _pendingPlay: boolean;
+    _paused: boolean;
+    assetsReady: boolean;
+    painted: boolean;
+    _waitForAssetsReady(doc: Document | null): void;
+    _onIframeLoad(): void;
+    play(): void;
+    pause(): void;
+    seek(timeInSeconds: number): void;
+    shaderLoader: { showAssetsLoading(): void };
+  };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+  });
+
+  // A bare iframe fires its own async `load` a few ms after append, which
+  // resets _assetsReady — await it first so it can't land mid-test.
+  async function createConnectedPlayer(): Promise<PlayerInternal> {
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+    await new Promise<void>((resolve) => {
+      player.iframe.addEventListener("load", () => resolve(), { once: true });
+    });
+    player._ready = true;
+    return player;
+  }
+
+  // A composition doc with one video stuck at readyState 0 — the shared
+  // "something is still loading" fixture for the defer/timeout tests below.
+  function createStalledVideoDoc(): { doc: Document; video: HTMLVideoElement } {
+    const doc = document.implementation.createHTMLDocument("composition");
+    const video = doc.createElement("video");
+    Object.defineProperty(video, "readyState", { value: 0, configurable: true });
+    doc.body.appendChild(video);
+    return { doc, video };
+  }
+
+  const post = (player: PlayerInternal, data: Record<string, unknown>) =>
+    (player as unknown as { _onMessage(e: MessageEvent): void })._onMessage({
+      source: player.iframe.contentWindow,
+      data: { source: "hf-preview", ...data },
+    } as unknown as MessageEvent);
+
+  it("holds an opaque-origin composition until its runtime posts assets-ready", async () => {
+    const player = await createConnectedPlayer();
+    player._ready = false;
+    Object.defineProperty(player.iframe, "contentDocument", { get: () => null });
+    post(player, { type: "timeline", durationInFrames: 60, assetsReady: false });
+    expect(player.assetsReady).toBe(false);
+
+    post(player, { type: "assets-ready", timedOut: false });
+    expect(player.assetsReady).toBe(true);
+
+    player.remove();
+  });
+
+  it("keeps a queued play across the iframe load event while the runtime still reports assets pending", async () => {
+    const player = await createConnectedPlayer();
+    player._ready = false;
+    Object.defineProperty(player.iframe, "contentDocument", { get: () => null });
+    post(player, { type: "timeline", durationInFrames: 60, assetsReady: false });
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    player._onIframeLoad();
+    post(player, { type: "assets-ready", timedOut: false });
+
+    expect(player.assetsReady).toBe(true);
+    expect(player._ready).toBe(true);
+    expect(player._pendingPlay).toBe(false);
+    expect(player._paused).toBe(false);
+
+    player.remove();
+  });
+
+  it("stays ready when a late iframe load follows a settled opaque-origin wait", async () => {
+    const player = await createConnectedPlayer();
+    player._ready = false;
+    Object.defineProperty(player.iframe, "contentDocument", { get: () => null });
+    post(player, { type: "timeline", durationInFrames: 60, assetsReady: false });
+    post(player, { type: "assets-ready", timedOut: false });
+    expect(player._ready).toBe(true);
+
+    player._onIframeLoad();
+
+    expect(player._ready).toBe(true);
+    expect(player.assetsReady).toBe(true);
+    player.play();
+    expect(player._paused).toBe(false);
+
+    player.remove();
+  });
+
+  it("does not wait on an opaque-origin runtime that already settled its assets", async () => {
+    const player = await createConnectedPlayer();
+    player._ready = false;
+    Object.defineProperty(player.iframe, "contentDocument", { get: () => null });
+    post(player, { type: "timeline", durationInFrames: 60, assetsReady: true });
+
+    expect(player.assetsReady).toBe(true);
+
+    player.remove();
+  });
+
+  it("does not wait on an opaque-origin runtime that never announced the capability", async () => {
+    const player = await createConnectedPlayer();
+    player._ready = false;
+    Object.defineProperty(player.iframe, "contentDocument", { get: () => null });
+    post(player, { type: "timeline", durationInFrames: 60 });
+
+    expect(player.assetsReady).toBe(true);
+
+    player.remove();
+  });
+
+  it("settles immediately for a cross-origin composition (doc === null)", async () => {
+    const player = await createConnectedPlayer();
+
+    player._waitForAssetsReady(null);
+
+    expect(player.assetsReady).toBe(true);
+    expect(player.hasAttribute("assets-loading")).toBe(false);
+
+    player.remove();
+  });
+
+  it("debounces the loading overlay so a fast, nothing-pending wait never shows it", async () => {
+    const player = await createConnectedPlayer();
+    const doc = player.iframe.contentDocument!;
+    const showSpy = vi.spyOn(player.shaderLoader, "showAssetsLoading");
+
+    player._waitForAssetsReady(doc);
+    expect(player.assetsReady).toBe(false);
+
+    // Only paint-and-idle is pending on this blank iframe doc (no runtime,
+    // no media) — it settles well under ASSETS_LOADING_SHOW_DELAY_MS.
+    await awaitPaintAndIdle(doc.defaultView!);
+
+    expect(player.assetsReady).toBe(true);
+    expect(player.hasAttribute("assets-loading")).toBe(false);
+    expect(showSpy).not.toHaveBeenCalled();
+
+    player.remove();
+  });
+
+  it("fires painted only after the raised loader has faded out, not at assetsready", async () => {
+    const player = await createConnectedPlayer();
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+    const events: string[] = [];
+    player.addEventListener("assetsready", () => events.push("assetsready"));
+    player.addEventListener("painted", () => events.push("painted"));
+
+    player._waitForAssetsReady(doc);
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(player.hasAttribute("assets-loading")).toBe(true);
+    expect(player.painted).toBe(false);
+
+    video.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toEqual(["assetsready"]);
+    expect(player.painted).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(events).toEqual(["assetsready", "painted"]);
+    expect(player.painted).toBe(true);
+
+    player._waitForAssetsReady(doc);
+    expect(player.painted).toBe(false);
+
+    player.remove();
+  });
+
+  it("fires painted right after assetsready when no loader was ever raised", async () => {
+    const player = await createConnectedPlayer();
+    const painted = vi.fn();
+    player.addEventListener("painted", painted);
+
+    player._waitForAssetsReady(null);
+
+    expect(player.assetsReady).toBe(true);
+    expect(player.painted).toBe(true);
+    expect(painted).toHaveBeenCalledTimes(1);
+
+    player.remove();
+  });
+
+  it("defers play() until a pending video settles, then plays and clears the overlay attribute", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player._waitForAssetsReady(doc);
+    expect(player.assetsReady).toBe(false);
+    // The loading overlay is debounced (ASSETS_LOADING_SHOW_DELAY_MS) so a
+    // wait that resolves fast never flashes it — advance past the debounce
+    // to exercise the shown state, since this video is still genuinely stuck.
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(player.hasAttribute("assets-loading")).toBe(true);
+
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    video.dispatchEvent(new Event("canplay"));
+    // A macrotask flush drains the whole promise chain regardless of its
+    // depth (resolved media promise -> Promise.all -> Promise.race -> settle).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player.hasAttribute("assets-loading")).toBe(false);
+    expect(player._pendingPlay).toBe(false);
+    expect(playSpy).toHaveBeenCalledTimes(1);
+
+    player.remove();
+  });
+
+  it("cancels a queued play if the user pauses while assets are still buffering", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player._waitForAssetsReady(doc);
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    player.pause();
+    expect(player._pendingPlay).toBe(false);
+    expect(player._paused).toBe(true);
+
+    video.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player._pendingPlay).toBe(false);
+    expect(player._paused).toBe(true);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    player.remove();
+  });
+
+  it("cancels a queued play if the user seeks while assets are still buffering", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player._waitForAssetsReady(doc);
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    player.seek(1.5);
+    expect(player._pendingPlay).toBe(false);
+
+    video.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player._pendingPlay).toBe(false);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    player.remove();
+  });
+
+  it("settles a play() called twice while buffering into exactly one playback start (pre-existing idempotency, not the pause/seek cancel)", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player._waitForAssetsReady(doc);
+    player.play();
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    video.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player._pendingPlay).toBe(false);
+    // Two queued play() calls settle into exactly one playback start, never two.
+    expect(playSpy).toHaveBeenCalledTimes(1);
+
+    player.remove();
+  });
+
+  it("plays anyway once the 8s timeout elapses for an asset that never settles", async () => {
+    // Real timers for the initial (blank) iframe load, then switch to fake
+    // timers so the 8s asset-ready timeout can be advanced instantly.
+    const player = await createConnectedPlayer();
+    vi.useFakeTimers();
+    try {
+      const { doc } = createStalledVideoDoc();
+      // A document with no browsing context (created via createHTMLDocument,
+      // as this fixture is) reports hidden=true per spec regardless of the
+      // real page — stub it visible so this test isn't about visibility.
+      Object.defineProperty(doc, "hidden", { value: false, configurable: true });
+      stubIframeContentDocument(player.iframe, doc);
+
+      player._waitForAssetsReady(doc);
+      player.play();
+      expect(player._pendingPlay).toBe(true);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await vi.advanceTimersByTimeAsync(8_000);
+
+      expect(player.assetsReady).toBe(true);
+      expect(player._pendingPlay).toBe(false);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls[0]?.[0]).toContain("assets-loading timed out");
+      // computeReady is reported alongside the media/image/font scan, since
+      // compute (window.__renderReady) can also be why the timeout fired.
+      expect(warnSpy.mock.calls[0]?.[1]).toMatchObject({
+        computeReady: false,
+        documentHidden: false,
+      });
+      warnSpy.mockRestore();
+
+      player.remove();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports documentHidden: true when the composition document is backgrounded", async () => {
+    const player = await createConnectedPlayer();
+    vi.useFakeTimers();
+    try {
+      const { doc } = createStalledVideoDoc();
+      Object.defineProperty(doc, "hidden", { value: true, configurable: true });
+      stubIframeContentDocument(player.iframe, doc);
+
+      player._waitForAssetsReady(doc);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await vi.advanceTimersByTimeAsync(8_000);
+
+      expect(warnSpy.mock.calls[0]?.[1]).toMatchObject({ documentHidden: true });
+      warnSpy.mockRestore();
+
+      player.remove();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a superseded wait's settle after a composition swap mid-wait", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc: docA, video: videoA } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, docA);
+    player._waitForAssetsReady(docA);
+
+    // Simulates a src/srcdoc swap arriving while A's wait is still in flight,
+    // then B's own ready handler firing (which is what real navigation does:
+    // _onIframeLoad clears _ready, the new composition's ready handler sets
+    // it again before calling _waitForAssetsReady).
+    player._onIframeLoad();
+    player._ready = true;
+    const { doc: docB, video: videoB } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, docB);
+    player._waitForAssetsReady(docB);
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    videoA.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A's stale settle must not mark B ready or play it — B's own video is
+    // still stuck.
+    expect(player.assetsReady).toBe(false);
+    expect(player._pendingPlay).toBe(true);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    videoB.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(player.assetsReady).toBe(true);
+    expect(player._pendingPlay).toBe(false);
+    expect(playSpy).toHaveBeenCalledTimes(1);
+
+    player.remove();
+  });
+
+  it("does not resume play() after disconnect once a pending wait settles late", async () => {
+    const player = await createConnectedPlayer();
+
+    const { doc, video } = createStalledVideoDoc();
+    stubIframeContentDocument(player.iframe, doc);
+    player._waitForAssetsReady(doc);
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player.remove();
+    video.dispatchEvent(new Event("canplay"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(playSpy).not.toHaveBeenCalled();
+  });
+
+  it("dispatches 'play' exactly once for a call made before the probe resolves", async () => {
+    const player = await createConnectedPlayer();
+    player._ready = false;
+
+    const playSpy = vi.fn();
+    player.addEventListener("play", playSpy);
+
+    player.play();
+    expect(player._pendingPlay).toBe(true);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    (
+      player as unknown as {
+        _onProbeReady: (r: {
+          duration: number;
+          adapter: { kind: string; getDuration: () => number };
+          compositionSize: null;
+        }) => void;
+      }
+    )._onProbeReady({
+      duration: 5,
+      adapter: { kind: "runtime", getDuration: () => 5 },
+      compositionSize: null,
+    });
+    // The blank iframe doc has no pending media, but play() also queues on
+    // the paint-and-idle default now — it fires once that settles.
+    await awaitPaintAndIdle(player.iframe.contentDocument!.defaultView!);
+
+    expect(playSpy).toHaveBeenCalledTimes(1);
+
+    player.remove();
   });
 });

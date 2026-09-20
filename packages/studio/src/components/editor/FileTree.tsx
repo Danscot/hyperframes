@@ -49,7 +49,12 @@ export const FileTree = memo(function FileTree({
 
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [inlineInput, setInlineInput] = useState<InlineInputState | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{
+    path: string;
+    isFolder: boolean;
+    x: number;
+    y: number;
+  } | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const dragSourceRef = useRef<string | null>(null);
 
@@ -145,13 +150,23 @@ export const FileTree = memo(function FileTree({
 
   // ── Delete ──
 
-  const handleDelete = useCallback((path: string) => {
-    setDeleteTarget(path);
-  }, []);
+  const handleDelete = useCallback(
+    (path: string) => {
+      // Anchor the confirm near where the context menu was opened so it
+      // appears next to the row the user acted on.
+      setDeleteTarget({
+        path,
+        isFolder: contextMenu?.targetIsFolder ?? false,
+        x: contextMenu?.x ?? window.innerWidth / 2,
+        y: contextMenu?.y ?? window.innerHeight / 2,
+      });
+    },
+    [contextMenu],
+  );
 
   const handleDeleteConfirm = useCallback(() => {
     if (deleteTarget) {
-      onDeleteFile?.(deleteTarget);
+      onDeleteFile?.(deleteTarget.path);
       setDeleteTarget(null);
     }
   }, [deleteTarget, onDeleteFile]);
@@ -220,22 +235,24 @@ export const FileTree = memo(function FileTree({
     <div className="flex flex-col h-full min-h-0">
       {/* FILES header with action buttons */}
       {hasFileOps && (
-        <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-neutral-800/50 flex-shrink-0">
+        <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-neutral-800/50 shrink-0">
           <span className="text-[10px] font-semibold tracking-wider text-neutral-600 uppercase">
             Files
           </span>
           <div className="flex items-center gap-0.5">
             <button
               onClick={() => handleNewFile("")}
-              className="p-0.5 rounded hover:bg-neutral-800 text-neutral-600 hover:text-neutral-400 transition-colors"
+              className="p-1.5 rounded-sm hover:bg-neutral-800 text-neutral-600 hover:text-neutral-400 active:scale-[0.97] transition-colors"
               title="New File"
+              aria-label="New File"
             >
               <Plus size={12} weight="bold" />
             </button>
             <button
               onClick={() => handleNewFolder("")}
-              className="p-0.5 rounded hover:bg-neutral-800 text-neutral-600 hover:text-neutral-400 transition-colors"
+              className="p-1.5 rounded-sm hover:bg-neutral-800 text-neutral-600 hover:text-neutral-400 active:scale-[0.97] transition-colors"
               title="New Folder"
+              aria-label="New Folder"
             >
               <FolderSimplePlus size={12} weight="duotone" />
             </button>
@@ -246,7 +263,7 @@ export const FileTree = memo(function FileTree({
       <div
         className={`flex-1 overflow-y-auto py-1 transition-colors ${
           dragOverFolder === ""
-            ? "bg-[#3CE6AC]/5 outline outline-1 outline-[#3CE6AC]/30 -outline-offset-1"
+            ? "bg-[#3CE6AC]/5 outline-solid outline-1 outline-[#3CE6AC]/30 -outline-offset-1"
             : ""
         }`}
         onContextMenu={handleRootContextMenu}
@@ -274,6 +291,11 @@ export const FileTree = memo(function FileTree({
               onCancel={() => inlineInput.onCancel?.()}
             />
           )}
+        {children.length === 0 && !inlineInput && (
+          <div className="px-3 py-4 text-center text-[11px] text-neutral-600">
+            No files yet{hasFileOps ? " — use + above to create one" : ""}.
+          </div>
+        )}
         {children.map((child) =>
           child.isFile && child.children.size === 0 ? (
             <TreeFile
@@ -308,15 +330,22 @@ export const FileTree = memo(function FileTree({
         )}
       </div>
 
-      {/* Delete confirmation overlay */}
+      {/* Delete confirmation — anchored near the row it was invoked on */}
       {deleteTarget && (
-        <div className="border-t border-neutral-800/50 flex-shrink-0">
+        <div
+          className="fixed z-50 w-56"
+          style={{
+            left: Math.min(deleteTarget.x, window.innerWidth - 240),
+            top: Math.min(deleteTarget.y, window.innerHeight - 120),
+          }}
+        >
           <DeleteConfirm
             name={
-              deleteTarget.includes("/")
-                ? deleteTarget.slice(deleteTarget.lastIndexOf("/") + 1)
-                : deleteTarget
+              deleteTarget.path.includes("/")
+                ? deleteTarget.path.slice(deleteTarget.path.lastIndexOf("/") + 1)
+                : deleteTarget.path
             }
+            isFolder={deleteTarget.isFolder}
             onConfirm={handleDeleteConfirm}
             onCancel={handleDeleteCancel}
           />

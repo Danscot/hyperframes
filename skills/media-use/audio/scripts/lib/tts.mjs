@@ -1,3 +1,4 @@
+import { fetchMedia } from "../../../scripts/lib/media-fetch.mjs";
 // tts.mjs — multi-provider TTS for the media audio engine. The provider chain,
 // auto-detected from env, is the one documented in ../SKILL.md:
 //
@@ -109,7 +110,7 @@ function ffmpegDurationFallback(absPath) {
 export function ffprobeDuration(absPath) {
   const r = spawnSync(
     "ffprobe",
-    ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", absPath],
+    ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", "--", absPath],
     { encoding: "utf8" },
   );
   if (r.error?.code === "ENOENT") return ffmpegDurationFallback(absPath);
@@ -312,7 +313,7 @@ export async function synthesizeHeygen({ text, voiceId, lang, speed, wavAbs }, d
     if (!inner.audio_url) {
       return { ok: false, words: null, error: "HeyGen /voices/speech returned no audio_url" };
     }
-    const res = await fetchImpl(inner.audio_url);
+    const res = await fetchMedia(inner.audio_url, { fetchImpl });
     if (!res.ok) {
       return { ok: false, words: null, error: `audio_url fetch failed: HTTP ${res.status}` };
     }

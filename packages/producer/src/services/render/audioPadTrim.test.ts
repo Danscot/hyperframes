@@ -14,6 +14,9 @@
  */
 
 import { describe, expect, it, mock } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildPadTrimAudioArgs,
   buildPadTrimAudioPlan,
@@ -24,72 +27,42 @@ import {
 } from "./audioPadTrim.js";
 
 describe("buildPadTrimAudioArgs", () => {
-  it("emits a concat-copy pad plan when audio is shorter than target", () => {
-    const plan = buildPadTrimAudioPlan("/tmp/in.aac", "/tmp/out.aac", 4.0, 5.0, {
-      sampleRate: 48000,
-      channels: 2,
-    });
+  it("emits a decode/filter/re-encode pad plan when audio is shorter than target", () => {
+    const plan = buildPadTrimAudioPlan("/tmp/in.aac", "/tmp/out.aac", 4.0, 5.0);
     expect(plan.operation).toBe("pad");
-    expect(plan.steps).toHaveLength(2);
-
-    const silenceArgs = plan.steps[0]!.args;
-    expect(plan.steps[0]!.kind).toBe("pad-silence");
-    expect(silenceArgs).not.toContain("/tmp/in.aac");
-    expect(silenceArgs[silenceArgs.indexOf("-i") + 1]).toBe(
-      "anullsrc=channel_layout=stereo:sample_rate=48000",
-    );
-    expect(silenceArgs[silenceArgs.indexOf("-t") + 1]).toBe("1.000000");
-    expect(silenceArgs[silenceArgs.indexOf("-c:a") + 1]).toBe("aac");
-
-    const concatArgs = plan.steps[1]!.args;
-    expect(plan.steps[1]!.kind).toBe("pad-concat");
-    expect(concatArgs).toContain("concat");
-    // The concat script is passed via a real file (NOT `pipe:0`). Feeding
-    // it through stdin makes FFmpeg's URL joiner prepend `pipe:` to bare
-    // absolute paths in the script — the demuxer then tries to open e.g.
-    // `pipe:/tmp/foo.aac` and fails with "Impossible to open pipe:/…".
-    // Materializing to a file matches `assemble.ts`'s concat convention.
-    expect(plan.steps[1]!.concatListPath).toBe("/tmp/out.aac.concat-list.txt");
-    expect(concatArgs[concatArgs.indexOf("-i") + 1]).toBe("/tmp/out.aac.concat-list.txt");
-    expect(concatArgs[concatArgs.indexOf("-c:a") + 1]).toBe("copy");
-    expect(concatArgs[concatArgs.length - 1]).toBe("/tmp/out.aac");
-    // Concat script MUST use bare paths, NOT `file://` URLs. FFmpeg 8.x
-    // on Windows can't open `file:///C:/…` URLs from the concat demuxer
-    // (field-signal ts=1784169914 / 1784177061 / 1784177375). Regression
-    // pin: the `file://` scheme prefix must never appear in the concat
-    // list content.
-    expect(plan.steps[1]!.concatListContent).toContain("file '/tmp/in.aac'");
-    expect(plan.steps[1]!.concatListContent).toContain("file '/tmp/out.aac.pad-silence.aac'");
-    expect(plan.steps[1]!.concatListContent).not.toContain("file://");
-    // Cleanup includes BOTH the silence tail and the concat list script.
-    expect(plan.cleanupPaths).toEqual([
-      "/tmp/out.aac.pad-silence.aac",
-      "/tmp/out.aac.concat-list.txt",
-    ]);
-
-    const reencodedSourceStep = plan.steps.find(
-      (step) =>
-        step.args.includes("/tmp/in.aac") && step.args[step.args.indexOf("-c:a") + 1] === "aac",
-    );
-    expect(reencodedSourceStep).toBeUndefined();
+    expect(plan.steps).toHaveLength(1);
+    const args = plan.steps[0]!.args;
+    expect(args[args.indexOf("-i") + 1]).toBe("/tmp/in.aac");
+    expect(args[args.indexOf("-af") + 1]).toBe("apad,atrim=0:5.000000");
+    expect(args.join(" ")).not.toContain("whole_dur");
+    expect(args[args.indexOf("-t") + 1]).toBe("5.000000");
+    expect(args[args.indexOf("-c:a") + 1]).toBe("aac");
+    // The single-step filter plan has no intermediate artifacts to clean up.
+    expect(plan.cleanupPaths).toEqual([]);
   });
 
   it("keeps the legacy args helper on the first pad materialization step", () => {
     const { args, operation } = buildPadTrimAudioArgs("/tmp/in.aac", "/tmp/out.aac", 4.0, 5.0);
     expect(operation).toBe("pad");
-    expect(args).not.toContain("/tmp/in.aac");
-    expect(args[args.indexOf("-t") + 1]).toBe("1.000000");
+    expect(args).toContain("/tmp/in.aac");
+    expect(args[args.indexOf("-t") + 1]).toBe("5.000000");
   });
 
-  it("emits -t when audio is longer than target", () => {
-    const { args, operation } = buildPadTrimAudioArgs("/tmp/in.aac", "/tmp/out.aac", 6.123, 5.0);
+  it("filter-trims and re-encodes AAC packet padding beyond the target", () => {
+    const { args, operation } = buildPadTrimAudioArgs(
+      "/tmp/in.aac",
+      "/tmp/out.m4a",
+      15.018667,
+      15.0,
+    );
     expect(operation).toBe("trim");
-    const tIdx = args.indexOf("-t");
-    expect(tIdx).toBeGreaterThan(-1);
-    expect(args[tIdx + 1]).toBe("5.000000");
-    // Trim preserves AAC stream copy.
+    const filterIdx = args.indexOf("-af");
+    expect(args[filterIdx + 1]).toBe("atrim=duration=15.000000,asetpts=PTS-STARTPTS");
+    expect(args[args.indexOf("-t") + 1]).toBe("15.000000");
     const codecIdx = args.indexOf("-c:a");
-    expect(args[codecIdx + 1]).toBe("copy");
+    expect(args[codecIdx + 1]).toBe("aac");
+    expect(args[args.indexOf("-b:a") + 1]).toBe("192k");
+    expect(args.at(-1)).toBe("/tmp/out.m4a");
   });
 
   it("emits a plain copy when source duration matches target within ~1ms", () => {
@@ -123,57 +96,33 @@ describe("buildPadTrimAudioArgs", () => {
     expect(trimNeeded.operation).toBe("trim");
   });
 
-  it("does not emit `file://` URLs in the pad-concat script (FFmpeg 8.x Windows compat)", () => {
-    // Regression pin for field-signal reports ts=1784169914 / 1784177061 /
-    // ts=1784177375 (win32/x64, CLI 0.7.59, ffmpeg 8.1.1-full_build). The
-    // concat demuxer's file open on Windows in FFmpeg 8.x rejects
-    // `file:///C:/…` URLs with "Impossible to open …". The concat script
-    // MUST use bare paths. Match sibling `assemble.ts` /
-    // `chunkEncoder.ts` conventions.
+  it("uses the portable apad/atrim filter for Windows duration normalization", () => {
+    // Bundled Windows FFmpeg builds reject `apad=whole_dur`. Match the
+    // portable finite-padding shape used by the main audio mixer.
     const winPlan = buildPadTrimAudioPlan(
-      "C:\\Users\\alice\\AppData\\Local\\Temp\\hf-render-abc\\audio.aac",
-      "C:\\Users\\alice\\AppData\\Local\\Temp\\hf-render-abc\\audio-padded.aac",
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\hf-render-abc\\audio.m4a",
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\hf-render-abc\\audio-padded.m4a",
       4.0,
       5.0,
     );
     expect(winPlan.operation).toBe("pad");
-    const concatStep = winPlan.steps.find((s) => s.kind === "pad-concat");
-    expect(concatStep).toBeDefined();
-    expect(concatStep!.concatListContent).toBeDefined();
-    expect(concatStep!.concatListContent).not.toContain("file://");
-    expect(concatStep!.concatListContent).not.toContain("file:\\\\");
-    // Bare Windows paths appear as-is in the concat directives.
-    expect(concatStep!.concatListContent).toContain(
-      "file 'C:\\Users\\alice\\AppData\\Local\\Temp\\hf-render-abc\\audio.aac'",
-    );
-  });
-
-  it("materializes the pad-concat script to a real file (not `pipe:0`)", () => {
-    // Regression pin for the Linux CI failure that surfaced when the
-    // fix originally dropped `file://` while still feeding the concat
-    // script via `pipe:0`. FFmpeg's URL joiner resolves bare absolute
-    // paths against the base `pipe:` URL, producing `pipe:/tmp/foo.aac`
-    // which the demuxer then tries to open as a pipe. Materializing to
-    // a real file makes the demuxer treat absolute paths as absolute.
-    const plan = buildPadTrimAudioPlan("/tmp/in.aac", "/tmp/out.aac", 4.0, 5.0);
-    const concatStep = plan.steps.find((s) => s.kind === "pad-concat");
-    expect(concatStep).toBeDefined();
-    // The concat script must NOT be piped in via stdin.
-    expect(concatStep!.args).not.toContain("pipe:0");
-    // The `-i` arg points at the materialized concat list file.
-    const iIdx = concatStep!.args.indexOf("-i");
-    expect(concatStep!.args[iIdx + 1]).toBe(concatStep!.concatListPath);
-    // The concat list file is cleaned up alongside the silence tail.
-    expect(plan.cleanupPaths).toContain(concatStep!.concatListPath!);
+    const args = winPlan.steps[0]!.args;
+    expect(args).toContain("-af");
+    expect(args[args.indexOf("-af") + 1]).toBe("apad,atrim=0:5.000000");
+    expect(args.join(" ")).not.toContain("whole_dur");
   });
 });
 
 describe("padOrTrimAudioToVideoFrameCount", () => {
-  // Build a minimal harness that stubs out the three injectables.
+  // Build a minimal harness that stubs out the duration probes and ffmpeg runner.
   function harness(opts: {
     video: ProbeVideoFrameInfo | "throw";
     audio: AudioProbeInfo | "throw";
-    ffmpeg?: (args: string[]) => Promise<{ success: boolean; error?: string }>;
+    ffmpeg?: (args: string[]) => Promise<{
+      success: boolean;
+      error?: string;
+      failureReason?: "external_interruption";
+    }>;
   }): { input: PadTrimAudioInput; captured: { args: string[][] } } {
     const captured = { args: [] as string[][] };
     const input: PadTrimAudioInput = {
@@ -226,11 +175,10 @@ describe("padOrTrimAudioToVideoFrameCount", () => {
     expect(result.operation).toBe("pad");
     expect(result.targetDurationSeconds).toBe(6);
     expect(result.sourceDurationSeconds).toBe(5.5);
-    expect(captured.args).toHaveLength(2);
+    expect(captured.args).toHaveLength(1);
     const tIdx = captured.args[0]!.indexOf("-t");
-    expect(captured.args[0]![tIdx + 1]).toBe("0.500000");
-    expect(captured.args[0]).not.toContain("/tmp/a.aac");
-    expect(captured.args[1]![captured.args[1]!.indexOf("-c:a") + 1]).toBe("copy");
+    expect(captured.args[0]![tIdx + 1]).toBe("6.000000");
+    expect(captured.args[0]![captured.args[0]!.indexOf("-c:a") + 1]).toBe("aac");
   });
 
   it("trims a video of N=120 frames at 30/1 fps with longer audio", async () => {
@@ -243,8 +191,8 @@ describe("padOrTrimAudioToVideoFrameCount", () => {
     expect(result.operation).toBe("trim");
     expect(result.targetDurationSeconds).toBe(4);
     expect(captured.args).toHaveLength(1);
-    const tIdx = captured.args[0]!.indexOf("-t");
-    expect(captured.args[0]![tIdx + 1]).toBe("4.000000");
+    const filterIdx = captured.args[0]!.indexOf("-af");
+    expect(captured.args[0]![filterIdx + 1]).toBe("atrim=duration=4.000000,asetpts=PTS-STARTPTS");
   });
 
   it("emits a copy when audio duration already equals frameCount/fps", async () => {
@@ -271,7 +219,7 @@ describe("padOrTrimAudioToVideoFrameCount", () => {
     expect(result.operation).toBe("pad");
     expect(result.targetDurationSeconds).toBeCloseTo((120 * 1001) / 30000, 9);
     const tIdx = captured.args[0]!.indexOf("-t");
-    expect(captured.args[0]![tIdx + 1]).toMatch(/^0\.004\d+$/);
+    expect(captured.args[0]![tIdx + 1]).toBe("4.004000");
   });
 
   it("propagates video probe failure as success=false", async () => {
@@ -327,5 +275,220 @@ describe("padOrTrimAudioToVideoFrameCount", () => {
     expect(result.error).toBe("synthetic ffmpeg failure");
     expect(result.operation).toBe("pad");
     expect(result.targetDurationSeconds).toBe(6);
+  });
+
+  it("preserves an external interruption from the audio pad/trim ffmpeg pass", async () => {
+    const { input } = harness({
+      video: { frameCount: 180, fpsNum: 30, fpsDen: 1 },
+      audio: { durationSeconds: 5.0 },
+      ffmpeg: async () => ({
+        success: false,
+        error: "synthetic interruption diagnostics",
+        failureReason: "external_interruption",
+      }),
+    });
+
+    const result = await padOrTrimAudioToVideoFrameCount(input);
+
+    expect(result).toMatchObject({
+      success: false,
+      failureReason: "external_interruption",
+    });
+  });
+
+  it("accepts silence as already below the AAC true-peak ceiling", async () => {
+    const { input, captured } = harness({
+      video: { frameCount: 90, fpsNum: 30, fpsDen: 1 },
+      audio: { durationSeconds: 3 },
+    });
+    input.probeAudioTruePeakDbfs = async () => Number.NEGATIVE_INFINITY;
+
+    const result = await padOrTrimAudioToVideoFrameCount(input);
+
+    expect(result.success).toBe(true);
+    expect(captured.args).toHaveLength(1);
+  });
+
+  it("attenuates the duration-normalized artifact with AAC correction headroom", async () => {
+    const calls: string[][] = [];
+    const { input } = harness({
+      video: { frameCount: 90, fpsNum: 30, fpsDen: 1 },
+      audio: { durationSeconds: 3.029333 },
+    });
+    input.probeAudioTruePeakDbfs = async () => 1.5;
+    input.runFfmpeg = async (args) => {
+      calls.push(args);
+      return calls.length === 1
+        ? { success: true }
+        : { success: false, error: "synthetic correction stop" };
+    };
+
+    const result = await padOrTrimAudioToVideoFrameCount(input);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("synthetic correction stop");
+    expect(calls).toHaveLength(2);
+    const correctionArgs = calls[1]!;
+    expect(correctionArgs[correctionArgs.indexOf("-af") + 1]).toBe("volume=-3.000dB");
+    expect(correctionArgs[correctionArgs.indexOf("-t") + 1]).toBe("3.000000");
+  });
+
+  it("uses correction headroom to converge within three AAC passes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-aac-convergence-"));
+    const corrections: number[] = [];
+    let attenuationDb = 0;
+    const { input } = harness({
+      video: { frameCount: 90, fpsNum: 30, fpsDen: 1 },
+      audio: { durationSeconds: 3 },
+    });
+    input.videoPath = join(dir, "video.mp4");
+    input.audioPath = join(dir, "source.m4a");
+    input.outputPath = join(dir, "normalized.m4a");
+    input.probeAudioTruePeakDbfs = async () => attenuationDb * 0.4;
+    input.runFfmpeg = async (args) => {
+      const filter = args[args.indexOf("-af") + 1];
+      if (filter?.startsWith("volume=")) {
+        attenuationDb = Number(filter.slice("volume=".length, -2));
+        corrections.push(attenuationDb);
+      }
+      writeFileSync(args.at(-1)!, "");
+      return { success: true };
+    };
+
+    try {
+      const result = await padOrTrimAudioToVideoFrameCount(input);
+
+      expect(result.success, result.error).toBe(true);
+      expect(corrections).toEqual([-1.5, -2.4, -2.94]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports every measured peak and attenuation when correction is exhausted", async () => {
+    const peaks = [0, -0.4, -0.6, -0.8];
+    let probeIndex = 0;
+    const { input } = harness({
+      video: { frameCount: 90, fpsNum: 30, fpsDen: 1 },
+      audio: { durationSeconds: 3 },
+    });
+    input.probeAudioTruePeakDbfs = async () => peaks[probeIndex++]!;
+
+    const result = await padOrTrimAudioToVideoFrameCount(input);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("pass 0: 0.000 dBFS at 0.000 dB attenuation");
+    expect(result.error).toContain("pass 1: -0.400 dBFS at -1.500 dB attenuation");
+    expect(result.error).toContain("pass 2: -0.600 dBFS at -2.600 dB attenuation");
+    expect(result.error).toContain("pass 3: -0.800 dBFS at -3.500 dB attenuation");
+  });
+});
+
+// ── Public-path path redaction ────────────────────────────────────────────
+//
+// The redaction helpers have their own unit tests, but those pass whether or
+// not this module actually CALLS them: deleting the wiring in
+// padOrTrimAudioToVideoFrameCount left every one of them green. These drive
+// the public entry point and assert on the public `PadTrimAudioResult.error`,
+// which is what reaches logs, telemetry, and the caller.
+describe("PadTrimAudioResult.error never carries the input path", () => {
+  const cases: Array<{ name: string; videoPath: string; secret: string }> = [
+    {
+      name: "a dash-prefixed relative path",
+      videoPath: "./assets/-customer-secret-intro.mp4",
+      secret: "customer-secret-intro",
+    },
+    {
+      name: "a non-allowlisted absolute root",
+      videoPath: "/data/acme-secret/video.mp4",
+      secret: "acme-secret",
+    },
+    {
+      name: "a bare relative path",
+      videoPath: "customer/acme-secret/video.mp4",
+      secret: "acme-secret",
+    },
+  ];
+
+  for (const { name, videoPath, secret } of cases) {
+    it(`redacts ${name} raised by the video probe`, async () => {
+      const result = await padOrTrimAudioToVideoFrameCount({
+        videoPath,
+        audioPath: "/tmp/audio.m4a",
+        outputPath: "/tmp/out.aac",
+        // Reproduces the real thrower: defaultProbeVideoFrameInfo raises
+        // `ffprobe found no video stream in ${videoPath}` with the raw path.
+        probeVideoFrameInfo: () =>
+          Promise.reject(new Error(`ffprobe found no video stream in ${videoPath}`)),
+        probeAudioInfo: () => Promise.resolve({ durationSeconds: 1 }),
+        runFfmpeg: () => Promise.resolve({ success: true }),
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBeDefined();
+      expect(result.error ?? "").not.toContain(secret);
+      expect(result.error ?? "").not.toContain(videoPath);
+      // Still diagnosable — the failure mode survives redaction.
+      expect(result.error ?? "").toContain("failed to probe video");
+    });
+  }
+
+  it("redacts raw ffprobe stderr surfaced through the audio probe", async () => {
+    const result = await padOrTrimAudioToVideoFrameCount({
+      videoPath: "/tmp/v.mp4",
+      audioPath: "/data/acme-secret/audio.m4a",
+      outputPath: "/tmp/out.aac",
+      probeVideoFrameInfo: () => Promise.resolve({ frameCount: 30, fpsNum: 30, fpsDen: 1 }),
+      probeAudioInfo: () =>
+        Promise.reject(
+          new Error("/data/acme-secret/audio.m4a: Invalid data found when processing input"),
+        ),
+      runFfmpeg: () => Promise.resolve({ success: true }),
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error ?? "").not.toContain("acme-secret");
+    expect(result.error ?? "").toContain("failed to probe audio");
+  });
+
+  // An injected probe can reject with anything. Casting the reason to Error and
+  // reading `.message` yielded undefined, which threw inside the redactor and
+  // turned a returned failure result into a rejected promise.
+  describe("a probe that rejects with a non-Error value", () => {
+    const nonErrors: Array<[string, unknown]> = [
+      ["a string", "probe failed"],
+      ["undefined", undefined],
+      ["null", null],
+      ["a number", 42],
+      ["a plain object", { code: "ENOENT" }],
+    ];
+
+    for (const [label, reason] of nonErrors) {
+      it(`still returns a failed result when the video probe rejects with ${label}`, async () => {
+        const result = await padOrTrimAudioToVideoFrameCount({
+          videoPath: "/data/acme-secret/video.mp4",
+          audioPath: "/tmp/audio.m4a",
+          outputPath: "/tmp/out.aac",
+          probeVideoFrameInfo: () => Promise.reject(reason),
+          probeAudioInfo: () => Promise.resolve({ durationSeconds: 1 }),
+          runFfmpeg: () => Promise.resolve({ success: true }),
+        });
+        expect(result.success).toBe(false);
+        expect(result.error ?? "").toContain("failed to probe video");
+      });
+
+      it(`still returns a failed result when the audio probe rejects with ${label}`, async () => {
+        const result = await padOrTrimAudioToVideoFrameCount({
+          videoPath: "/tmp/v.mp4",
+          audioPath: "/data/acme-secret/audio.m4a",
+          outputPath: "/tmp/out.aac",
+          probeVideoFrameInfo: () => Promise.resolve({ frameCount: 30, fpsNum: 30, fpsDen: 1 }),
+          probeAudioInfo: () => Promise.reject(reason),
+          runFfmpeg: () => Promise.resolve({ success: true }),
+        });
+        expect(result.success).toBe(false);
+        expect(result.error ?? "").toContain("failed to probe audio");
+      });
+    }
   });
 });

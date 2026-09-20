@@ -10,6 +10,15 @@ import { isVariablesPayload, VARIABLES_PAYLOAD_ERROR } from "../helpers/variable
 
 const VALID_RESOLUTIONS = new Set<string>(VALID_CANVAS_RESOLUTIONS);
 
+function contentDispositionHeader(disposition: "inline" | "attachment", filename: string): string {
+  const fallback = filename.replace(/[^\x20-\x7e]|["\\]/g, "_");
+  const encoded = encodeURIComponent(filename).replace(
+    /[!'()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
 export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void {
   // Scoped job store — not shared across createStudioApi() calls
   const renderJobs = new Map<string, RenderJobState & { createdAt: number }>();
@@ -66,6 +75,10 @@ export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void
       // Browser telemetry id, so the server-emitted render outcome is
       // attributed to the user who triggered the render (joinable funnel).
       telemetryDistinctId?: string;
+      // Explicit "this browser profile opted out" flag. Distinct from simply
+      // omitting the id: an OLD client omits it too, and that case falls back
+      // to the install anonymousId. Only an explicit `true` suppresses.
+      telemetryOptOut?: boolean;
       // Composition-variable overrides ({variableId: value}), injected as
       // window.__hfVariables — same channel as `hyperframes render --variables`.
       variables?: Record<string, unknown>;
@@ -126,6 +139,7 @@ export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void
       variables,
       distinctId:
         typeof body.telemetryDistinctId === "string" ? body.telemetryDistinctId : undefined,
+      telemetryOptOut: body.telemetryOptOut === true,
     });
     (jobState as RenderJobState & { createdAt: number }).createdAt = Date.now();
     renderJobs.set(jobId, jobState as RenderJobState & { createdAt: number });
@@ -199,7 +213,7 @@ export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void
     return new Response(content, {
       headers: {
         "Content-Type": contentType,
-        "Content-Disposition": `inline; filename="${filename}"`,
+        "Content-Disposition": contentDispositionHeader("inline", filename),
         "Accept-Ranges": "bytes",
         "Content-Length": String(content.length),
       },
@@ -220,7 +234,7 @@ export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void
     return new Response(content, {
       headers: {
         "Content-Type": contentType,
-        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Disposition": contentDispositionHeader("attachment", filename),
       },
     });
   });
@@ -262,7 +276,7 @@ export function registerRenderRoutes(api: Hono, adapter: StudioApiAdapter): void
     return new Response(content, {
       headers: {
         "Content-Type": contentType,
-        "Content-Disposition": `inline; filename="${filename}"`,
+        "Content-Disposition": contentDispositionHeader("inline", filename),
         "Accept-Ranges": "bytes",
         "Content-Length": String(content.length),
       },

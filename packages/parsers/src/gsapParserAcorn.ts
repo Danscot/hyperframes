@@ -21,6 +21,7 @@ import type {
 import { classifyTweenPropertyGroup } from "./gsapConstants.js";
 import { buildArcPath } from "./gsapSerialize.js";
 import { inlineComputedTimelines, readProvenance } from "./gsapInline.js";
+import { getObjectArrayKeyframeTiming } from "./gsapObjectArrayTiming.js";
 
 // Browser-safe re-exports so studio code can build arc config without importing
 // the recast parser (this acorn module is the browser-safe gsap subpath).
@@ -44,6 +45,22 @@ const SCOPE_NODE_TYPES = new Set([
   "FunctionExpression",
   "ArrowFunctionExpression",
 ]);
+
+function parseProgram(script: string): any {
+  try {
+    return acorn.parse(script, {
+      ecmaVersion: "latest",
+      sourceType: "script",
+      locations: true,
+    });
+  } catch {
+    return acorn.parse(script, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      locations: true,
+    });
+  }
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -694,6 +711,17 @@ function isGsapTimelineCall(node: any): boolean {
 interface TimelineDefaults {
   ease?: string;
   duration?: number;
+  durationUnresolved?: boolean;
+}
+
+/** True when the vars argument may carry a duration that static evaluation could not read. */
+function hasUnknownDuration(varsNode: any, scope: ScopeBindings): boolean {
+  if (!varsNode) return false;
+  if (varsNode.type !== "ObjectExpression") return true;
+  const props: any[] = varsNode.properties ?? [];
+  if (props.some((p) => p.type === "SpreadElement")) return true;
+  const prop = props.find((p) => isObjectProperty(p) && propKeyName(p) === "duration");
+  return prop !== undefined && typeof resolveNode(prop.value, scope) !== "number";
 }
 
 // How the timeline is referred to in source. `identifier` is the canonical
@@ -765,7 +793,10 @@ function extractTimelineDefaults(
     const key = propKeyName(prop);
     const val = resolveNode(prop.value, scope);
     if (key === "ease" && typeof val === "string") result.ease = val;
-    if (key === "duration" && typeof val === "number") result.duration = val;
+    if (key === "duration") {
+      if (typeof val === "number") result.duration = val;
+      else result.durationUnresolved = true;
+    }
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -975,6 +1006,14 @@ function parsePercentageKeyframes(
       for (const [k, v] of Object.entries(record)) {
         if (k === "ease" && typeof v === "string") {
           kfEase = v;
+        } else if (k === "duration") {
+          // `duration` is array-keyframe SEGMENT TIMING, not an animatable
+          // property. In a %-keyed object keyframe the % key owns timing, so a
+          // per-step `duration` is neither timing nor a property here. Skip it
+          // (parseObjectArrayKeyframes already does) — otherwise it surfaces as
+          // a bogus "duration" keyframe lane and gets round-tripped as a
+          // property, corrupting the tween on the next manual edit.
+          continue;
         } else if (typeof v === "number" || typeof v === "string") {
           properties[k] = v;
         }
@@ -1007,13 +1046,13 @@ function computeKeyframesTotalDuration(
     (p: any) => (p.key?.name ?? p.key?.value) === "keyframes",
   )?.value;
   if (!kfNode || kfNode.type !== "ArrayExpression") return undefined;
-  let total = 0;
+  const durations: unknown[] = [];
   for (const el of kfNode.elements ?? []) {
     if (!el || el.type !== "ObjectExpression") continue;
     const r = objectExpressionToRecord(el, scope, source);
-    if (typeof r.duration === "number") total += r.duration;
+    durations.push(r.duration);
   }
-  return total > 0 ? total : undefined;
+  return getObjectArrayKeyframeTiming(durations)?.totalDuration;
 }
 
 // fallow-ignore-next-line complexity
@@ -1021,11 +1060,11 @@ function parseObjectArrayKeyframes(
   node: any,
   scope: ScopeBindings,
   source: string,
-): GsapKeyframesData {
+): GsapKeyframesData | undefined {
   const elements = node.elements ?? [];
   const raw: Array<{
     properties: Record<string, number | string>;
-    duration?: number;
+    duration?: unknown;
     ease?: string;
   }> = [];
 
@@ -1033,10 +1072,10 @@ function parseObjectArrayKeyframes(
     if (!el || el.type !== "ObjectExpression") continue;
     const record = objectExpressionToRecord(el, scope, source);
     const properties: Record<string, number | string> = {};
-    let duration: number | undefined;
+    let duration: unknown;
     let ease: string | undefined;
     for (const [k, v] of Object.entries(record)) {
-      if (k === "duration" && typeof v === "number") {
+      if (k === "duration") {
         duration = v;
       } else if (k === "ease" && typeof v === "string") {
         ease = v;
@@ -1047,32 +1086,13 @@ function parseObjectArrayKeyframes(
     raw.push({ properties, duration, ease });
   }
 
-  const totalDuration = raw.reduce((sum, r) => sum + (r.duration ?? 0), 0);
-  const keyframes: GsapPercentageKeyframe[] = [];
-
-  if (totalDuration > 0) {
-    let cumulative = 0;
-    for (const entry of raw) {
-      cumulative += entry.duration ?? 0;
-      const percentage = Math.round((cumulative / totalDuration) * 100);
-      keyframes.push({
-        percentage,
-        properties: entry.properties,
-        ...(entry.ease ? { ease: entry.ease } : {}),
-      });
-    }
-  } else {
-    for (let i = 0; i < raw.length; i++) {
-      const entry = raw[i];
-      if (!entry) continue;
-      const percentage = raw.length > 1 ? Math.round((i / (raw.length - 1)) * 100) : 0;
-      keyframes.push({
-        percentage,
-        properties: entry.properties,
-        ...(entry.ease ? { ease: entry.ease } : {}),
-      });
-    }
-  }
+  const timing = getObjectArrayKeyframeTiming(raw.map((entry) => entry.duration));
+  if (!timing) return undefined;
+  const keyframes: GsapPercentageKeyframe[] = raw.map((entry, index) => ({
+    percentage: timing.percentages[index]!,
+    properties: entry.properties,
+    ...(entry.ease ? { ease: entry.ease } : {}),
+  }));
 
   return { format: "object-array", keyframes };
 }
@@ -1320,6 +1340,8 @@ function tweenCallToAnimation(
   if (duration === undefined && keyframesData) {
     duration = computeKeyframesTotalDuration(call.varsArg, scope, source);
   }
+  const durationUnresolved =
+    call.method !== "set" && duration === undefined && hasUnknownDuration(call.varsArg, scope);
 
   // Relabel object-proxy / empty-target tweens so they don't read as bare
   // __unresolved__: a dwell/hold spacer or an onUpdate-driven DOM channel (#5/#11).
@@ -1379,6 +1401,7 @@ function tweenCallToAnimation(
   if (keyframesData) anim.keyframes = keyframesData;
   if (motionPathResult) anim.arcPath = motionPathResult.arcPath;
   if (hasUnresolvedKeyframes) anim.hasUnresolvedKeyframes = true;
+  if (durationUnresolved) anim.durationUnresolved = true;
   if (selector === "__unresolved__") anim.hasUnresolvedSelector = true;
   if (provenance) anim.provenance = provenance;
   return anim;
@@ -1595,8 +1618,9 @@ function applyTimelineDefaults(
   if (!defaults) return;
   for (const anim of anims) {
     if (anim.method === "set") continue;
-    if (anim.duration === undefined && defaults.duration !== undefined) {
-      anim.duration = defaults.duration;
+    if (anim.duration === undefined && !anim.durationUnresolved) {
+      if (defaults.duration !== undefined) anim.duration = defaults.duration;
+      else if (defaults.durationUnresolved) anim.durationUnresolved = true;
     }
     if (anim.ease === undefined && defaults.ease !== undefined) {
       anim.ease = defaults.ease;
@@ -1663,6 +1687,9 @@ function resolveTimelinePositions(
 ): void {
   let cursor = 0;
   let prevStart = 0;
+  // Once a tween's start or duration is unknown, the timeline end is unknown:
+  // every later position that reads the cursor, the previous start or a label is unresolved.
+  let cursorKnown = true;
   const labels = new Map<string, number>();
   // Interleave addLabel definitions with tweens by source order so labels are
   // available exactly when later tweens reference them.
@@ -1672,6 +1699,7 @@ function resolveTimelinePositions(
   const defineLabel = (def: AddLabelDef): void => {
     let value: number;
     if (typeof def.position === "number") value = def.position;
+    else if (!cursorKnown) return;
     else if (typeof def.position === "string") {
       value = resolveLabelPosition(def.position, labels, cursor) ?? cursor;
     } else value = cursor; // no position ⇒ end of timeline
@@ -1694,8 +1722,11 @@ function resolveTimelinePositions(
     }
 
     const duration = anim.method === "set" ? 0 : (anim.duration ?? GSAP_DEFAULT_DURATION);
-    const start = resolveAnimStart(anim, cursor, prevStart, labels);
+    const readsCursor = anim.implicitPosition || typeof anim.position !== "number";
+    const start =
+      cursorKnown || !readsCursor ? resolveAnimStart(anim, cursor, prevStart, labels) : null;
 
+    if (start == null || anim.durationUnresolved) cursorKnown = false;
     if (start != null) {
       anim.resolvedStart = Math.max(0, start);
       prevStart = anim.resolvedStart;
@@ -1718,7 +1749,23 @@ function collectAddLabelDefs(
   scope: ScopeBindings,
   sortedCalls: TweenCallInfo[],
 ): AddLabelDef[] {
-  const callLocs = sortedCalls.map((c) => c.node.callee?.property?.loc?.start);
+  // Clones from the same expansion share __hfSiteStart (see tagTimelineCalls), so a
+  // label and a sibling tween can tie on site; __hfOrder is the tie-break, matching
+  // the source order tagTimelineCalls stamped them in.
+  const callKeys = sortedCalls.map((c) => ({
+    site: callSiteStart(c),
+    order: c.node.__hfOrder as number | undefined,
+  }));
+  const comesAfter = (
+    site: number | undefined,
+    order: number | undefined,
+    labelSite: number,
+    labelOrder: number | undefined,
+  ): boolean => {
+    if (site === undefined) return false;
+    if (site !== labelSite) return site > labelSite;
+    return (order ?? -Infinity) > (labelOrder ?? -Infinity);
+  };
   const defs: AddLabelDef[] = [];
   acornWalk.simple(ast, {
     // fallow-ignore-next-line complexity
@@ -1741,14 +1788,13 @@ function collectAddLabelDefs(
       const posVal = resolveNode(node.arguments?.[1], scope);
       const position =
         typeof posVal === "number" || typeof posVal === "string" ? posVal : undefined;
-      const labelLoc = callee.property?.loc?.start;
+      // Same coordinate space as callSiteStart: a label cloned into an inlined
+      // helper keeps the declaration's own offset unless tagTimelineCalls stamped it.
+      const labelStart: number | undefined = node.__hfSiteStart ?? callee.property?.start;
+      const labelOrder: number | undefined = node.__hfOrder;
       let order = sortedCalls.length;
-      if (labelLoc) {
-        order = callLocs.findIndex(
-          (l) =>
-            l &&
-            (l.line > labelLoc.line || (l.line === labelLoc.line && l.column > labelLoc.column)),
-        );
+      if (labelStart !== undefined) {
+        order = callKeys.findIndex((k) => comesAfter(k.site, k.order, labelStart, labelOrder));
         if (order === -1) order = sortedCalls.length;
       }
       defs.push({ name, position, order });
@@ -1764,15 +1810,20 @@ function compareByLoc(a: TweenCallInfo, b: TweenCallInfo): number {
   return aLoc.line - bLoc.line || aLoc.column - bLoc.column;
 }
 
-// Inlined tweens carry a monotonic __hfOrder (clones share source loc, so loc
-// can't order them); they sort by that, after all literal (loc-ordered) tweens.
+// Clones of an inlined helper share source loc, so an inlined tween sorts at the top-level
+// statement that expanded it (__hfSiteStart), then by expansion order (__hfOrder).
+function callSiteStart(call: TweenCallInfo): number | undefined {
+  return call.node.__hfSiteStart ?? call.node.callee?.property?.start;
+}
+
 function compareCallOrder(a: TweenCallInfo, b: TweenCallInfo): number {
+  const aSite = callSiteStart(a);
+  const bSite = callSiteStart(b);
+  if (aSite !== undefined && bSite !== undefined && aSite !== bSite) return aSite - bSite;
   const ao = a.node.__hfOrder;
   const bo = b.node.__hfOrder;
-  if (ao === undefined && bo === undefined) return compareByLoc(a, b);
-  if (ao === undefined) return -1;
-  if (bo === undefined) return 1;
-  return ao - bo;
+  if (ao !== undefined && bo !== undefined) return ao - bo;
+  return compareByLoc(a, b);
 }
 
 function sortBySourcePosition(calls: TweenCallInfo[]): void {
@@ -1850,11 +1901,7 @@ export function parseGsapScriptAcornForWrite(script: string): ParsedGsapAcornFor
  */
 export function parseGsapScriptAcorn(script: string): ParsedGsap {
   try {
-    const ast = acorn.parse(script, {
-      ecmaVersion: "latest",
-      sourceType: "script",
-      locations: true,
-    });
+    const ast = parseProgram(script);
     const scope = collectScopeBindings(ast);
     const detection = findTimelineVar(ast, scope);
     const ref: TimelineRef = detection.ref ?? { kind: "identifier", name: "tl" };
@@ -1919,6 +1966,87 @@ export function parseGsapScriptAcorn(script: string): ParsedGsap {
   } catch {
     return { animations: [], timelineVar: "tl", preamble: "", postamble: "" };
   }
+}
+
+/** Source offset of the first timeline or standalone GSAP MotionPathPlugin tween. */
+export function gsapScriptMotionPathFirstUseIndex(script: string): number | null {
+  try {
+    const ast = parseProgram(script);
+    const scope = collectScopeBindings(ast);
+    const identifierBindings = collectIdentifierBindingIndex(ast);
+    const timelineRef = findTimelineVar(ast, scope).ref;
+    const timelineDeclarations = new Set<any>();
+    let firstUseIndex: number | null = null;
+
+    acornWalk.ancestor(ast, {
+      VariableDeclarator(node: any) {
+        if (node.id?.type === "Identifier" && isGsapTimelineCall(node.init)) {
+          timelineDeclarations.add(node);
+        }
+      },
+      AssignmentExpression(node: any, _: unknown, ancestors: any[]) {
+        if (node.left?.type === "Identifier" && isGsapTimelineCall(node.right)) {
+          const declaration = findVisibleIdentifierDeclaration(
+            node.left.name,
+            ancestors,
+            identifierBindings,
+            node.start,
+          );
+          if (declaration) timelineDeclarations.add(declaration.node);
+        }
+      },
+    } as any);
+
+    acornWalk.ancestor(ast, {
+      CallExpression(node: any, _: unknown, ancestors: any[]) {
+        const callee = node.callee;
+        const method = callee?.property?.name;
+        if (callee?.type !== "MemberExpression" || !GSAP_METHODS.has(method)) return;
+        let rootObject = callee.object;
+        while (rootObject?.type === "CallExpression") rootObject = rootObject.callee?.object;
+        const isGsapRooted = rootObject?.type === "Identifier" && rootObject.name === "gsap";
+        const visibleTimelineDeclaration =
+          rootObject?.type === "Identifier"
+            ? findVisibleIdentifierDeclaration(
+                rootObject.name,
+                ancestors,
+                identifierBindings,
+                node.start,
+              )
+            : undefined;
+        const isTimelineTween =
+          (timelineRef?.kind === "member" ? isTimelineRootedCall(node, timelineRef) : false) ||
+          (!!visibleTimelineDeclaration &&
+            timelineDeclarations.has(visibleTimelineDeclaration.node));
+        if (!isGsapRooted && !isTimelineTween) return;
+        const varsArgs =
+          method === "fromTo" ? [node.arguments?.[1], node.arguments?.[2]] : [node.arguments?.[1]];
+        if (
+          varsArgs.some((varsArg) => {
+            if (findPropertyNode(varsArg, "motionPath")) return true;
+            if (varsArg?.type !== "Identifier") return false;
+            const declaration = findVisibleIdentifierDeclaration(
+              varsArg.name,
+              ancestors,
+              identifierBindings,
+              node.start,
+            );
+            return !!findPropertyNode(declaration?.node.init, "motionPath");
+          })
+        )
+          firstUseIndex = firstUseIndex === null ? node.start : Math.min(firstUseIndex, node.start);
+      },
+    } as any);
+
+    return firstUseIndex;
+  } catch {
+    return null;
+  }
+}
+
+/** True when a timeline or standalone GSAP tween authors a MotionPathPlugin property. */
+export function gsapScriptUsesMotionPath(script: string): boolean {
+  return gsapScriptMotionPathFirstUseIndex(script) !== null;
 }
 
 // ── Label extraction (WS-C) ──────────────────────────────────────────────────

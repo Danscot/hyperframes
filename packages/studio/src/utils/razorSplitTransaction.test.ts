@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TimelineElement } from "../player";
 import { buildAtomicCutIntents, runAtomicCutTransaction } from "./razorSplitTransaction";
+import { consumeStudioWriteToken, resetStudioWriteTokens } from "./studioFileVersion";
 
 const element = (over: Partial<TimelineElement> = {}): TimelineElement => ({
   id: "clip",
@@ -9,12 +10,14 @@ const element = (over: Partial<TimelineElement> = {}): TimelineElement => ({
   start: 0,
   duration: 4,
   track: 0,
-  timingSource: "authored",
   sourceFile: "index.html",
   ...over,
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  resetStudioWriteTokens();
+  vi.unstubAllGlobals();
+});
 
 describe("buildAtomicCutIntents", () => {
   it("deduplicates runtime aliases but keeps repeated authored hosts distinct", () => {
@@ -33,6 +36,16 @@ describe("buildAtomicCutIntents", () => {
     expect(intents[0].targets.map((target) => target.originalId)).toEqual(["host-a", "host-b"]);
   });
 
+  it("carries the element's authored track onto the cut target, so both split halves stay pinned to it server-side", () => {
+    const intents = buildAtomicCutIntents([element({ authoredTrack: 2 })], 2, "index.html");
+    expect(intents[0].targets[0].track).toBe(2);
+  });
+
+  it("falls back to the resolved track when the element has no authoredTrack", () => {
+    const intents = buildAtomicCutIntents([element({ track: 3 })], 2, "index.html");
+    expect(intents[0].targets[0].track).toBe(3);
+  });
+
   it("rebases each nested target into its own source-file coordinates", () => {
     const intents = buildAtomicCutIntents(
       [element({ start: 8, duration: 4, expandedParentStart: 6, sourceFile: "scene.html" })],
@@ -45,12 +58,16 @@ describe("buildAtomicCutIntents", () => {
 });
 
 function installCutServer(options: { status?: number } = {}) {
-  const requests: Array<{ url: string; body?: unknown }> = [];
+  const requests: Array<{ url: string; body?: unknown; headers?: HeadersInit }> = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
-      requests.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      requests.push({
+        url,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        headers: init?.headers,
+      });
       if (url.includes("/files/")) {
         return new Response(JSON.stringify({ content: "before", version: '"v0"' }), {
           status: 200,
@@ -95,7 +112,7 @@ describe("runAtomicCutTransaction", () => {
     const synchronize = vi.fn();
 
     const result = await runAtomicCutTransaction({
-      projectId: "launch/demo",
+      projectId: "launch#demo",
       intents: buildAtomicCutIntents([element()], 2, "index.html"),
       label: "Split timeline clip",
       writeProjectFile,
@@ -106,9 +123,13 @@ describe("runAtomicCutTransaction", () => {
 
     expect(requests.filter((request) => request.url.includes("split-batch"))).toHaveLength(1);
     expect(requests.map((request) => request.url)).toEqual([
-      "/api/projects/launch%2Fdemo/files/index.html",
-      "/api/projects/launch%2Fdemo/file-mutations/split-batch",
+      "/api/projects/launch%23demo/files/index.html",
+      "/api/projects/launch%23demo/file-mutations/split-batch",
     ]);
+    const splitRequest = requests.find((request) => request.url.includes("split-batch"));
+    const writeToken = new Headers(splitRequest?.headers).get("X-Hyperframes-Write-Token");
+    expect(writeToken).toMatch(/^cut:/);
+    expect(consumeStudioWriteToken(writeToken)).toBe(true);
     expect(writeProjectFile).not.toHaveBeenCalled();
     expect(recordEdit).toHaveBeenCalledWith({
       label: "Split timeline clip",

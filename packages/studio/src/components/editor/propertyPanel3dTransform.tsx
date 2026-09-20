@@ -1,6 +1,5 @@
 import { useState } from "react";
 import type { DomEditSelection } from "./domEditingTypes";
-import { STUDIO_KEYFRAMES_ENABLED } from "./manualEditingAvailability";
 import { MetricField } from "./propertyPanelPrimitives";
 import { KeyframeNavigation } from "./KeyframeNavigation";
 import { formatPxMetricValue, parsePxMetricValue, RESPONSIVE_GRID } from "./propertyPanelHelpers";
@@ -254,12 +253,12 @@ function Transform3dField({
           onCommit={(next) => {
             const v = parse(next);
             if (v != null && onCommitAnimatedProperty) {
-              void onCommitAnimatedProperty(ctx.element, prop, v);
+              return onCommitAnimatedProperty(ctx.element, prop, v);
             }
           }}
         />
       </div>
-      {STUDIO_KEYFRAMES_ENABLED && (gsapAnimId || onCommitAnimatedProperty) && (
+      {(gsapAnimId || onCommitAnimatedProperty) && (
         <KeyframeNavigation
           property={prop}
           keyframes={ctx.gsapKeyframes}
@@ -323,11 +322,19 @@ export function PropertyPanel3dTransform({
       <button
         type="button"
         onClick={() => setCollapsed((v) => !v)}
-        className="mb-2 flex w-full items-center justify-between text-[10px] font-medium uppercase tracking-wider text-neutral-600 hover:text-neutral-400"
+        aria-expanded={!collapsed}
+        className="mb-2 flex w-full items-center justify-between text-[10px] font-medium uppercase tracking-wider text-neutral-600 hover:text-neutral-400 active:scale-[0.99]"
       >
         <span>3D Transform</span>
-        <svg width="9" height="9" viewBox="0 0 10 10" fill="currentColor" aria-hidden>
-          {collapsed ? <path d="M3 2l4 3-4 3z" /> : <path d="M2 3l3 4 3-4z" />}
+        <svg
+          width="9"
+          height="9"
+          viewBox="0 0 10 10"
+          fill="currentColor"
+          aria-hidden
+          className={`transition-transform duration-150 ${collapsed ? "-rotate-90" : ""}`}
+        >
+          <path d="M2 3l3 4 3-4z" />
         </svg>
       </button>
       {collapsed ? null : (

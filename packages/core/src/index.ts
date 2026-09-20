@@ -1,4 +1,5 @@
 // Types
+export type { RuntimeTimelineClipIdentity } from "./runtime/types.js";
 export type {
   ExecutionMode,
   Orientation,
@@ -51,6 +52,13 @@ export type {
 
 export { parseSlideshowManifest, resolveSlideshow } from "./slideshow/index.js";
 
+export type {
+  AuthoredTimingValue,
+  RawAuthoredTiming,
+  AuthoredTimingWindow,
+} from "./runtime/authoredTiming.js";
+export { resolveAuthoredTimingWindow } from "./runtime/authoredTiming.js";
+
 export {
   CANVAS_DIMENSIONS,
   VALID_CANVAS_RESOLUTIONS,
@@ -95,7 +103,6 @@ export {
   keyframesToGsapAnimations,
   gsapAnimationsToKeyframes,
 } from "@hyperframes/parsers";
-
 export type { ParsedHtml, CompositionMetadata } from "@hyperframes/parsers";
 
 export {
@@ -145,6 +152,18 @@ export {
   MEDIA_DURATION_CLAMP_EPSILON_SECONDS,
 } from "./compiler/timingCompiler";
 
+export {
+  AUDIO_GROUP_RENDER_ID_ATTR,
+  MEDIA_RENDER_ID_ATTR,
+  assignMediaRenderIds,
+} from "./compiler/mediaRenderIds";
+
+export {
+  RENDER_FRAME_ID_PREFIX,
+  RENDER_FRAME_ID_SUFFIX,
+  renderFrameIdForRenderId,
+} from "./runtime/renderFrameSibling";
+
 // Lint moved to @hyperframes/lint. Import lint APIs from @hyperframes/lint
 // directly, or via the back-compat stub at @hyperframes/core/lint. Not
 // re-exported here — doing so would cycle core's main entry through the lint
@@ -169,11 +188,24 @@ export { parseAnimatedGifMetadata, type AnimatedGifMetadata } from "./media/gif"
 export {
   HF_COLOR_GRADING_ATTR,
   HF_COLOR_GRADING_ADJUST_KEYS,
+  HF_COLOR_GRADING_ACTIVE_EFFECT_KEYS,
+  HF_COLOR_GRADING_ANIMATABLE_PROPERTIES,
   HF_COLOR_GRADING_CANVAS_ID_PREFIX,
   HF_COLOR_GRADING_COLOR_SPACE,
+  HF_COLOR_GRADING_CURVE_KEYS,
   HF_COLOR_GRADING_DETAIL_KEYS,
+  HF_COLOR_GRADING_EFFECT_APPLY_DEFAULTS,
   HF_COLOR_GRADING_EFFECT_KEYS,
+  HF_COLOR_GRADING_EFFECT_PRESETS,
+  HF_COLOR_GRADING_GRADE_PRESETS,
+  HF_COLOR_GRADING_HUE_CURVE_KEYS,
+  HF_COLOR_GRADING_LUT_KEYS,
+  HF_COLOR_GRADING_PALETTES,
   HF_COLOR_GRADING_PRESETS,
+  HF_COLOR_GRADING_TOP_LEVEL_KEYS,
+  HF_COLOR_GRADING_WHEEL_KEYS,
+  getHfColorGradingCapabilities,
+  hasHfColorGradingAuthoredValues,
   isHfColorGradingActive,
   normalizeHfColorGrading,
   normalizeHfColorGradingWithVariables,
@@ -182,6 +214,8 @@ export {
   type HfColorGrading,
   type HfColorGradingAdjust,
   type HfColorGradingAdjustKey,
+  type HfColorGradingAnimatablePath,
+  type HfColorGradingActiveEffectKey,
   type HfColorGradingDetailKey,
   type HfColorGradingDetails,
   type HfColorGradingEffectKey,
@@ -191,7 +225,26 @@ export {
   type HfColorGradingPresetId,
   type HfColorGradingTarget,
   type HfColorGradingVariableMap,
+  type HfColorGradingCapabilities,
+  type HfColorGradingCurveKey,
+  type HfColorGradingCurves,
+  type HfColorGradingHueCurveKey,
+  type HfColorGradingHueCurves,
+  type HfColorGradingHueRange,
+  type HfColorGradingSecondary,
+  type HfColorGradingSecondaryCorrection,
+  type HfColorGradingSoftRange,
+  type HfColorGradingTonalWheel,
+  type HfColorGradingWheelKey,
+  type HfColorGradingWheels,
+  type HfColorCurvePoint,
+  type HfHueCurvePoint,
   type NormalizedHfColorGrading,
+  type NormalizedHfColorGradingCurves,
+  type NormalizedHfColorGradingHueCurves,
+  type NormalizedHfColorGradingSecondary,
+  type NormalizedHfColorGradingWheels,
+  type ResolvedHfColorGrading,
 } from "./colorGrading";
 export { parseCubeLut, CubeLutParseError, type ParseCubeLutOptions } from "./colorLuts";
 
@@ -216,10 +269,11 @@ export {
 export {
   MEDIA_VISUAL_STYLE_PROPERTIES,
   copyMediaVisualStyles,
+  quantizeSeekTime,
   quantizeTimeToFrame,
   type MediaVisualStyleProperty,
 } from "./inline-scripts/parityContract";
-export { redactTelemetryString } from "./telemetryRedaction";
+export { redactKnownPaths, redactTelemetryString } from "./telemetryRedaction";
 export { isSafePath, resolveWithinProject } from "./safePath";
 export type {
   HyperframePickerApi,
@@ -265,6 +319,19 @@ export {
 // publishConfig entry points at a file the pack doesn't contain
 // (verify:packed-manifests catches exactly that).
 export { createRuntimeStartTimeResolver } from "./runtime/startResolver.js";
+// Also exposed via the ./runtime/clip-window subpath; re-exported here for the same dist-emit reason.
+export { isClipVisibleAt, isInClipWindow } from "./runtime/clipWindow.js";
+export {
+  normalizePlaybackRate,
+  normalizeRateSpec,
+  parseStrictFiniteTimingNumber,
+  readElementPlaybackRate,
+  readElementRateSpec,
+  readMediaStart,
+  resolveNaturalMediaTimelineDuration,
+  resolveNaturalMediaTimelineDurationFromValues,
+} from "./runtime/playbackRate.js";
+export { shiftRateLane, sourceTimeAt, timeAtSourceTime, type RateSpec } from "./speedRamp.js";
 
 // Variable validation (CLI / tooling-side)
 export {
@@ -296,3 +363,19 @@ export {
   isBlockItem,
   isComponentItem,
 } from "./registry/index.js";
+
+export {
+  canaryBucket,
+  evaluateCanary,
+  parseCanaryOverride,
+  type CanaryDecision,
+  type CanaryInput,
+  type CanaryReason,
+} from "./canary.js";
+export {
+  CANARIES,
+  canaryEnvVar,
+  findCanary,
+  overdueCanaries,
+  type CanaryDefinition,
+} from "./canaryRegistry.js";

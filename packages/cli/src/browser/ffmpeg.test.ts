@@ -2,11 +2,19 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { findFFmpeg, findFFprobe } from "./ffmpeg.js";
+import { findFFmpeg, findFFprobe, H264EncoderUnavailableError } from "./ffmpeg.js";
 
 // Only child_process is mocked: the H264 encoder probe shells out, while the
 // wrapper tests below resolve via env overrides and need the real `existsSync`.
 vi.mock("node:child_process", () => ({ execFileSync: vi.fn(), execSync: vi.fn() }));
+
+// Only the distro probe is faked; `ffmpegInstallCommand` stays real so the
+// linux cases below assert the string a user would actually be handed.
+let linuxFamily = "debian";
+vi.mock("./linuxDeps.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./linuxDeps.js")>()),
+  detectLinuxDistro: () => ({ family: linuxFamily, isWsl: false, prettyName: null }),
+}));
 
 const mockExecFile = vi.mocked(execFileSync);
 
@@ -52,9 +60,27 @@ describe("resolveH264EncoderMode", () => {
  V....D h264_vaapi    H.264/AVC (VAAPI)
 `;
 
-    expect(() => resolveH264EncoderMode(encoders, false)).toThrow(
-      "neither libx264 nor VideoToolbox",
+    expect(() => resolveH264EncoderMode(encoders, false)).toThrow(H264EncoderUnavailableError);
+  });
+
+  it("prefers libx264 when both encoders are available", async () => {
+    const { resolveH264EncoderMode } = await import("./ffmpeg.js");
+    expect(
+      resolveH264EncoderMode(" V....D libx264 H.264\n V....D h264_videotoolbox H.264\n", false),
+    ).toBe("software");
+  });
+
+  it("distinguishes a successful unsupported probe from an unavailable probe", async () => {
+    const { detectH264EncoderMode } = await import("./ffmpeg.js");
+    mockExecFile.mockReturnValue(" V....D libvpx-vp9 VP9\n");
+    expect(() => detectH264EncoderMode("/custom/ffmpeg", false)).toThrow(
+      H264EncoderUnavailableError,
     );
+    const timeout = new Error("ETIMEDOUT");
+    mockExecFile.mockImplementationOnce(() => {
+      throw timeout;
+    });
+    expect(() => detectH264EncoderMode("/custom/ffmpeg", false)).toThrow(timeout);
   });
 
   it("inspects the configured FFmpeg binary", async () => {
@@ -67,7 +93,71 @@ describe("resolveH264EncoderMode", () => {
     expect(mockExecFile).toHaveBeenCalledWith(
       "/custom/ffmpeg",
       ["-hide_banner", "-encoders"],
-      expect.objectContaining({ encoding: "utf-8" }),
+      expect.objectContaining({ encoding: "utf-8", windowsHide: true }),
     );
+  });
+});
+
+// Studio renders the command behind a copy button, so "is there a command at
+// all" has to be a typed answer rather than a guess made by pattern-matching
+// the prose hint. The hint is derived from the command, so they move together.
+describe("getFFmpegInstallCommand / getFFmpegInstallHint", () => {
+  const realPlatform = process.platform;
+
+  function setPlatform(platform: NodeJS.Platform): void {
+    Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  }
+
+  afterEach(() => {
+    setPlatform(realPlatform);
+  });
+
+  it("gives macOS a pasteable command and uses it verbatim as the hint", async () => {
+    setPlatform("darwin");
+    const { getFFmpegInstallCommand, getFFmpegInstallHint } = await import("./ffmpeg.js");
+
+    expect(getFFmpegInstallCommand()).toBe("brew install ffmpeg");
+    expect(getFFmpegInstallHint()).toBe("brew install ffmpeg");
+  });
+
+  it("gives Windows a winget command and keeps the manual route in the hint", async () => {
+    setPlatform("win32");
+    const { getFFmpegInstallCommand, getFFmpegInstallHint } = await import("./ffmpeg.js");
+
+    const command = getFFmpegInstallCommand();
+    expect(command).toBe("winget install --id Gyan.FFmpeg -e");
+    // Machines predating winget still need somewhere to go.
+    expect(getFFmpegInstallHint()).toContain(command);
+    expect(getFFmpegInstallHint()).toContain("https://ffmpeg.org/download.html");
+  });
+
+  it("reports no command on a platform without one, and still hints", async () => {
+    setPlatform("sunos");
+    const { getFFmpegInstallCommand, getFFmpegInstallHint } = await import("./ffmpeg.js");
+
+    expect(getFFmpegInstallCommand()).toBeUndefined();
+    expect(getFFmpegInstallHint()).toBe("https://ffmpeg.org/download.html");
+  });
+
+  it("gives a recognised linux distro its package-manager command", async () => {
+    setPlatform("linux");
+    linuxFamily = "debian";
+    const { getFFmpegInstallCommand } = await import("./ffmpeg.js");
+
+    expect(getFFmpegInstallCommand()).toBe("sudo apt-get update && sudo apt-get install -y ffmpeg");
+  });
+
+  // The reason the command and the hint are separate functions at all. On an
+  // unrecognised distro `ffmpegInstallCommand` returns a sentence, and Studio
+  // renders whatever comes back inside a <code> block behind a Copy button —
+  // so a command must be absent here, not prose. Without this the guard that
+  // makes that true is unpinned, and deleting it keeps every other test green.
+  it("reports no command on an unrecognised distro, and hints in prose", async () => {
+    setPlatform("linux");
+    linuxFamily = "unknown";
+    const { getFFmpegInstallCommand, getFFmpegInstallHint } = await import("./ffmpeg.js");
+
+    expect(getFFmpegInstallCommand()).toBeUndefined();
+    expect(getFFmpegInstallHint()).toContain("distro package manager");
   });
 });

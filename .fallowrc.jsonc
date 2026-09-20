@@ -1,9 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/config-schema.json",
   "entry": [
+    // IconButton, Tabs and cn are exported before their first consumer exists.
+    "packages/studio/src/components/ui/index.ts",
     "packages/producer/src/**/*.test.ts",
     "packages/aws-lambda/src/**/*.test.ts",
     "packages/gcp-cloud-run/src/**/*.test.ts",
+    "packages/gcp-cloud-run/terraform/*.test.ts",
     "packages/producer/src/regression-harness.ts",
     "packages/producer/src/regression-harness-distributed.test.ts",
     "packages/producer/src/regression-harness-lambda-local.ts",
@@ -25,6 +28,9 @@
     // Bundled as a standalone IIFE by the position-edits render artifact
     // generator; referenced by file path rather than imported by TypeScript.
     "packages/core/stubs/position-edits-render-entry.ts",
+    // Same arrangement for the audio FX graph builders, bundled by
+    // build-audio-fx-runtime.ts for the offline render page.
+    "packages/core/stubs/audio-fx-runtime-entry.ts",
     // In-page audit scripts read as raw strings and injected via
     // page.addScriptTag (see layout.ts / validate.ts) — referenced by file
     // path, never imported, so they have no import-graph referrer.
@@ -145,6 +151,49 @@
       "file": "packages/studio/src/utils/studioHelpers.ts",
       "exports": ["resolveDroppedAssetDimensions"],
     },
+    {
+      "file": "packages/core/src/audio/audioFxGraph.ts",
+      "exports": ["ensureAudioFxWorklets"],
+    },
+    // automationLaneGeometry is the bottom of the audio-automation stack: its
+    // consumer is the lane component one PR upstack, so a per-PR audit diffing
+    // against the merge base sees these as unused. Consumed for real once the
+    // stack merges; safe to drop this entry then.
+    {
+      "file": "packages/studio/src/player/components/automationLaneGeometry.ts",
+      "exports": [
+        "POINT_MERGE_SEC",
+        "GRAB_PX",
+        "DRAW_SAMPLES",
+        "PAD_X",
+        "formatValue",
+        "laneFor",
+        "withLane",
+      ],
+    },
+    // automationShapes is part of the audio-automation stack: its consumer is
+    // the UI layer that uses shape generators one PR upstack, so a per-PR audit
+    // diffing against the merge base sees these as unused. Consumed for real once
+    // the stack merges; safe to drop this entry then.
+    {
+      "file": "packages/studio/src/player/components/automationShapes.ts",
+      "exports": ["AUTOMATION_SHAPES"],
+    },
+    // automationSimplify is part of the audio-automation stack: its consumer is
+    // the UI layer one PR upstack, so a per-PR audit diffing against the merge
+    // base sees these as unused. Consumed for real once the stack merges; safe
+    // to drop this entry then.
+    {
+      "file": "packages/studio/src/player/components/automationSimplify.ts",
+      "exports": ["simplifyPoints"],
+    },
+    // propertyPanelAutomation is the shared reader for both panel sections; the
+    // FX group that consumes these two lands one PR upstack, so a per-PR audit
+    // against the merge base sees them as unused.
+    {
+      "file": "packages/studio/src/components/editor/propertyPanelAutomation.ts",
+      "exports": ["automatedTargetsOf", "resolveAutomationRange"],
+    },
     // drawElementService is the bottom of the fast-capture Graphite stack
     // (#1917): its consumers (frameCapture in #1919) land two PRs upstack, so
     // a per-PR audit diffing against the merge base sees these exports as
@@ -161,12 +210,23 @@
         "produceDrawElementFrame",
       ],
     },
+    // External-conflict persistence is the #2990 stack boundary. The coordinator
+    // consumes these exports in child PR #2991; keep the primitive independently reviewable.
+    {
+      "file": "packages/studio/src/utils/externalConflictStorage.ts",
+      "exports": [
+        "persistExternalConflictSnapshot",
+        "persistExternalFailureSnapshot",
+        "loadExternalConflictSnapshot",
+        "deleteExternalConflictSnapshot",
+      ],
+    },
     // CLI command files: every command exports a const `examples` per the
     // convention documented in CLAUDE.md. This is a namespace barrel, not a
     // collision.
     { "file": "packages/cli/src/commands/*.ts", "exports": ["examples"] },
     // Options type for the render-queue hook's public startRender callback —
-    // consumed structurally by callers (StudioRightPanel), not by import.
+    // consumed structurally by callers (StudioRightPanels), not by import.
     {
       "file": "packages/studio/src/components/renders/useRenderQueue.ts",
       "exports": ["StartRenderOptions"],
@@ -397,6 +457,18 @@
     // require intrusive middleware changes beyond this PR's scope.
     "minLines": 6,
     "ignore": [
+      // AWS Lambda and GCP Cloud Run deliberately mirror the same distributed
+      // rendering lifecycle while retaining provider-specific SDK, storage, and
+      // retry semantics. The Plan v2 AWS adapter extends that existing symmetry;
+      // extracting a shared cloud abstraction would couple independent packages.
+      "packages/aws-lambda/src/handler.ts",
+      "packages/aws-lambda/src/s3Transport.ts",
+      // The GCP handler deliberately mirrors the AWS protocol lifecycle while
+      // retaining provider-specific GCS, HTTP, and Cloud Workflows semantics.
+      // Its tests also mirror the same wire-contract cases; a cross-provider
+      // test abstraction would hide the adapter boundary being asserted.
+      "packages/gcp-cloud-run/src/server.ts",
+      "packages/gcp-cloud-run/src/server.test.ts",
       // sourcePatcher.ts: pre-existing internal clones between the inline-style
       // and attribute tag-patchers; only the PatchOperation type gained two
       // optional fields here, but the line shift makes fallow re-flag them.
@@ -520,6 +592,12 @@
       // this PR only teaches the server scan to prefer its reported PID, but that
       // line shift makes fallow re-flag the inherited probe clones.
       "packages/cli/src/server/portUtils.ts",
+      // iframe.test.ts: the remaining clone groups are pre-existing per-case arrange
+      // blocks in the selection and draft-loop suites (build an adapter, wire a spy,
+      // act). Appending the paint-query suite shifts their line numbers and re-flags
+      // them; each block states its own setup on purpose, which a shared fixture
+      // would hide.
+      "packages/sdk/src/adapters/iframe.test.ts",
       // gsapParserAcorn.motionEval.test.ts: parallel arrange/act/assert cases for
       // the staggered-collection honesty pass (.from reveal vs .to landing on the
       // rest pose). Each asserts a distinct keyframe shape; collapsing the shared
@@ -593,6 +671,45 @@
       // makes non-trivial.
       "packages/studio-server/src/helpers/screenshotClip.ts",
       "packages/studio/vite.browser.ts",
+      // off_pivot_rotation Kåsa circle fit (feat/needle-pivot-offset-check):
+      // fitCirclePoints in layout-audit.browser.js and fitCircle in
+      // checkPipeline.ts are the same least-squares circle fit, but the browser
+      // copy is injected as a raw string via page.addScriptTag and cannot import
+      // the Node-side module across puppeteer's serialization boundary. The two
+      // copies carry matching "KEEP IN SYNC" headers; the duplication is
+      // intentional and per-language, so it's exempted here rather than faked
+      // away with cosmetic divergence.
+      "packages/cli/src/commands/layout-audit.browser.js",
+      "packages/cli/src/utils/checkPipeline.ts",
+      // check.test.ts: the fakeDriver-based command tests share a pre-existing
+      // arrange/act/assert scaffold (runScenario + vi.fn runPipeline + spy +
+      // createCheckCommand). Adding the required collectOffPivotRotationSample
+      // stub to the CheckAuditDriver fake shifts line numbers and re-flags that
+      // inherited clone; consistent with the norm above of leaving parallel
+      // command-test cases unabstracted.
+      "packages/cli/src/commands/check.test.ts",
+      // canary.test.ts: rawFnv is a deliberate independent re-implementation of
+      // canary.ts's fnv1a32, not copy-paste — its own docstring explains why:
+      // the test re-derives the hash so it can cross-check canaryBucket against
+      // a copy that owes it nothing, rather than importing the function under
+      // test. Importing fnv1a32 here would defeat the point of the assertion.
+      "packages/core/src/canary.test.ts",
+      // The audio FX property-panel test files (and the two siblings outside
+      // this stack, propertyPanelFlatMotionSection.test.tsx and
+      // propertyPanelFlatEffectsSection.test.tsx) share a `renderInto` React
+      // mount helper — pre-existing across nine files, not introduced here.
+      // The FxSection/FlatTextSection `mount()` wrappers additionally look
+      // alike because both build a props-with-overrides harness for their own
+      // component; the prop shapes differ per component, so a shared mount
+      // abstraction would obscure more than it dedupes (same rationale as
+      // slideshowPanelHelpers.ts above).
+      "packages/studio/src/components/editor/PropertyPanelEmptyState.test.tsx",
+      "packages/studio/src/components/editor/propertyPanelFlatColorGradingSection.test.tsx",
+      "packages/studio/src/components/editor/propertyPanelFlatLayoutSection.test.tsx",
+      "packages/studio/src/components/editor/propertyPanelFlatPrimitives.test.tsx",
+      "packages/studio/src/components/editor/propertyPanelFlatTextSection.test.tsx",
+      "packages/studio/src/components/editor/propertyPanelFlatToggle.test.tsx",
+      "packages/studio/src/components/editor/propertyPanelFxSection.test.tsx",
     ],
   },
   "health": {
@@ -601,11 +718,27 @@
     // complexity pre-dates the computed-timeline work. Exempted at file level
     // rather than refactored as scope creep.
     "ignore": [
+      // audio-fx-runtime-entry.ts: the browser-side IIFE entry for the offline FX
+      // render. It runs only inside the headless page the engine drives, so unit
+      // coverage cannot reach it and its CRAP score is coverage-driven rather
+      // than complexity-driven (5 cyclomatic). Its behaviour is covered by the
+      // engine's real-browser render tests.
+      "packages/core/stubs/audio-fx-runtime-entry.ts",
+      // useGestureRecording.ts: readBasePosition/connectGsapRuntime/tick are
+      // inherited gesture-runtime control flow. This stack only changes
+      // recordSample to coalesce display-rate events onto authored frames;
+      // the import and helper insertion shift the untouched functions' lines.
+      "packages/studio/src/hooks/useGestureRecording.ts",
       // sourcePatcher.ts: resolveSourceFile / splitInlineStyleDeclarations /
       // patch*InTag pre-date this PR; only the PatchOperation type gained two
       // optional fields, but the line-shift fingerprint re-flags the inherited
       // complexity.
       "packages/studio/src/utils/sourcePatcher.ts",
+      // runtime/media.ts: refreshRuntimeMediaCache pre-dates this work and is
+      // untouched by it — this stack only adds a volume-lane branch to
+      // syncRuntimeMedia's author-volume resolution, but touching the file makes
+      // fallow report the inherited function.
+      "packages/core/src/runtime/media.ts",
       // timeline.ts: collectRuntimeTimelinePayload (CRITICAL) pre-dates this PR;
       // only an import line changed here (slideshow/sceneId → slideshow/index),
       // but the line-shift fingerprint makes fallow re-flag inherited complexity.
@@ -625,6 +758,11 @@
       "packages/parsers/src/gsapParser.ts",
       // htmlParser.ts has pre-existing complexity (moved from packages/core).
       "packages/parsers/src/htmlParser.ts",
+      // automationSimplify.ts: Ramer–Douglas–Peucker algorithm inherently requires
+      // nested loops and stack-based control flow (12 cyclomatic / 20 cognitive);
+      // this complexity is by design and not refactorable. Consumed by the UI
+      // layer one PR upstack in the audio-automation feature stack.
+      "packages/studio/src/player/components/automationSimplify.ts",
       // studio-server files: pre-existing complexity (moved from packages/core/src/studio-api/).
       // files.ts: executeGsapMutationRecast/Acorn are CRITICAL; excluded as files.ts
       // was already in health.ignore at the old path (packages/core/src/studio-api/routes/files.ts).
@@ -734,6 +872,10 @@
       "packages/studio/src/components/editor/BlockParamsPanel.tsx",
       "packages/studio/src/components/editor/DomEditOverlay.tsx",
       "packages/studio/src/components/editor/FileTree.tsx",
+      // ColorGradingControls: main's 374-line render function (LUT + vignette/grain
+      // detail panels), reconciled against this PR's LUT import spinner/error graft
+      // during rebase. Pre-existing complexity; line-shift re-flags it.
+      "packages/studio/src/components/editor/propertyPanelColorGradingControls.tsx",
       "packages/studio/src/components/editor/FileTreeNodes.tsx",
       "packages/studio/src/components/editor/LayersPanel.tsx",
       "packages/studio/src/components/editor/MotionPathNode.tsx",
@@ -748,13 +890,15 @@
       "packages/studio/src/components/sidebar/AudioRow.tsx",
       "packages/studio/src/components/sidebar/BlocksTab.tsx",
       "packages/studio/src/components/sidebar/CompositionsTab.tsx",
-      "packages/studio/src/components/sidebar/LeftSidebar.tsx",
-      "packages/studio/src/components/storyboard/StoryboardLoaded.tsx",
-      "packages/studio/src/components/StudioRightPanel.tsx",
+      "packages/studio/src/components/StudioRightPanels.tsx",
       "packages/studio/src/components/StudioToast.tsx",
       "packages/studio/src/components/ui/Tooltip.tsx",
       "packages/studio/src/components/ui/useDialogBehavior.ts",
       "packages/studio/src/hooks/useAppHotkeys.ts",
+      // dispatchModifierKey/dispatchPlainKey moved verbatim out of the
+      // already-suppressed useAppHotkeys.ts above, to keep that file under
+      // the 600-line cap. Same pre-existing complexity, new file path.
+      "packages/studio/src/hooks/appHotkeysDispatch.ts",
       "packages/studio/src/hooks/useCaptionDetection.ts",
       "packages/studio/src/hooks/useFileManager.ts",
       "packages/studio/src/hooks/useFrameCapture.ts",
@@ -818,6 +962,11 @@
       // file-level fingerprint invalidation re-flags the inherited findings even at
       // unchanged line numbers.
       "packages/core/src/runtime/picker.ts",
+      // generate-catalog-payloads.ts: hostsOwnDirectory, parseArgs and generate (the
+      // former main body, moved unchanged) are untouched. buildPayload's canvas-draw-element branch now writes a marker
+      // via a small writePayload helper instead of dropping the payload, but at
+      // the same branch count — its flagged 14-branch CRAP score predates this PR.
+      "scripts/generate-catalog-payloads.ts",
     ],
   },
 }

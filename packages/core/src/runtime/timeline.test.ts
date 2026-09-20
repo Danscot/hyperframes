@@ -1,13 +1,39 @@
+import { DEFAULT_IMAGE_TIMELINE_DURATION_SECONDS } from "@hyperframes/parsers/media-duration";
 import { describe, it, expect, afterEach } from "vitest";
 import { collectRuntimeTimelinePayload } from "./timeline";
+
+type TimelineTestWindow = Window & {
+  __timelines?: Record<string, { duration: () => number }>;
+};
 
 describe("collectRuntimeTimelinePayload", () => {
   afterEach(() => {
     document.body.innerHTML = "";
-    delete (window as any).__timelines;
+    delete (window as TimelineTestWindow).__timelines;
   });
 
   const defaultParams = { canonicalFps: 30 };
+
+  function appendTimedCompositionClip(
+    id: string,
+    duration: string,
+    authoredDuration?: string,
+  ): HTMLDivElement {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+    const clip = document.createElement("div");
+    clip.id = id;
+    clip.setAttribute("data-composition-id", id);
+    clip.setAttribute("data-start", "0");
+    clip.setAttribute("data-duration", duration);
+    if (authoredDuration != null) {
+      clip.setAttribute("data-hf-authored-duration", authoredDuration);
+    }
+    root.appendChild(clip);
+    return clip;
+  }
 
   it("returns minimal payload for empty document", () => {
     const result = collectRuntimeTimelinePayload(defaultParams);
@@ -301,6 +327,41 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.clips[0].kind).toBe("image");
   });
 
+  it("gives a timed image with no data-duration the dropped-image default, not the composition remainder", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+
+    const timed = document.createElement("img");
+    timed.id = "timed";
+    timed.setAttribute("data-start", "2");
+    root.appendChild(timed);
+
+    const timedClip = collectRuntimeTimelinePayload(defaultParams).clips.find(
+      (c) => c.id === "timed",
+    );
+    expect([timedClip?.start, timedClip?.duration]).toEqual([
+      2,
+      DEFAULT_IMAGE_TIMELINE_DURATION_SECONDS,
+    ]);
+  });
+
+  it("trims a timed image with data-end and no data-duration to end minus start", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+    const img = document.createElement("img");
+    img.id = "trimmed";
+    img.setAttribute("data-start", "2");
+    img.setAttribute("data-end", "6");
+    root.appendChild(img);
+
+    const clip = collectRuntimeTimelinePayload(defaultParams).clips.find((c) => c.id === "trimmed");
+    expect([clip?.start, clip?.duration]).toEqual([2, 4]);
+  });
+
   it("identifies composition clips", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -338,6 +399,46 @@ describe("collectRuntimeTimelinePayload", () => {
     const clip = collectRuntimeTimelinePayload(defaultParams).clips[0];
     expect(clip.playbackStart).toBe(0);
     expect(clip.playbackRate).toBe(1);
+  });
+
+  it.each([
+    [0, 2, 5],
+    [2, 2, 4],
+    [2, 0.01, 80],
+    [2, 20, 0.8],
+    [0, "2x", 5],
+    [0, "0x2", 10],
+  ])("rate-scales natural media duration (start=%s rate=%s)", (mediaStart, rate, expected) => {
+    document.body.innerHTML = '<div data-composition-id="main" data-duration="100"></div>';
+    const root = document.body.firstElementChild!;
+    const video = document.createElement("video");
+    video.id = "natural";
+    video.setAttribute("data-start", "0");
+    video.setAttribute("data-media-start", String(mediaStart));
+    video.setAttribute("data-playback-rate", String(rate));
+    Object.defineProperty(video, "duration", { value: 10, configurable: true });
+    root.appendChild(video);
+    expect(collectRuntimeTimelinePayload(defaultParams).clips[0].duration).toBeCloseTo(expected);
+  });
+
+  it.each([10, 11])(
+    "does not replace a known zero media span with root duration (start=%s)",
+    (start) => {
+      document.body.innerHTML = '<div data-composition-id="main" data-duration="100"></div>';
+      const video = document.createElement("video");
+      video.id = "at-eof";
+      video.setAttribute("data-start", "0");
+      video.setAttribute("data-media-start", String(start));
+      Object.defineProperty(video, "duration", { value: 10, configurable: true });
+      document.body.firstElementChild!.appendChild(video);
+      expect(collectRuntimeTimelinePayload(defaultParams).clips).toEqual([]);
+    },
+  );
+
+  it("keeps explicit media duration ahead of natural rate scaling", () => {
+    document.body.innerHTML =
+      '<div data-composition-id="main" data-duration="100"><video id="v" data-start="0" data-duration="7" data-playback-rate="2"></video></div>';
+    expect(collectRuntimeTimelinePayload(defaultParams).clips[0].duration).toBe(7);
   });
 
   it("collects scenes from composition nodes", () => {
@@ -623,6 +724,26 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(starts["slide-3"]).toBe(26);
     expect(result.durationInFrames).toBe(42 * 30);
   });
+
+  it("uses preserved duration when a normalized timeline clip retains public zero", () => {
+    const clip = appendTimedCompositionClip("normalized-zero", "0", "3.5");
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.clips.find((candidate) => candidate.id === clip.id)?.duration).toBe(3.5);
+  });
+
+  it.each(["0", "-2"])(
+    "drops an explicit nonpositive duration %s before timeline fallback",
+    (duration) => {
+      const clip = appendTimedCompositionClip("invalid-window", duration);
+      (window as TimelineTestWindow).__timelines = {
+        "invalid-window": { duration: () => 5 },
+      };
+
+      const result = collectRuntimeTimelinePayload(defaultParams);
+      expect(result.clips.find((candidate) => candidate.id === clip.id)).toBeUndefined();
+    },
+  );
 
   it("discovers GSAP-animated scene elements via timeline introspection", () => {
     const root = document.createElement("div");

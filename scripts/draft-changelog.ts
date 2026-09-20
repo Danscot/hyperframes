@@ -11,6 +11,14 @@ import {
   validateCliVersion,
   type InlineValueOption,
 } from "./cli-options.ts";
+import { CHANGELOG_REVIEW_TODO, CHANGELOG_STYLE_NOTE, compareSemver } from "./set-version.ts";
+
+/**
+ * The generator only ever produces mechanical bullets from commit subjects. The
+ * human-written summary is the one place it controls the *shape* of the prose,
+ * so the placeholder carries the writing bar rather than a bare TODO.
+ */
+const REVIEW_SUMMARY_BLOCK = [CHANGELOG_REVIEW_TODO, CHANGELOG_STYLE_NOTE].join("\n");
 
 const ROOT = join(import.meta.dirname, "..");
 const REPO_URL = "https://github.com/heygen-com/hyperframes";
@@ -100,7 +108,7 @@ function main() {
 function createDraft(options: Options): DraftOutput {
   const versionTag = `v${options.version}`;
   const to = options.to ?? (tagExists(versionTag) ? versionTag : "HEAD");
-  const from = options.from ?? resolvePreviousTag(versionTag, to);
+  const from = options.from ?? resolvePreviousTag(versionTag, to, options.version);
   const commits = getCommits(from, to).filter((commit) => !shouldSkipCommit(commit));
   const parsedCommits = commits.map(parseCommit);
 
@@ -204,15 +212,64 @@ function tagExists(tag: string) {
   }
 }
 
-function resolvePreviousTag(versionTag: string, to: string) {
+function resolvePreviousTag(versionTag: string, to: string, version: string) {
+  const ref = tagExists(versionTag) ? `${versionTag}^` : to;
+  let from: string;
   try {
-    if (tagExists(versionTag)) {
-      return git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", `${versionTag}^`]);
-    }
-    return git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", to]);
+    from = git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", ref]);
   } catch {
     fail("Could not resolve the previous release tag. Pass --from <tag> explicitly.");
   }
+  // Only guards an auto-resolved baseline; an explicit --from never reaches here.
+  assertNoSkippedTags(from, version);
+  return from;
+}
+
+/**
+ * Stable tags that belong between `from` and the release being drafted.
+ *
+ * `git describe` only ever returns a tag *reachable* from its argument, so a
+ * tag in this range means describe could not reach it and silently fell back
+ * to an older baseline. That happens when a local tag points at a commit that
+ * is not in this history: `release:prepare` creates `vX.Y.Z` locally at the
+ * branch commit, then the publish workflow creates the same tag at the merge
+ * SHA, and after a squash merge those differ. `git fetch --tags` will not move
+ * a tag that already exists locally, so the stale one survives and the next
+ * draft re-lists every commit of the release it skipped.
+ */
+export function findSkippedReleaseTags(
+  stableVersions: string[],
+  from: string,
+  version: string,
+): string[] {
+  const fromVersion = from.replace(/^v/, "");
+  return stableVersions
+    .filter((tag) => compareSemver(tag, fromVersion) > 0 && compareSemver(tag, version) < 0)
+    .sort(compareSemver);
+}
+
+/** Stable `vX.Y.Z` tags in this worktree; prereleases carry a `-` and are excluded. */
+function listStableTags(): string[] {
+  try {
+    return git(["tag", "--list", "v[0-9]*"])
+      .split("\n")
+      .filter((tag) => tag && !tag.includes("-"))
+      .map((tag) => tag.replace(/^v/, ""));
+  } catch {
+    return [];
+  }
+}
+
+function assertNoSkippedTags(from: string, version: string) {
+  const skipped = findSkippedReleaseTags(listStableTags(), from, version);
+  if (skipped.length === 0) return;
+  const names = skipped.map((tag) => `v${tag}`).join(", ");
+  fail(
+    `Baseline v${from.replace(/^v/, "")} skips ${names} — tagged locally, but not in this history.\n` +
+      "Those tags are stale, so the draft would re-list work that already shipped.\n\n" +
+      "  git fetch origin --tags --force\n\n" +
+      "Then re-run. Pass --from <tag> to override when the baseline is deliberate.",
+  );
 }
 
 function getCommits(from: string, to: string): RawCommit[] {
@@ -265,12 +322,8 @@ export function parseConventionalSubject(subject: string): ParsedSubject {
     };
   }
 
-  return {
-    type: match[1],
-    scope: match[2],
-    summary: match[4],
-    breaking: match[3] === "!",
-  };
+  const [, type = "other", scope, breaking, summary = subject] = match;
+  return { type, scope, summary, breaking: breaking === "!" };
 }
 
 function extractPrNumber(subject: string) {
@@ -327,7 +380,7 @@ function renderReleaseNotes(version: string, date: string, from: string, commits
     "",
     `Released on ${date}.`,
     "",
-    "<!-- TODO: write a 1-2 sentence release summary here. -->",
+    REVIEW_SUMMARY_BLOCK,
     "",
     sections,
     "",
@@ -348,7 +401,7 @@ function renderDocsUpdate(version: string, date: string, from: string, commits: 
     `  description="Released - ${date}"`,
     `  tags={${renderTagsLiteral(tags)}}`,
     ">",
-    "<!-- TODO: write a 1-2 sentence release summary here. -->",
+    REVIEW_SUMMARY_BLOCK,
     "",
     sections,
     "",
@@ -381,7 +434,7 @@ export function renderCommitBullet(commit: ParsedCommit) {
     links.push(`[#${commit.prNumber}](${REPO_URL}/pull/${commit.prNumber})`);
   }
 
-  return `- ${scope}${capitalize(commit.summary)} (${links.join(", ")})`;
+  return `- ${scope}${capitalize(commit.summary)} (${links.join(", ")}).`;
 }
 
 export function renderMdxCommitBullet(commit: ParsedCommit) {
@@ -391,7 +444,7 @@ export function renderMdxCommitBullet(commit: ParsedCommit) {
     links.push(`[#${commit.prNumber}](${REPO_URL}/pull/${commit.prNumber})`);
   }
 
-  return `- ${scope}${escapeForMdx(capitalize(commit.summary))} (${links.join(", ")})`;
+  return `- ${scope}${escapeForMdx(capitalize(commit.summary))} (${links.join(", ")}).`;
 }
 
 function renderTags(commits: ParsedCommit[]) {
@@ -436,7 +489,7 @@ function capitalize(value: string) {
   if (!value) {
     return value;
   }
-  return value[0].toUpperCase() + value.slice(1);
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function renderTagsLiteral(tags: string[]) {

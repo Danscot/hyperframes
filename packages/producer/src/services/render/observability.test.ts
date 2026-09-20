@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { CaptureStageError, getCaptureStageBrowserConsole } from "./captureStageError.js";
+import {
+  CaptureStageError,
+  getCaptureStageBrowserConsole,
+  wrapCaptureStageError,
+} from "./captureStageError.js";
+import { EncoderInterruptedError } from "./encoderInterruption.js";
 import {
   computeCompositionObservabilityHash,
   observeRenderStage,
@@ -82,6 +87,11 @@ describe("sanitizeObservationMessage", () => {
 });
 
 describe("CaptureStageError", () => {
+  it("preserves a typed encoder interruption through capture wrapping", () => {
+    const cause = new EncoderInterruptedError("Streaming encode failed", "private stderr");
+    expect(wrapCaptureStageError(cause, ["console output"])).toBe(cause);
+  });
+
   it("preserves the original message and browser console diagnostics", () => {
     const cause = new Error("Navigation timeout of 60000 ms exceeded");
     const browserConsole = ["[FrameCapture:ERROR] page.goto failed"];
@@ -405,5 +415,64 @@ describe("RenderObservabilityRecorder", () => {
         status: "error",
       }),
     );
+  });
+});
+
+describe("init observability fallback (parallel workers)", () => {
+  const makeRecorder = () =>
+    new RenderObservabilityRecorder({ renderJobId: "render-par", pipelineStartMs: Date.now() });
+
+  it("uses the structured fallback when the console has no INIT line — the parallel success path", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: ["[FrameCapture:NAV] page.goto start"],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+      initFallback: { initDurationMs: 850, tweenCount: 1200, elementCount: 3400 },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 850, tweenCount: 1200, elementCount: 3400 });
+  });
+
+  it("max-merges console INIT lines over the fallback, matching multi-session semantics", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: [
+        "[FrameCapture:INIT] complete initDurationMs=1234 tweenCount=42 elementCount=5000",
+      ],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+      initFallback: { initDurationMs: 850, tweenCount: 1200, elementCount: 3400 },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 1234, tweenCount: 1200, elementCount: 5000 });
+  });
+
+  // The single-session path has no structured fallback — it parses the console
+  // line only. This is the path that covers renders the routing gate cannot
+  // measure, so the element count must survive it.
+  // The collector omits `elementCount=` entirely when the page.evaluate that
+  // measures it failed, rather than emitting 0 — a 0 there is
+  // indistinguishable from a legitimately empty comp, and evaluate failures
+  // concentrate on exactly the huge-DOM tail this field exists to observe.
+  it("leaves elementCount absent when the INIT line omits it (measurement failed)", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: ["[FrameCapture:INIT] complete initDurationMs=90 tweenCount=7"],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 90, tweenCount: 7, elementCount: undefined });
+    expect(summary.init?.elementCount).not.toBe(0);
+  });
+
+  it("parses elementCount from the console INIT line with no fallback at all", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: [
+        "[FrameCapture:INIT] complete initDurationMs=90 tweenCount=7 elementCount=1420",
+      ],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 90, tweenCount: 7, elementCount: 1420 });
+  });
+
+  it("stays undefined when neither source has anything", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: [],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+    });
+    expect(summary.init).toBeUndefined();
   });
 });

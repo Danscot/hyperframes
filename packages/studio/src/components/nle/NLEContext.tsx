@@ -1,25 +1,14 @@
-import {
-  createContext,
-  useContext,
-  useState,
-  useCallback,
-  useRef,
-  useEffect,
-  type ReactNode,
-} from "react";
+import { buildProjectApiPath } from "../../utils/projectRouting";
+import { useContext, useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { useTimelinePlayer, usePlayerStore } from "../../player";
 import type { TimelineElement } from "../../player";
+import type { PreviewIframeSlot } from "../../player/hooks/useTimelineSyncCallbacks";
 import type { CompositionLevel } from "./CompositionBreadcrumb";
 import { useCompositionStack } from "./useCompositionStack";
-import { MIN_TIMELINE_H, MIN_PREVIEW_H } from "./TimelineResizeDivider";
 import { setCompositionSourceMap } from "../editor/domEditingDom";
 import { ensureMotionPathPluginLoaded } from "../../utils/gsapSoftReload";
-import { readStudioUiPreferences, writeStudioUiPreferences } from "../../utils/studioUiPreferences";
 import { useAssetPreviewStore } from "../../utils/assetPreviewStore";
-
-// Timeline gets a generous default height so the preview isn't oversized and the
-// tracks have room to breathe (CapCut-style). Users can still drag the divider.
-const DEFAULT_TIMELINE_H = 340;
+import { createStableContext } from "../../utils/hmrStableContext";
 
 export function shouldDisableTimelineWhileCompositionLoading(compositionLoading: boolean): boolean {
   return compositionLoading;
@@ -33,6 +22,14 @@ export interface NLEContextValue {
   seek: (time: number, options?: { keepPlaying?: boolean }) => boolean;
   refreshPlayer: () => void;
   onIframeLoad: () => void;
+  // The hidden reload iframe NLEPreview renders next to the live one during a full reload.
+  previewSlots: PreviewIframeSlot[];
+  onShadowIframeLoad: (gen: number) => void;
+  onShadowReadyChange: (gen: number, ready: boolean) => void;
+  onShadowError: (gen: number, message: string) => void;
+  setShadowIframeNode: (node: HTMLIFrameElement | null) => void;
+  resetPreviewSlots: () => void;
+  containerRef: React.MutableRefObject<HTMLDivElement | null>;
   // composition stack (from useCompositionStack)
   compositionStack: CompositionLevel[];
   updateCompositionStack: React.Dispatch<React.SetStateAction<CompositionLevel[]>>;
@@ -40,21 +37,18 @@ export interface NLEContextValue {
   handleDrillDown: (element: TimelineElement) => void;
   compIdToSrc: Map<string, string>;
   // layout state
-  timelineH: number;
-  setTimelineH: React.Dispatch<React.SetStateAction<number>>;
-  persistTimelineH: (height: number) => void;
-  containerRef: React.RefObject<HTMLDivElement | null>;
   // composition loading
   compositionLoading: boolean;
   setCompositionLoading: (loading: boolean) => void;
   timelineDisabled: boolean;
+  timelineSessionEpoch: number;
   hasLoadedOnceRef: React.MutableRefObject<boolean>;
   // preview composition size (for preview block drop)
   previewCompositionSize: { width: number; height: number } | null;
   setPreviewCompositionSize: (size: { width: number; height: number } | null) => void;
 }
 
-const NLEContext = createContext<NLEContextValue | null>(null);
+const NLEContext = createStableContext<NLEContextValue | null>("NLEContext", null);
 
 export function useNLEContext(): NLEContextValue {
   const ctx = useContext(NLEContext);
@@ -70,6 +64,8 @@ export interface NLEProviderProps {
   onCompositionChange?: (compositionPath: string | null) => void;
   onCompIdToSrcChange?: (map: Map<string, string>) => void;
   onCompositionLoadingChange?: (loading: boolean) => void;
+  /** A preview reload was abandoned; the previous preview is still showing. */
+  onPreviewReloadFailed?: (message: string) => void;
   children: ReactNode;
 }
 
@@ -81,15 +77,27 @@ export function NLEProvider({
   onCompositionChange,
   onCompIdToSrcChange,
   onCompositionLoadingChange,
+  onPreviewReloadFailed,
   children,
 }: NLEProviderProps) {
+  const shadowPromotedRef = useRef<() => void>(() => {});
+  const containerRef = useRef<HTMLDivElement>(null);
   const {
     iframeRef,
     togglePlay,
     seek,
     onIframeLoad: baseOnIframeLoad,
     refreshPlayer,
-  } = useTimelinePlayer();
+    previewSlots,
+    onShadowIframeLoad,
+    onShadowReadyChange,
+    onShadowError,
+    setShadowIframeNode,
+    resetPreviewSlots,
+  } = useTimelinePlayer({
+    onShadowPromoted: () => shadowPromotedRef.current(),
+    onPreviewReloadFailed,
+  });
 
   // Reset timeline state when the project changes. Done in an effect, not during
   // render: reset() updates the player store, and updating another store/component
@@ -103,7 +111,7 @@ export function NLEProvider({
   // project would otherwise keep rendering (and re-fetching from) the old project
   // after switching.
   useEffect(() => {
-    usePlayerStore.getState().reset();
+    usePlayerStore.getState().beginTimelineSession(projectId);
     useAssetPreviewStore.getState().clearPreviewAsset();
   }, [projectId]);
 
@@ -122,14 +130,20 @@ export function NLEProvider({
     refreshPlayer();
   }, [refreshKey, refreshPlayer]);
 
-  const onIframeLoad = useCallback(() => {
-    baseOnIframeLoad();
+  // Steps that follow every load of the live iframe, including a reload promoted in place.
+  const afterLiveIframeLoad = useCallback(() => {
     // Pre-load + register MotionPathPlugin once so adding a motion path in the
     // studio doesn't take the async plugin-load flash path on the first soft
     // reload (the comp may not ship the plugin until it actually uses one).
     ensureMotionPathPluginLoaded(iframeRef.current);
     onIframeRef?.(iframeRef.current);
-  }, [baseOnIframeLoad, iframeRef, onIframeRef]);
+  }, [iframeRef, onIframeRef]);
+  shadowPromotedRef.current = afterLiveIframeLoad;
+
+  const onIframeLoad = useCallback(() => {
+    baseOnIframeLoad();
+    afterLiveIframeLoad();
+  }, [baseOnIframeLoad, afterLiveIframeLoad]);
 
   const {
     compositionStack,
@@ -191,7 +205,7 @@ export function NLEProvider({
     setCompositionSourceMap(emptyMap);
     onCompIdToSrcChangeRef.current?.(emptyMap);
 
-    fetch(`/api/projects/${projectId}/files/index.html`, {
+    fetch(buildProjectApiPath(projectId, `/files/index.html`), {
       signal: controller.signal,
     })
       .then((r) => {
@@ -261,26 +275,6 @@ export function NLEProvider({
     });
   }, [compIdToSrc]);
 
-  // Resizable timeline height — persisted alongside zoom/pan so the user's
-  // workspace layout survives reloads.
-  const [timelineH, setTimelineH] = useState(() => {
-    const stored = readStudioUiPreferences().timelineHeight;
-    return stored !== undefined && stored >= MIN_TIMELINE_H ? stored : DEFAULT_TIMELINE_H;
-  });
-  const persistTimelineH = useCallback((height: number) => {
-    writeStudioUiPreferences({ timelineHeight: Math.round(height) });
-  }, []);
-  const containerRef = useRef<HTMLDivElement>(null);
-  // A height persisted on a tall window can exceed this window's container and
-  // collapse the flex-1 preview to 0px — clamp once the container is measurable
-  // (the drag/keyboard paths already clamp; the restore path must too).
-  useEffect(() => {
-    const containerH = containerRef.current?.getBoundingClientRect().height;
-    if (!containerH) return;
-    const max = containerH - MIN_PREVIEW_H;
-    setTimelineH((prev) => (prev > max ? Math.max(MIN_TIMELINE_H, max) : prev));
-  }, []);
-
   const hasLoadedOnceRef = useRef(false);
   const [compositionLoading, setCompositionLoadingRaw] = useState(true);
   const setCompositionLoading = useCallback((loading: boolean) => {
@@ -289,6 +283,7 @@ export function NLEProvider({
     setCompositionLoadingRaw(loading);
   }, []);
   const timelineDisabled = shouldDisableTimelineWhileCompositionLoading(compositionLoading);
+  const timelineSessionEpoch = usePlayerStore((state) => state.timelineSessionEpoch);
 
   useEffect(() => {
     onCompositionLoadingChange?.(compositionLoading);
@@ -303,22 +298,26 @@ export function NLEProvider({
   const value: NLEContextValue = {
     projectId,
     iframeRef,
+    containerRef,
     togglePlay,
     seek,
     refreshPlayer,
     onIframeLoad,
+    previewSlots,
+    onShadowIframeLoad,
+    onShadowReadyChange,
+    onShadowError,
+    setShadowIframeNode,
+    resetPreviewSlots,
     compositionStack,
     updateCompositionStack,
     handleNavigateComposition,
     handleDrillDown,
     compIdToSrc,
-    timelineH,
-    setTimelineH,
-    persistTimelineH,
-    containerRef,
     compositionLoading,
     setCompositionLoading,
     timelineDisabled,
+    timelineSessionEpoch,
     hasLoadedOnceRef,
     previewCompositionSize,
     setPreviewCompositionSize,

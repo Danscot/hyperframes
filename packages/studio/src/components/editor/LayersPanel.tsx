@@ -1,3 +1,4 @@
+import { useLivePreviewIframe } from "../../player/store/previewIframeStore";
 import { memo, useState, useCallback, useEffect, useRef } from "react";
 import {
   collectDomEditLayerItems,
@@ -22,6 +23,9 @@ import { zReorderCoalesceKey } from "../../hooks/useElementLifecycleOps";
 import { useLayerReorderTimelineMirror } from "../nle/useCanvasZOrderTimelineMirror";
 import { runZLaneGesture } from "../nle/zLaneGesture";
 import { useLayerRevealOverride } from "./useLayerRevealOverride";
+
+// Rows this panel renders before it stops. A display budget, not a document limit.
+const LAYERS_PANEL_MAX_ROWS = 80;
 
 const TAG_ICONS: Record<string, string> = {
   video: "Vi",
@@ -119,6 +123,7 @@ export const LayersPanel = memo(function LayersPanel() {
 
   const isMasterView = !activeCompPath || activeCompPath === "index.html";
 
+  const livePreviewIframe = useLivePreviewIframe();
   const collectLayers = useCallback(() => {
     const iframe = previewIframeRef.current;
     if (!iframe) return;
@@ -137,17 +142,19 @@ export const LayersPanel = memo(function LayersPanel() {
     // A preview reload detaches the drilled-into wrapper; exit drill-in if so.
     if (activeGroupElement && !activeGroupElement.isConnected) setActiveGroupElement(null);
 
-    const items = collectDomEditLayerItems(root, {
-      activeCompositionPath: activeCompPath,
-      isMasterView,
-      activeGroupElement,
-    });
+    const items = collectDomEditLayerItems(
+      root,
+      { activeCompositionPath: activeCompPath, isMasterView, activeGroupElement },
+      // How many rows this panel is willing to render, nothing more. Hit-testing
+      // callers deliberately take the whole document instead.
+      LAYERS_PANEL_MAX_ROWS,
+    );
     setLayers(sortLayersByZIndex(items));
   }, [previewIframeRef, activeCompPath, isMasterView, activeGroupElement, setActiveGroupElement]);
 
   useEffect(() => {
     collectLayers();
-  }, [collectLayers, refreshKey, zEditVersion]);
+  }, [collectLayers, refreshKey, zEditVersion, livePreviewIframe]);
 
   useEffect(() => {
     const iframe = previewIframeRef.current;
@@ -158,7 +165,7 @@ export const LayersPanel = memo(function LayersPanel() {
     };
     iframe.addEventListener("load", handleLoad);
     return () => iframe.removeEventListener("load", handleLoad);
-  }, [previewIframeRef, collectLayers]);
+  }, [previewIframeRef, livePreviewIframe, collectLayers]);
 
   useEffect(() => {
     if (!compositionLoading) {
@@ -464,14 +471,23 @@ export const LayersPanel = memo(function LayersPanel() {
                   : selected
                     ? "bg-panel-accent/14 text-panel-accent"
                     : "text-panel-text-2 hover:bg-panel-hover/40 hover:text-panel-text-1"
-              } ${dragKey ? "cursor-grabbing" : draggable ? "cursor-pointer" : "cursor-not-allowed opacity-50"}`}
+              } ${dragKey ? "cursor-grabbing" : "cursor-pointer"}`}
               style={{ paddingLeft: 8 + layer.depth * 16 }}
+              title={
+                draggable
+                  ? layer.element.hasAttribute("data-hf-group")
+                    ? "Double-click to enter group"
+                    : undefined
+                  : "This layer can't be reordered"
+              }
             >
               {hasChildren ? (
                 <button
                   type="button"
                   onClick={(e) => toggleCollapse(layer.key, e)}
-                  className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded text-neutral-500 hover:text-neutral-300"
+                  aria-expanded={!isCollapsed}
+                  aria-label={isCollapsed ? "Expand children" : "Collapse children"}
+                  className="relative flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-neutral-500 hover:text-neutral-300 before:absolute before:-inset-1.5 before:content-['']"
                 >
                   <svg
                     width="8"
@@ -484,10 +500,10 @@ export const LayersPanel = memo(function LayersPanel() {
                   </svg>
                 </button>
               ) : (
-                <span className="w-4 flex-shrink-0" />
+                <span className="w-4 shrink-0" />
               )}
               <span
-                className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-[8px] font-bold uppercase ${
+                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded text-[8px] font-bold uppercase ${
                   selected
                     ? "bg-panel-accent/18 text-panel-accent"
                     : isCompHost

@@ -1,3 +1,4 @@
+import { setCommandExitCode } from "../utils/commandResult.js";
 import { defineCommand } from "citty";
 import type { Example } from "./_examples.js";
 import { existsSync, readFileSync } from "node:fs";
@@ -46,6 +47,7 @@ import {
   decideMediaProxyEligibility,
   isProxyVariantRequest,
   probeAssetCodec,
+  recordProxyRequest,
   resolveProxyVariantRequest,
   PROXY_VARIANT_CONFIG,
 } from "@hyperframes/studio-server/media-codec-map";
@@ -86,7 +88,7 @@ export default defineCommand({
     // Validation: --user-data-dir requires --browser-path
     if (args["user-data-dir"] && !args["browser-path"]) {
       clack.log.error("--user-data-dir requires --browser-path");
-      process.exitCode = 1;
+      setCommandExitCode(1);
       return;
     }
     // Validation: --remote-debugging-port deps
@@ -97,7 +99,7 @@ export default defineCommand({
     });
     if (depsError) {
       clack.log.error(depsError);
-      process.exitCode = 1;
+      setCommandExitCode(1);
       return;
     }
     // Parse --remote-debugging-port before any server setup so an invalid value
@@ -109,7 +111,7 @@ export default defineCommand({
       );
     } catch (err) {
       clack.log.error((err as Error).message);
-      process.exitCode = 1;
+      setCommandExitCode(1);
       return;
     }
 
@@ -117,7 +119,7 @@ export default defineCommand({
     const runtimePath = resolveRuntimePath();
     if (!runtimePath) {
       clack.log.error("HyperFrames runtime not found. Run `bun run build` first.");
-      process.exitCode = 1;
+      setCommandExitCode(1);
       return;
     }
 
@@ -127,7 +129,7 @@ export default defineCommand({
       clack.log.error(
         "@hyperframes/player not found. Run `bun run --cwd packages/player build` first.",
       );
-      process.exitCode = 1;
+      setCommandExitCode(1);
       return;
     }
 
@@ -247,6 +249,7 @@ export async function registerCompositionRoute(
         if (!proxyVariant) {
           return ctx.text("Media proxy variant does not match asset", 422);
         }
+        recordProxyRequest();
         const proxyPath = await resolveProxy(project.dir, filePath, proxyVariant);
         return buildRangeResponse(
           proxyPath,

@@ -12,6 +12,19 @@ import {
 } from "./propertyPanelHelpers";
 import { FlatSelectRow, FlatSlider } from "./propertyPanelFlatPrimitives";
 import { FlatToggle } from "./propertyPanelFlatToggle";
+import { AutomationToggle } from "./propertyPanelFxControls";
+import { RATE_RANGE } from "@hyperframes/core/audio-automation";
+import { type SpeedPresetId } from "@hyperframes/core/speed-ramp";
+import { SPEED_PRESET_OPTIONS, type RateBinding } from "./useVolumeAutomation";
+import { fromUnit, toUnit } from "../../player/components/automationLaneGeometry";
+import {
+  AUDIO_GAIN_FADER_MAX,
+  AUDIO_GAIN_FADER_MIN,
+  audioFaderPositionToGain,
+  formatAudioGain,
+  audioGainToFaderPosition,
+  audioGainToText,
+} from "@hyperframes/core/audio-gain";
 
 // fallow-ignore-next-line complexity
 export function FlatMediaSection({
@@ -22,13 +35,27 @@ export function FlatMediaSection({
   onSetAttribute,
   onSetHtmlAttribute,
   onRemoveBackground,
+  volumeAutomated,
+  onAutomateVolume,
+  onRemoveVolumeAutomation,
+  onCommitVolumeAt,
+  automatedVolumeValue,
+  rate,
 }: {
   projectDir: string | null;
   element: DomEditSelection;
   styles: Record<string, string>;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
   onSetAttribute: (attr: string, value: string) => void | Promise<void>;
   onSetHtmlAttribute: (attr: string, value: string | null) => void | Promise<void>;
+  /** A volume lane in the timeline drives the level; the slider writes a keyframe instead. */
+  volumeAutomated?: boolean;
+  onAutomateVolume?: () => void;
+  onRemoveVolumeAutomation?: () => void;
+  onCommitVolumeAt?: (v: number) => void;
+  automatedVolumeValue?: number;
+  /** Speed lane binding and presets; absent outside the Studio panel. */
+  rate?: RateBinding;
   onRemoveBackground?: (
     inputPath: string,
     options: {
@@ -45,13 +72,21 @@ export function FlatMediaSection({
   const isVisualMedia = isVideo || isImage;
   const el = element.element;
 
-  const volume = parseNumericValue(element.dataAttributes.volume ?? "") ?? 1;
-  const volumePercent = Math.round(volume * 100);
+  // While a lane owns the level, the envelope's live value at the playhead is
+  // what the slider must show — the static attribute is only what the engine
+  // falls back to outside automation.
+  const volume =
+    volumeAutomated && automatedVolumeValue !== undefined
+      ? automatedVolumeValue
+      : (parseNumericValue(element.dataAttributes.volume ?? "") ?? 1);
+  const volumeFaderPosition = audioGainToFaderPosition(volume);
   const mediaStart =
     Number.parseFloat(
       element.dataAttributes["media-start"] ?? element.dataAttributes["playback-start"] ?? "0",
     ) || 0;
-  const playbackRate = Number.parseFloat(element.dataAttributes["playback-rate"] ?? "1") || 1;
+  const constantRate = Number.parseFloat(element.dataAttributes["playback-rate"] ?? "1") || 1;
+  const playbackRate =
+    rate?.automated && rate.automatedValue !== undefined ? rate.automatedValue : constantRate;
   const sourceDuration =
     Number.parseFloat(element.dataAttributes["source-duration"] ?? "") ||
     (el as HTMLMediaElement).duration ||
@@ -120,7 +155,7 @@ export function FlatMediaSection({
     <div className="space-y-1.5">
       <div className="flex min-h-8 items-center justify-between gap-2">
         <span className="flex min-w-0 items-center gap-2">
-          <span className="h-5 w-8 flex-shrink-0 rounded-[3px] bg-panel-surface" />
+          <span className="h-5 w-8 shrink-0 rounded-[3px] bg-panel-surface" />
           <span className="min-w-0 truncate font-mono text-[11px] text-panel-text-0">
             {srcAttr}
           </span>
@@ -135,14 +170,14 @@ export function FlatMediaSection({
               setTimeout(() => setCopied(false), 1500);
             });
           }}
-          className="flex flex-shrink-0 items-center gap-1 text-[10px] text-panel-text-3 hover:text-panel-text-1"
+          className="flex shrink-0 items-center gap-1 text-[10px] text-panel-text-3 hover:text-panel-text-1"
         >
           {copied ? <Check size={11} /> : <ClipboardList size={11} />}
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
       {isVisualMedia && (
-        <div className="ml-[1px] border-l-2 border-panel-border-input py-1 pl-[10px]">
+        <div className="ml-px border-l-2 border-panel-border-input py-1 pl-[10px]">
           <div className="flex min-h-6 items-center justify-between">
             <span className="flex items-baseline gap-[7px]">
               <span className="text-[11px] font-semibold text-panel-text-1">Cutout</span>
@@ -197,26 +232,78 @@ export function FlatMediaSection({
       )}
       {(isVideo || isAudio) && (
         <>
-          <FlatSlider
-            label="Volume"
-            value={volumePercent}
-            min={0}
-            max={100}
-            tier={volumePercent === 100 ? "default" : "explicitCustom"}
-            displayValue={`${volumePercent}%`}
-            onCommit={(next) => void onSetAttribute("volume", formatNumericValue(next / 100))}
-          />
-          <FlatSlider
-            label="Rate"
-            value={playbackRate * 100}
-            min={25}
-            max={300}
-            tier={playbackRate === 1 ? "default" : "explicitCustom"}
-            displayValue={`${formatNumericValue(playbackRate)}x`}
-            onCommit={(next) =>
-              void onSetAttribute("playback-rate", formatNumericValue(next / 100))
-            }
-          />
+          {/* While a lane owns the level, a commit writes a keyframe at the
+              playhead instead of the plain attribute — same slider, same
+              gesture, the write just goes through the envelope. */}
+          <div
+            className="hf-volume-row flex items-center gap-1"
+            data-volume-automated={volumeAutomated ? "" : undefined}
+          >
+            <div className="min-w-0 flex-1">
+              <FlatSlider
+                label="Volume"
+                value={volumeFaderPosition}
+                min={AUDIO_GAIN_FADER_MIN}
+                max={AUDIO_GAIN_FADER_MAX}
+                tier={volume === 1 ? "default" : "explicitCustom"}
+                displayValue={audioGainToText(volume)}
+                centerTick
+                onCommit={(next) => {
+                  const gain = audioFaderPositionToGain(next);
+                  if (volumeAutomated) {
+                    onCommitVolumeAt?.(gain);
+                  } else {
+                    void onSetAttribute("volume", formatAudioGain(gain));
+                  }
+                }}
+              />
+            </div>
+            <AutomationToggle
+              paramKey="volume"
+              label="Volume"
+              automated={Boolean(volumeAutomated)}
+              onAutomate={onAutomateVolume ? () => onAutomateVolume() : undefined}
+              onRemoveAutomation={
+                onRemoveVolumeAutomation ? () => onRemoveVolumeAutomation() : undefined
+              }
+            />
+          </div>
+          <div className="flex items-center gap-1">
+            <div className="min-w-0 flex-1">
+              <FlatSlider
+                label="Speed"
+                value={Math.round(toUnit(RATE_RANGE, playbackRate) * 1000)}
+                min={0}
+                max={1000}
+                tier={playbackRate === 1 ? "default" : "explicitCustom"}
+                displayValue={`${formatNumericValue(playbackRate)}x`}
+                onCommit={(next) => {
+                  const speed = fromUnit(RATE_RANGE, next / 1000);
+                  if (rate?.automated) {
+                    rate.onCommitAt(speed);
+                  } else {
+                    void onSetAttribute("playback-rate", formatNumericValue(speed));
+                  }
+                }}
+              />
+            </div>
+            <AutomationToggle
+              paramKey="rate"
+              label="Speed"
+              automated={Boolean(rate?.automated)}
+              onAutomate={rate ? () => rate.onAutomate() : undefined}
+              onRemoveAutomation={rate ? () => rate.onRemoveAutomation() : undefined}
+            />
+          </div>
+          {rate?.canApplyPreset && (
+            <FlatSelectRow
+              label="Speed preset"
+              value=""
+              options={[{ value: "", label: "Choose…" }, ...SPEED_PRESET_OPTIONS]}
+              tier="default"
+              onChange={(id) => id && rate.onApplyPreset(id as SpeedPresetId)}
+            />
+          )}
           <FlatSlider
             label="Media start"
             value={Math.round(mediaStart * 100)}

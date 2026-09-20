@@ -163,8 +163,27 @@ export function Transform3DCube({
     setDraft(null);
   };
 
+  const onKeyDown = (e: React.KeyboardEvent<SVGSVGElement>) => {
+    const STEP = e.altKey ? 1 : 5;
+    let next: CubePose | null = null;
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      const dir = e.key === "ArrowUp" ? -1 : 1;
+      next = e.shiftKey
+        ? { ...shown, rotationZ: wrapDeg(shown.rotationZ + dir * STEP) }
+        : { ...shown, rotationX: wrapDeg(shown.rotationX + dir * STEP) };
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      const dir = e.key === "ArrowRight" ? 1 : -1;
+      next = e.shiftKey
+        ? { ...shown, rotationZ: wrapDeg(shown.rotationZ + dir * STEP) }
+        : { ...shown, rotationY: wrapDeg(shown.rotationY + dir * STEP) };
+    }
+    if (!next) return;
+    e.preventDefault();
+    onPoseCommit(next);
+  };
+
   return (
-    <div className="relative overflow-hidden rounded-lg border border-neutral-800 bg-gradient-to-b from-neutral-900 to-neutral-950">
+    <div className="relative overflow-hidden rounded-lg border border-neutral-800 bg-linear-to-b from-neutral-900 to-neutral-950">
       <svg
         ref={svgRef}
         viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
@@ -174,8 +193,10 @@ export function Transform3DCube({
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
+        onKeyDown={onKeyDown}
+        tabIndex={0}
         role="slider"
-        aria-label="Drag to rotate in 3D; hold Shift to roll; scroll to change depth"
+        aria-label="3D rotation. Arrow keys rotate X/Y, Shift+arrows roll Z, Alt for fine steps; drag to rotate, scroll to change depth"
         aria-valuetext={`X ${Math.round(shown.rotationX)}°, Y ${Math.round(
           shown.rotationY,
         )}°, Z ${Math.round(shown.rotationZ)}°`}
@@ -273,7 +294,7 @@ export function Transform3DCube({
           onClick={onRecenter}
           title="Reset 3D orientation"
           aria-label="Reset 3D orientation"
-          className="absolute right-1.5 top-1.5 rounded p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+          className="absolute right-1.5 top-1.5 rounded-sm p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <circle cx="12" cy="12" r="9" strokeWidth="2" />

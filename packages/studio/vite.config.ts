@@ -1,9 +1,20 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
-import { readFileSync, readdirSync, existsSync, lstatSync, realpathSync } from "node:fs";
+import tailwindcss from "@tailwindcss/vite";
+import {
+  copyFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  lstatSync,
+  realpathSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { readNodeRequestBody } from "./vite.request-body.js";
-import { createViteAdapter, isPathWithin } from "./vite.adapter";
+import { watch } from "chokidar";
+import { createProjectSignatureCache, createViteAdapter } from "./vite.adapter";
+import { previewConfigPayload } from "./vite.preview-config";
+import { loadStudioServerDevModule } from "./vite.studio-server-module";
 
 async function loadRuntimeSourceForDev(
   server: import("vite").ViteDevServer,
@@ -22,6 +33,30 @@ async function loadRuntimeSourceForDev(
 }
 
 const studioPkg = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8"));
+
+/**
+ * Copies the build's one CSS asset, unhashed, to `dist/styles.css` for the
+ * `./styles.css` export. Throws if the build ever emits more than one.
+ */
+export function stableStylesCssPlugin(): Plugin {
+  return {
+    name: "studio-stable-styles-css",
+    writeBundle(options, bundle) {
+      const cssAssets = Object.values(bundle).filter(
+        (item) => item.type === "asset" && item.fileName.endsWith(".css"),
+      );
+      if (cssAssets.length !== 1) {
+        throw new Error(
+          `stableStylesCssPlugin: expected exactly one CSS asset for the ./styles.css ` +
+            `export, found ${cssAssets.length} (${cssAssets.map((a) => a.fileName).join(", ") || "none"}). ` +
+            `Scope this plugin to the entry stylesheet instead of assuming a single emit.`,
+        );
+      }
+      const outDir = options.dir ?? "dist";
+      copyFileSync(join(outDir, cssAssets[0]!.fileName), join(outDir, "styles.css"));
+    },
+  };
+}
 
 // ── Bridge Hono fetch → Node http response ───────────────────────────────────
 
@@ -62,26 +97,84 @@ function devProjectApi(): Plugin {
   return {
     name: "studio-dev-api",
     configureServer(server): void {
+      // Watch project directories on a watcher of our own. Vite's is told to
+      // ignore them (see `server.watch.ignored`), because it answers an html
+      // change with a full page reload; this one only announces the change and
+      // lets Studio decide what to do with it.
+      const realProjectPaths: string[] = [];
+      try {
+        for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
+          const full = join(dataDir, entry.name);
+          try {
+            realProjectPaths.push(lstatSync(full).isSymbolicLink() ? realpathSync(full) : full);
+          } catch {
+            /* skip broken symlinks */
+          }
+        }
+      } catch {
+        /* dataDir doesn't exist yet */
+      }
+
+      const projectWatcher = watch(realProjectPaths, {
+        ignoreInitial: true,
+        // A project write is a whole-file replace; wait for it to settle so a
+        // half-written composition is never announced.
+        awaitWriteFinish: { stabilityThreshold: 40, pollInterval: 10 },
+      });
+
+      // This watcher, and not Vite's, is what clears the preview signature.
+      // Vite's ignores `data/projects/**`, so subscribing the cache to it left
+      // the ETag frozen for the life of the dev server: the preview answered
+      // every revalidation with 304 and thumbnails regenerated after an edit
+      // still rendered the pre-edit composition. Every event type counts, since
+      // an added or deleted asset changes the signature as surely as an edit.
+      const signatureCache = createProjectSignatureCache({
+        watch: (projectDir) => void projectWatcher.add(projectDir),
+      });
+      for (const event of ["add", "change", "unlink", "addDir", "unlinkDir"] as const) {
+        projectWatcher.on(event, (filePath: string) => signatureCache.invalidate(filePath));
+      }
+
       let _api: { fetch: (req: Request) => Promise<Response> } | null = null;
       let _studioServerModule: {
         createStudioApi: (adapter: ReturnType<typeof createViteAdapter>) => {
           fetch: (req: Request) => Promise<Response>;
         };
-        consumeFileWriteReceipt?: (path: string) => {
-          path: string;
-          version: string;
-          writeToken: string;
-        } | null;
+        identifyFileWrite: (
+          path: string,
+          expectedVersion: string,
+        ) => { path: string; version: string; writeToken: string } | null;
+        fileContentVersion: (content: string) => string;
       } | null = null;
       const getApi = async () => {
         if (!_api) {
-          const mod = await server.ssrLoadModule("@hyperframes/studio-server");
-          _studioServerModule = mod as typeof _studioServerModule;
-          const adapter = createViteAdapter(dataDir, server);
+          // The package's `node` condition resolves to ignored dist output,
+          // which may predate the source under test. Studio dev owns a source
+          // workspace, so load that producer explicitly.
+          const mod = (await loadStudioServerDevModule(server, __dirname)) as NonNullable<
+            typeof _studioServerModule
+          >;
+          // The cast above is the only thing standing between a renamed export and
+          // a dev server that silently reports every Studio write as external.
+          for (const name of ["identifyFileWrite", "fileContentVersion"] as const) {
+            if (typeof mod[name] !== "function") {
+              throw new Error(`@hyperframes/studio-server dev module is missing ${name}()`);
+            }
+          }
+          _studioServerModule = mod;
+          const adapter = createViteAdapter(dataDir, server, signatureCache);
           _api = mod.createStudioApi(adapter);
         }
         return _api;
       };
+
+      server.middlewares.use((req, res, next) => {
+        if (req.url !== "/__hyperframes_config") return next();
+        const payload = previewConfigPayload(process.env, process.pid, studioPkg.version);
+        if (!payload) return next();
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(payload));
+      });
 
       // Runtime endpoint — prefer source build over dist artifact
       server.middlewares.use((req, res, next) => {
@@ -143,52 +236,53 @@ function devProjectApi(): Plugin {
         }
       });
 
-      // Watch project directories for file changes → HMR
-      const realProjectPaths: string[] = [];
-      try {
-        for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
-          const full = join(dataDir, entry.name);
-          try {
-            const real = lstatSync(full).isSymbolicLink() ? realpathSync(full) : full;
-            realProjectPaths.push(real);
-            server.watcher.add(real);
-          } catch {
-            /* skip broken symlinks */
-          }
-        }
-      } catch {
-        /* dataDir doesn't exist yet */
-      }
-
-      server.watcher.on("change", (filePath: string) => {
-        const isProjectFile = realProjectPaths.some((p) => isPathWithin(p, filePath));
+      projectWatcher.on("change", (filePath: string) => {
         if (
-          isProjectFile &&
-          (filePath.endsWith(".html") ||
-            filePath.endsWith(".css") ||
-            filePath.endsWith(".js") ||
-            filePath.endsWith(".json"))
-        ) {
-          console.log(`[Studio] File changed: ${filePath}`);
-          const receipt = _studioServerModule?.consumeFileWriteReceipt?.(filePath) ?? null;
-          server.ws.send({
-            type: "custom",
-            event: "hf:file-change",
-            data: receipt ?? { path: filePath },
-          });
+          !filePath.endsWith(".html") &&
+          !filePath.endsWith(".css") &&
+          !filePath.endsWith(".js") &&
+          !filePath.endsWith(".json")
+        )
+          return;
+        console.log(`[Studio] File changed: ${filePath}`);
+        // The receipt is matched on the file's current bytes, not just its path,
+        // so a write is only recognised as ours when the version agrees. Calling
+        // this without the version could never match, which left every Studio
+        // write looking external and reloaded the preview on each edit.
+        const studioServer = _studioServerModule;
+        let version: string | null = null;
+        try {
+          version = studioServer?.fileContentVersion(readFileSync(filePath, "utf-8")) ?? null;
+        } catch {
+          // A deletion has no current bytes to match a write receipt against.
         }
+        const receipt =
+          version && studioServer ? studioServer.identifyFileWrite(filePath, version) : null;
+        server.ws.send({
+          type: "custom",
+          event: "hf:file-change",
+          data: { path: filePath, version, ...receipt },
+        });
       });
+      server.httpServer?.on("close", () => void projectWatcher.close());
     },
   };
 }
 
 export default defineConfig({
-  plugins: [react(), devProjectApi()],
+  plugins: [react(), tailwindcss(), devProjectApi()],
   define: {
     __STUDIO_VERSION__: JSON.stringify(studioPkg.version),
   },
   resolve: {
     alias: {
+      // linkedom's HTMLCanvasElement constructor calls createCanvas(300, 150)
+      // from the Node-only `canvas` package, behind a
+      // `try { require('canvas') } catch { shim }` guard. A bundler resolves
+      // that require statically, so the catch never fires and createCanvas is
+      // undefined — every composition containing a <canvas> then throws inside
+      // openComposition and silently loses its SDK session. See the stub.
+      canvas: resolve(__dirname, "src/shims/canvasBrowserStub.js"),
       "@hyperframes/player": resolve(__dirname, "../player/src/hyperframes-player.ts"),
       "@hyperframes/studio-server/source-mutation": resolve(
         __dirname,
@@ -199,12 +293,27 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      // /assets/* caches by filename alone, immutably, for a year
+      // (studioServer.ts). Keep every hash; copy one CSS file, unhashed,
+      // to the dist ROOT instead for the ./styles.css export.
+      plugins: [stableStylesCssPlugin()],
+    },
   },
   optimizeDeps: {
     include: ["bpm-detective"],
   },
   server: {
     port: 5190,
+    watch: {
+      // A composition lives under this package's root, so Vite's HMR sees a
+      // write to one as an html page dependency changing and full-reloads the
+      // browser. That reload is the flash after every edit in the canvas, and
+      // it is not Studio's to make: the app already decides whether a write of
+      // its own needs the preview refreshed, and the plugin below announces
+      // project writes as `hf:file-change` off its own watcher.
+      ignored: ["**/data/projects/**"],
+    },
   },
   ssr: {
     // recast / @babel/parser are CommonJS and call `require("fs")`. They are

@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -46,6 +47,62 @@ afterEach(() => {
 });
 
 describe("mirrorGlobalSkills", () => {
+  it.each([
+    [
+      "absolute",
+      (home: string, source: string) => symlinkSync(source, join(home, ".cursor", "skills")),
+    ],
+    [
+      "relative",
+      (home: string) => symlinkSync("../.claude/skills", join(home, ".cursor", "skills")),
+    ],
+    ["intermediate", (home: string) => symlinkSync(".claude", join(home, ".cursor"))],
+  ])(
+    "fails closed when the target reaches the canonical store through a %s alias",
+    (_kind, alias) => {
+      const home = makeHome();
+      seedStore(home, ["hyperframes"]);
+      const source = join(home, ".claude", "skills");
+      if (_kind !== "intermediate") installMarker(home, ".cursor");
+      alias(home, source);
+
+      const result = mirrorGlobalSkills({
+        skills: ["hyperframes"],
+        home,
+        platform: "linux",
+        env: ENV,
+      });
+
+      expect(lstatSync(join(source, "hyperframes")).isDirectory()).toBe(true);
+      expect(readFileSync(join(source, "hyperframes", "SKILL.md"), "utf8")).toBe("# hyperframes\n");
+      expect(result.mirrored.map((entry) => entry.agent)).not.toContain("cursor");
+      expect(result.skipped).toContainEqual(
+        expect.objectContaining({ agent: "cursor", reason: "aliases_install_owned_store" }),
+      );
+    },
+  );
+
+  it("fails closed and reports an unresolvable self-loop before destructive mirroring", () => {
+    const home = makeHome();
+    seedStore(home, ["hyperframes"]);
+    installMarker(home, ".cursor");
+    symlinkSync("skills", join(home, ".cursor", "skills"));
+
+    const result = mirrorGlobalSkills({
+      skills: ["hyperframes"],
+      home,
+      platform: "linux",
+      env: ENV,
+    });
+
+    expect(readFileSync(join(home, ".claude", "skills", "hyperframes", "SKILL.md"), "utf8")).toBe(
+      "# hyperframes\n",
+    );
+    expect(result.skipped).toContainEqual(
+      expect.objectContaining({ agent: "cursor", reason: "unresolvable_target" }),
+    );
+  });
+
   it("no-ops when there is no global Claude store", () => {
     const home = makeHome();
     const result = mirrorGlobalSkills({
@@ -176,6 +233,30 @@ describe("mirrorGlobalSkills", () => {
     expect(mirrored.map((m) => m.agent)).toContain("cursor");
     const link = join(home, ".cursor", "skills", "hyperframes");
     expect(realpathSync(link)).toBe(realpathSync(join(home, ".claude", "skills", "hyperframes")));
+  });
+
+  // Pi natively discovers BOTH ~/.pi/agent/skills and the universal
+  // ~/.agents/skills (pi's packages/coding-agent/docs/skills.md#locations).
+  // A mirrored per-agent copy collides with the universal one and Pi skips
+  // the universal entry on name conflict (#3294), so the mirror must not fan
+  // out to it.
+  it("skips agents that natively read the universal store (pi, #3294)", () => {
+    const home = makeHome();
+    seedStore(home, ["hyperframes"]);
+    installMarker(home, ".pi/agent"); // Pi present
+    installMarker(home, ".cursor"); // a regular per-dir agent, for contrast
+
+    const { mirrored } = mirrorGlobalSkills({
+      skills: ["hyperframes"],
+      home,
+      platform: "linux",
+      env: ENV,
+    });
+    const agents = mirrored.map((m) => m.agent);
+    expect(agents).not.toContain("pi");
+    expect(agents).toContain("cursor");
+    // no per-agent copy created where the universal store already serves Pi
+    expect(existsSync(join(home, ".pi", "agent", "skills", "hyperframes"))).toBe(false);
   });
 });
 

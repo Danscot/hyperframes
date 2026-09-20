@@ -2,6 +2,8 @@ import { createStudioSaveHttpError } from "./studioSaveDiagnostics";
 import { serializeStudioFileMutation } from "./studioFileMutationCoordinator";
 import type { RecordEditInput } from "./studioFileHistory";
 import { buildProjectApiPath } from "./projectRouting";
+import { studioWriteHeaders } from "./studioFileVersion";
+import { deriveTimelineStoreKeyForDomId } from "../player/lib/timelineElementHelpers";
 
 interface TimelineCompositionInsertionResult {
   path: string;
@@ -34,7 +36,7 @@ async function insertTimelineComposition(input: {
     ),
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
       body: JSON.stringify({
         sourcePath: input.sourcePath,
         start: input.start,
@@ -75,7 +77,7 @@ export async function commitTimelineCompositionInsertion(input: {
       await input.writeFile(input.targetPath, result.before, result.after);
       throw error;
     }
-    input.selectHost(`${input.targetPath}#${result.hostId}`);
+    input.selectHost(deriveTimelineStoreKeyForDomId(result.hostId, input.targetPath));
     try {
       input.resync?.();
     } catch (error) {

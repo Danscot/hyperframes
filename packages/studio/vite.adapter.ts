@@ -1,3 +1,4 @@
+import { isValidProjectId } from "./src/utils/projectRouting";
 // Vite adapter that wires the shared Studio API to the local filesystem and build tools.
 
 import {
@@ -10,7 +11,7 @@ import {
   copyFileSync,
   unlinkSync,
 } from "node:fs";
-import { join, relative, resolve, isAbsolute, dirname } from "node:path";
+import { join, relative, resolve, isAbsolute, dirname, sep } from "node:path";
 import type { ViteDevServer } from "vite";
 import {
   type ResolvedProject,
@@ -19,17 +20,20 @@ import {
   type BackgroundRemovalRender,
   createBackgroundRemovalJob,
   createProjectSignature,
+  affectsProjectSignature,
 } from "@hyperframes/studio-server";
 import type { RegistryItem } from "@hyperframes/core/registry";
 import { createRetryingModuleLoader, ensureProducerDist } from "./vite.producer";
 import { createStudioDevRenderBodyScripts } from "./vite.studioMotion";
 import { generateThumbnail, findSystemChrome } from "./vite.browser";
 
-export function isPathWithin(parentDir: string, childPath: string): boolean {
+function isPathWithin(parentDir: string, childPath: string): boolean {
   const childRelativePath = relative(resolve(parentDir), resolve(childPath));
   return (
     childRelativePath === "" ||
-    (!childRelativePath.startsWith("..") && !isAbsolute(childRelativePath))
+    (childRelativePath !== ".." &&
+      !childRelativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(childRelativePath))
   );
 }
 
@@ -37,7 +41,65 @@ export function resolveViteAutoProxy(value: string | undefined): boolean {
   return value !== "false";
 }
 
-export function createViteAdapter(dataDir: string, server: ViteDevServer): StudioApiAdapter {
+/**
+ * The preview ETag's cache, and the one thing allowed to clear it.
+ *
+ * The signature walks the whole project directory, so it is memoised per project
+ * directory. (The content hash underneath is already gated behind a stat-only
+ * fingerprint, so what this memo saves is the walk, not the hashing — worth
+ * knowing before deciding how aggressive invalidation is allowed to be.)
+ * Getting the invalidation wrong is not a
+ * performance bug: the preview answers a revalidation with 304 and the browser
+ * keeps serving the pre-edit composition, which is how a thumbnail regenerated
+ * after an edit can still show the old frame.
+ *
+ * `watch` is called the first time a project dir is seen, so whoever owns the
+ * watcher can start following it. It must be a watcher that actually sees
+ * project writes: Vite's own is configured to ignore them.
+ */
+export interface ProjectSignatureCache {
+  get(projectDir: string): string;
+  /** Drop the signature of whichever project contains `changedPath`. */
+  invalidate(changedPath: string): void;
+}
+
+export function createProjectSignatureCache({
+  compute = createProjectSignature,
+  watch,
+}: {
+  compute?: (projectDir: string) => string;
+  watch?: (projectDir: string) => void;
+} = {}): ProjectSignatureCache {
+  const signatures = new Map<string, string>();
+  const watched = new Set<string>();
+  return {
+    get(projectDir) {
+      const key = resolve(projectDir);
+      const cached = signatures.get(key);
+      if (cached !== undefined) return cached;
+      if (!watched.has(key)) {
+        watched.add(key);
+        watch?.(key);
+      }
+      const signature = compute(key);
+      signatures.set(key, signature);
+      return signature;
+    },
+    invalidate(changedPath) {
+      // Filtered here rather than at the watcher so no caller can wire up a
+      // subscription that forgets to: the cache owns what can change its value.
+      for (const projectDir of signatures.keys()) {
+        if (affectsProjectSignature(projectDir, changedPath)) signatures.delete(projectDir);
+      }
+    },
+  };
+}
+
+export function createViteAdapter(
+  dataDir: string,
+  server: ViteDevServer,
+  signatureCache: ProjectSignatureCache,
+): StudioApiAdapter {
   let _bundler:
     | ((
         dir: string,
@@ -62,13 +124,6 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
         ) => Promise<void>;
       }>)
     | null = null;
-
-  const projectSignatureCache = new Map<string, string>();
-  server.watcher.on("all", (_event, file) => {
-    for (const projectDir of projectSignatureCache.keys()) {
-      if (isPathWithin(projectDir, file)) projectSignatureCache.delete(projectDir);
-    }
-  });
 
   const getBundler = async () => {
     if (!_bundler) {
@@ -131,6 +186,7 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
       return readdirSync(dataDir, { withFileTypes: true })
         .filter(
           (d) =>
+            isValidProjectId(d.name) &&
             (d.isDirectory() || d.isSymbolicLink()) &&
             (existsSync(join(dataDir, d.name, "index.html")) ||
               existsSync(join(dataDir, d.name, `${d.name}.html`))),
@@ -149,15 +205,19 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
 
     // fallow-ignore-next-line complexity
     resolveProject(id: string) {
-      let projectDir = join(dataDir, id);
+      if (!isValidProjectId(id)) return null;
+      let projectDir = resolve(dataDir, id);
+      if (!isPathWithin(dataDir, projectDir)) return null;
       if (!existsSync(projectDir)) {
         const sessionsDir = resolve(dataDir, "../sessions");
-        const sessionFile = join(sessionsDir, `${id}.json`);
+        const sessionFile = resolve(sessionsDir, `${id}.json`);
+        if (!isPathWithin(sessionsDir, sessionFile)) return null;
         if (existsSync(sessionFile)) {
           try {
             const session = JSON.parse(readFileSync(sessionFile, "utf-8"));
-            if (session.projectId) {
-              projectDir = join(dataDir, session.projectId);
+            if (typeof session.projectId === "string" && isValidProjectId(session.projectId)) {
+              projectDir = resolve(dataDir, session.projectId);
+              if (!isPathWithin(dataDir, projectDir)) return null;
               if (existsSync(projectDir)) {
                 return {
                   id: session.projectId,
@@ -192,22 +252,17 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
     },
 
     getProjectSignature(projectDir: string): string {
-      const cacheKey = resolve(projectDir);
-      const cached = projectSignatureCache.get(cacheKey);
-      if (cached) return cached;
-      // Project dirs are symlinked from anywhere on disk (often outside the
-      // studio package), so Vite's default watch roots don't cover them.
-      // Without this, the signature cache never invalidates for external
-      // projects and the preview ETag serves stale 304s after edits.
-      server.watcher.add(cacheKey);
-      const signature = createProjectSignature(cacheKey);
-      projectSignatureCache.set(cacheKey, signature);
-      return signature;
+      return signatureCache.get(projectDir);
     },
 
-    async lint(html: string, opts?: { filePath?: string }) {
+    async lint(html: string, opts?: { filePath?: string; isSubComposition?: boolean }) {
       const mod = await server.ssrLoadModule("@hyperframes/core/lint");
-      return await mod.lintHyperframeHtml(html, opts);
+      return await mod.lintHyperframeHtml(html, { ...opts, host: "studio" });
+    },
+
+    async lintProject(projectDir: string) {
+      const mod = await server.ssrLoadModule("@hyperframes/core/lint");
+      return await mod.lintProject(projectDir, undefined, { host: "studio" });
     },
 
     runtimeUrl: "/api/runtime.js",

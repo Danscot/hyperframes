@@ -2,10 +2,10 @@ import { useTrackDesignInput } from "../../contexts/DesignPanelInputContext";
 import { FlatRow, FlatSegmentedRow, FlatSelectRow } from "./propertyPanelFlatPrimitives";
 import { KeyframeNavigation } from "./KeyframeNavigation";
 import { formatPxMetricValue } from "./propertyPanelHelpers";
-import { STUDIO_KEYFRAMES_ENABLED } from "./manualEditingAvailability";
 import { resolveValueTier } from "./propertyPanelValueTier";
 import { PropertyPanel3dTransform } from "./propertyPanel3dTransform";
 import type { DomEditSelection } from "./domEditingTypes";
+import { usePreviewReadOnly, usePreviewReadOnlyReason } from "./previewReadOnlyContext";
 
 type KeyframeEntry = Array<{
   percentage: number;
@@ -69,7 +69,7 @@ function KeyframeGutter({
   | "onConvertToKeyframes"
 >) {
   const track = useTrackDesignInput();
-  if (!STUDIO_KEYFRAMES_ENABLED || !gsapAnimId) return null;
+  if (!gsapAnimId) return null;
   const hasKeyframesOnProp = Boolean(navKeyframes?.some((kf) => property in kf.properties));
   return (
     <span data-flat-kf-gutter="true" style={{ opacity: hasKeyframesOnProp ? 1 : 0.3 }}>
@@ -83,10 +83,10 @@ function KeyframeGutter({
           track("button", `Add ${property} keyframe`);
           void onCommitAnimatedProperty(element, property, displayValue);
         }}
-        onRemoveKeyframe={(pct) => {
+        onRemoveKeyframe={(pct, animationId) => {
           if (!onRemoveKeyframe) return;
           track("button", `Remove ${property} keyframe`);
-          onRemoveKeyframe(animIdForProp(property), pct);
+          onRemoveKeyframe(animationId ?? animIdForProp(property), pct);
         }}
         onConvertToKeyframes={() => {
           if (!onConvertToKeyframes) return;
@@ -120,6 +120,9 @@ export function LayoutGeometryRows({
   onRemoveKeyframe,
   onConvertToKeyframes,
 }: GeometryRowsProps) {
+  const readOnlyPreview = usePreviewReadOnly();
+  const readOnlyPreviewReason = usePreviewReadOnlyReason();
+  const readOnlyTooltip = readOnlyPreview ? readOnlyPreviewReason : undefined;
   const gutterProps = {
     element,
     gsapAnimId,
@@ -138,6 +141,7 @@ export function LayoutGeometryRows({
         value={formatPxMetricValue(displayX)}
         tier={displayX === 0 ? "default" : "explicitCustom"}
         disabled={manualOffsetEditingDisabled}
+        tooltip={readOnlyTooltip}
         onCommit={(next) => commitManualOffset("x", next)}
         suffix={<KeyframeGutter property="x" displayValue={displayX} {...gutterProps} />}
       />
@@ -146,6 +150,7 @@ export function LayoutGeometryRows({
         value={formatPxMetricValue(displayY)}
         tier={displayY === 0 ? "default" : "explicitCustom"}
         disabled={manualOffsetEditingDisabled}
+        tooltip={readOnlyTooltip}
         onCommit={(next) => commitManualOffset("y", next)}
         suffix={<KeyframeGutter property="y" displayValue={displayY} {...gutterProps} />}
       />
@@ -154,6 +159,7 @@ export function LayoutGeometryRows({
         value={formatPxMetricValue(displayW)}
         tier="default"
         disabled={manualSizeEditingDisabled}
+        tooltip={readOnlyTooltip}
         onCommit={(next) => commitManualSize("width", next)}
         suffix={<KeyframeGutter property="width" displayValue={displayW} {...gutterProps} />}
       />
@@ -162,6 +168,7 @@ export function LayoutGeometryRows({
         value={formatPxMetricValue(displayH)}
         tier="default"
         disabled={manualSizeEditingDisabled}
+        tooltip={readOnlyTooltip}
         onCommit={(next) => commitManualSize("height", next)}
         suffix={<KeyframeGutter property="height" displayValue={displayH} {...gutterProps} />}
       />
@@ -170,6 +177,7 @@ export function LayoutGeometryRows({
         value={`${displayR}°`}
         tier="default"
         disabled={manualRotationEditingDisabled}
+        tooltip={readOnlyTooltip}
         onCommit={(next) => commitManualRotation(next.replace("°", ""))}
         suffix={<KeyframeGutter property="rotation" displayValue={displayR} {...gutterProps} />}
       />
@@ -182,7 +190,7 @@ export function LayoutZIndexRow({
   onSetStyle,
 }: {
   styles: Record<string, string>;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const zIndex = String(parseInt(styles["z-index"] || "auto", 10) || 0);
   return (
@@ -201,7 +209,7 @@ export function LayoutFlexBlock({
   disabled,
 }: {
   styles: Record<string, string>;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
   disabled: boolean;
 }) {
   const isFlex = styles.display === "flex" || styles.display === "inline-flex";
@@ -338,7 +346,7 @@ interface FlatLayoutSectionProps
     > {
   element: DomEditSelection;
   styles: Record<string, string>;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
   disabled: boolean;
 }
 

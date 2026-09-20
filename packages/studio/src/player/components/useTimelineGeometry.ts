@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 import { usePlayerStore, type TimelineElement, type ZoomMode } from "../store/playerStore";
 import { getTimelinePixelsPerSecond } from "./timelineZoom";
 import {
@@ -21,6 +21,7 @@ interface UseTimelineGeometryInput {
   isDragging: RefObject<boolean>;
   scrollRef: RefObject<HTMLDivElement | null>;
   lastScrollLeftRef: RefObject<number>;
+  contentOrigin: number;
 }
 
 // Derive the timeline's horizontal geometry from the viewport, zoom, and any live
@@ -40,10 +41,11 @@ export function useTimelineGeometry({
   isDragging,
   scrollRef,
   lastScrollLeftRef,
+  contentOrigin,
 }: UseTimelineGeometryInput) {
   // Fit pps maps at least MIN_TIMELINE_EXTENT_S onto the viewport, so short
   // comps show a 60s ruler with usable empty space (see getTimelineFitPps).
-  const fitPps = getTimelineFitPps(viewportWidth, effectiveDuration);
+  const fitPps = getTimelineFitPps(viewportWidth, effectiveDuration, contentOrigin);
   const pps = getTimelinePixelsPerSecond(fitPps, zoomMode, manualZoomPercent);
   ppsRef.current = pps;
   const trackContentWidth = Math.max(0, effectiveDuration * pps);
@@ -70,18 +72,12 @@ export function useTimelineGeometry({
   const displayContentWidth = getTimelineDisplayContentWidth({
     trackContentWidth,
     viewportWidth,
+    contentOrigin,
     pps,
     dragGhostEndPx,
     resizeGhostEndPx,
   });
   const displayDuration = pps > 0 ? displayContentWidth / pps : effectiveDuration;
-  const clipStateVersion = useMemo(
-    () =>
-      expandedElements
-        .map((el) => `${el.key ?? el.id}:${el.start}:${el.duration}:${el.track}`)
-        .join("|"),
-    [expandedElements],
-  );
   const zoomModeRef = useRef(zoomMode);
   zoomModeRef.current = zoomMode;
   const manualZoomPercentRef = useRef(manualZoomPercent);
@@ -89,7 +85,7 @@ export function useTimelineGeometry({
   fitPpsRef.current = fitPps;
 
   // Restore the horizontal scroll offset after an edit re-derives the elements
-  // (clipStateVersion changes) so the reload doesn't jump the view. Only in manual
+  // (the immutable element snapshot changes) so the reload doesn't jump the view. Only in manual
   // (pinned) mode — fit mode hides the x-scrollbar (scrollLeft is always 0) — and
   // never mid-drag (auto-scroll owns the offset then). rAF waits for the new layout
   // so the clamp reads the post-resync scrollWidth. zoomMode is a legitimate dep:
@@ -97,16 +93,21 @@ export function useTimelineGeometry({
   useEffect(() => {
     if (zoomMode !== "manual" || isDragging.current) return;
     const el = scrollRef.current;
-    const target = lastScrollLeftRef.current;
-    if (!el || target <= 0) return;
+    if (!el) return;
+    // Read the ref inside the frame, not here: a sibling effect in the same
+    // commit (a fresh reveal) can still update lastScrollLeftRef before this
+    // frame runs, and a value captured now would fight that reveal with a
+    // stale target.
     const raf = requestAnimationFrame(() => {
+      const target = lastScrollLeftRef.current;
+      if (target <= 0) return;
       const max = Math.max(0, el.scrollWidth - el.clientWidth);
       const next = Math.min(target, max);
       if (Math.abs(el.scrollLeft - next) > 0.5) el.scrollLeft = next;
     });
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clipStateVersion, zoomMode]);
+  }, [expandedElements, zoomMode]);
   // Publish the live scale so edit handlers OUTSIDE <Timeline> (the keyboard-delete
   // path) can pin the zoom via pinTimelineZoomToCurrent without threading geometry.
   // In a useEffect (not the render body) so React-18 concurrent replay — Suspense
@@ -122,7 +123,7 @@ export function useTimelineGeometry({
     fitPps,
     displayContentWidth,
     displayDuration,
-    clipStateVersion,
+    clipStateVersion: expandedElements,
     zoomModeRef,
     manualZoomPercentRef,
   };

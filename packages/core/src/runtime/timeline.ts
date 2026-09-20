@@ -5,33 +5,48 @@ import type {
   RuntimeTimelineLike,
 } from "./types";
 import { stableClipId } from "./clipTree";
+import { resolveAuthoredTimingWindow } from "./authoredTiming";
 import { swallow } from "./diagnostics";
 import { readElementPlaybackRate, readElementPlaybackStart } from "./media";
+import {
+  parseStrictFiniteTimingNumber,
+  resolveMediaElementDurationSeconds,
+  resolveNaturalMediaTimelineDuration,
+  resolveTimedImageDurationSeconds,
+} from "./playbackRate";
 import { resolveCssStackingContextId } from "./stackingContext";
 import { createRuntimeStartTimeResolver } from "./startResolver";
 import { isSceneLikeCompositionId } from "../slideshow/index.js";
 import { COMPOSITION_CONTRACT_VERSION } from "../compositionContract.js";
 import { runtimeProtocolMetadata } from "./protocol.js";
-
-const AUTHORED_DURATION_ATTR = "data-hf-authored-duration";
-const AUTHORED_END_ATTR = "data-hf-authored-end";
+import { isElementNode, isMediaElement } from "./domRealm";
 
 function parseNum(value: string | null | undefined): number | null {
-  if (value == null || value === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseStrictFiniteTimingNumber(value);
 }
 
 function parseElementDurationAttr(element: Element): number | null {
-  return (
-    parseNum(element.getAttribute("data-duration")) ??
-    parseNum(element.getAttribute(AUTHORED_DURATION_ATTR))
-  );
+  const publicDuration = element.getAttribute("data-duration");
+  const authoredDuration = element.getAttribute("data-hf-authored-duration");
+  const resolved = resolveAuthoredTimingWindow({
+    start: 0,
+    duration: publicDuration,
+    authoredDuration,
+  })?.duration;
+  if (resolved != null) return resolved;
+  const hasExplicitNonpositive = [publicDuration, authoredDuration]
+    .map(parseNum)
+    .some((duration) => duration != null && duration <= 0);
+  return hasExplicitNonpositive ? 0 : null;
 }
 
 function parseElementEndAttr(element: Element): number | null {
   return (
-    parseNum(element.getAttribute("data-end")) ?? parseNum(element.getAttribute(AUTHORED_END_ATTR))
+    resolveAuthoredTimingWindow({
+      start: 0,
+      end: element.getAttribute("data-end"),
+      authoredEnd: element.getAttribute("data-hf-authored-end"),
+    })?.end ?? null
   );
 }
 
@@ -173,22 +188,6 @@ export function collectRuntimeTimelinePayload(params: {
       return null;
     }
   };
-  const resolveMediaElementDurationSeconds = (
-    mediaEl: HTMLVideoElement | HTMLAudioElement,
-  ): number | null => {
-    const declaredDuration = parseNum(mediaEl.getAttribute("data-duration"));
-    if (declaredDuration != null && declaredDuration > 0) {
-      return declaredDuration;
-    }
-    const playbackStart =
-      parseNum(mediaEl.getAttribute("data-playback-start")) ??
-      parseNum(mediaEl.getAttribute("data-media-start")) ??
-      0;
-    if (Number.isFinite(mediaEl.duration) && mediaEl.duration > playbackStart) {
-      return Math.max(0, (mediaEl.duration - playbackStart) / readElementPlaybackRate(mediaEl));
-    }
-    return null;
-  };
   const resolveMediaWindowEndSeconds = (): number | null => {
     const mediaNodes = Array.from(
       document.querySelectorAll("video[data-start], audio[data-start]"),
@@ -196,9 +195,7 @@ export function collectRuntimeTimelinePayload(params: {
     if (mediaNodes.length === 0) return null;
     let maxWindowEndSeconds = 0;
     for (const mediaNode of mediaNodes) {
-      const start = !mediaNode.hasAttribute("data-hf-auto-start")
-        ? Math.max(0, Number(mediaNode.getAttribute("data-start") ?? 0) || 0)
-        : startResolver.resolveStartForElement(mediaNode, 0);
+      const start = startResolver.resolveMediaStartForElement(mediaNode);
       if (!Number.isFinite(start)) continue;
       const duration = resolveMediaElementDurationSeconds(mediaNode);
       if (duration == null || duration <= 0) continue;
@@ -351,29 +348,23 @@ export function collectRuntimeTimelinePayload(params: {
     if (["SCRIPT", "STYLE", "LINK", "META", "TEMPLATE", "NOSCRIPT"].includes(node.tagName))
       continue;
     const compositionContext = resolveNearestCompositionContext(node, root);
-    const start = startResolver.resolveStartForElement(
-      node,
-      compositionContext.inheritedStart ?? 0,
-    );
+    const tag = node.tagName.toLowerCase();
+    const start =
+      tag === "video" || tag === "audio"
+        ? startResolver.resolveMediaStartForElement(node)
+        : startResolver.resolveStartForElement(node, compositionContext.inheritedStart ?? 0);
     const nodeCompositionId = node.getAttribute("data-composition-id");
     let duration = parseElementDurationAttr(node);
-    if (
-      (duration == null || duration <= 0) &&
-      nodeCompositionId &&
-      nodeCompositionId !== rootCompositionId
-    ) {
+    if (duration == null && nodeCompositionId && nodeCompositionId !== rootCompositionId) {
       duration = resolveTimelineDurationSeconds(nodeCompositionId);
     }
-    if ((duration == null || duration <= 0) && node instanceof HTMLMediaElement) {
-      const mediaStart =
-        parseNum(node.getAttribute("data-playback-start")) ??
-        parseNum(node.getAttribute("data-media-start")) ??
-        0;
-      if (Number.isFinite(node.duration) && node.duration > 0) {
-        duration = Math.max(0, node.duration - mediaStart);
+    if (duration == null && isMediaElement(node)) {
+      if (Number.isFinite(node.duration)) {
+        duration = resolveNaturalMediaTimelineDuration(node, node.duration);
       }
     }
-    if (duration == null || duration <= 0) {
+    if (duration == null) duration = resolveTimedImageDurationSeconds(node, start);
+    if (duration == null) {
       const inheritedDuration = compositionContext.inheritedDuration;
       if (inheritedDuration != null && inheritedDuration > 0) {
         const inheritedStart = compositionContext.inheritedStart ?? 0;
@@ -386,7 +377,6 @@ export function collectRuntimeTimelinePayload(params: {
     if (duration <= 0) continue;
     const end = start + duration;
     maxEnd = Math.max(maxEnd, end);
-    const tag = node.tagName.toLowerCase();
     const kind: RuntimeTimelineClip["kind"] =
       nodeCompositionId && nodeCompositionId !== rootCompositionId
         ? "composition"
@@ -483,7 +473,7 @@ export function collectRuntimeTimelinePayload(params: {
           const tweenEnd = tweenStart + tween.duration();
           if (!Number.isFinite(tweenStart) || !Number.isFinite(tweenEnd)) continue;
           for (const target of tween.targets()) {
-            if (!(target instanceof Element)) continue;
+            if (!isElementNode(target)) continue;
             // Bubble up to the scene-level ancestor
             const scene = findSceneAncestor(target);
             if (!scene) continue;

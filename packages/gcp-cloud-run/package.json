@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/gcp-cloud-run",
-  "version": "0.7.64",
+  "version": "0.8.56",
   "description": "Google Cloud Run + Workflows adapter for HyperFrames distributed rendering — request handler, client-side SDK, and Terraform module.",
   "repository": {
     "type": "git",
@@ -70,10 +70,10 @@
   "dependencies": {
     "@google-cloud/storage": "^7.14.0",
     "@google-cloud/workflows": "^4.2.0",
-    "@hono/node-server": "^1.13.0",
+    "@hono/node-server": "^2.0.5",
     "@hyperframes/producer": "workspace:^",
     "hono": "^4.6.0",
-    "puppeteer-core": "^25.2.1",
+    "puppeteer-core": "^25.8.0",
     "tar": "^7.4.3"
   },
   "devDependencies": {
@@ -81,7 +81,8 @@
     "@types/tar": "^6.1.13",
     "esbuild": "^0.25.12",
     "tsx": "^4.21.0",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "yaml": "^2.9.0"
   },
   "engines": {
     "node": ">=22"

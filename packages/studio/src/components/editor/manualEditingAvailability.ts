@@ -1,7 +1,5 @@
 export type StudioFeatureFlagEnv = Record<string, boolean | string | undefined>;
 
-const STUDIO_PREVIEW_MANUAL_DRAGGING_ENV = "VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING";
-const STUDIO_INSPECTOR_PANELS_ENV = "VITE_STUDIO_ENABLE_INSPECTOR_PANELS";
 const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes", "on", "enabled"]);
 const FALSY_ENV_VALUES = new Set(["0", "false", "no", "off", "disabled"]);
 
@@ -40,54 +38,20 @@ const runtimeEnv =
     : {};
 const env = { ...(import.meta.env ?? {}), ...runtimeEnv } as StudioFeatureFlagEnv;
 
-export const STUDIO_PREVIEW_MANUAL_EDITING_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  [STUDIO_PREVIEW_MANUAL_DRAGGING_ENV, "VITE_STUDIO_PREVIEW_MANUAL_EDITING_ENABLED"],
-  true,
-);
-
-export const STUDIO_INSPECTOR_PANELS_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  [STUDIO_INSPECTOR_PANELS_ENV, "VITE_STUDIO_INSPECTOR_PANELS_ENABLED"],
-  true,
-);
-
-export const STUDIO_BLOCKS_PANEL_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  ["VITE_STUDIO_ENABLE_BLOCKS_PANEL", "VITE_STUDIO_BLOCKS_PANEL_ENABLED"],
-  true,
-);
-
-export const STUDIO_GSAP_PANEL_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  ["VITE_STUDIO_ENABLE_GSAP_PANEL", "VITE_STUDIO_GSAP_PANEL_ENABLED"],
-  true,
-);
-
-export const STUDIO_KEYFRAMES_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  ["VITE_STUDIO_ENABLE_KEYFRAMES", "VITE_STUDIO_KEYFRAMES_ENABLED"],
-  true,
-);
-
-export const STUDIO_RAZOR_TOOL_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  ["VITE_STUDIO_ENABLE_RAZOR_TOOL", "VITE_STUDIO_RAZOR_TOOL_ENABLED"],
-  true,
-);
-
-export const STUDIO_PREVIEW_SELECTION_ENABLED = STUDIO_INSPECTOR_PANELS_ENABLED;
-
-// Stage 7 Step 3c: SDK cutover — routes inline-style ops through SDK dispatch
-// instead of the server patch-element API. Default false; enable via
-// VITE_STUDIO_SDK_CUTOVER_ENABLED=true. Requires SDK session to be open.
+// Stage 7 SDK cutover — routes Studio edits through SDK dispatch instead of the
+// server patch/mutation routes. Default TRUE as of the flip release (spec:
+// 2026-09-17-studio-sdk-cutover-flip-design.md). Kill switch:
+// VITE_STUDIO_SDK_CUTOVER_ENABLED=false (works at runtime via __HF_STUDIO_ENV__).
 export const STUDIO_SDK_CUTOVER_ENABLED = resolveStudioBooleanEnvFlag(
   env,
   ["VITE_STUDIO_SDK_CUTOVER_ENABLED"],
-  false,
+  true,
 );
 
-/** Explicit per-operation-family canary selection; the master flag alone enables nothing. */
+/**
+ * Per-family selection. Unset = every family (the master alone enables all).
+ * Set `VITE_STUDIO_SDK_CUTOVER_FAMILIES=dom,timing` to RESTRICT to a subset.
+ */
 export const STUDIO_SDK_CUTOVER_FAMILIES = resolveEnabledSdkFamilies(
   env,
   STUDIO_SDK_CUTOVER_ENABLED,
@@ -114,5 +78,4 @@ export const STUDIO_FLAT_INSPECTOR_ENABLED = resolveStudioBooleanEnvFlag(
   true,
 );
 
-export const STUDIO_MANUAL_EDITING_DISABLED_TITLE = "Manual editing is temporarily disabled";
 import { resolveEnabledSdkFamilies } from "../../utils/sdkCutoverPolicy";

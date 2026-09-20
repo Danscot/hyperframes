@@ -1,11 +1,21 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   readElementPlaybackRate,
+  readElementPlaybackStart,
   refreshRuntimeMediaCache,
   resolveRuntimeMediaClipDuration,
-  syncRuntimeMedia,
+  syncRuntimeMedia as syncRuntimeMediaWithDuration,
 } from "./media";
 import type { RuntimeMediaClip } from "./media";
+import { resolveNaturalMediaTimelineDuration } from "./playbackRate";
+import { sourceTimeAt } from "../speedRamp";
+import type { HfAutomationLane } from "../audioAutomation";
+
+// Most cases predate the terminal rule and run with no composition end to hold at.
+const syncRuntimeMedia = (
+  params: Omit<Parameters<typeof syncRuntimeMediaWithDuration>[0], "getCompositionDuration"> &
+    Partial<Pick<Parameters<typeof syncRuntimeMediaWithDuration>[0], "getCompositionDuration">>,
+) => syncRuntimeMediaWithDuration({ getCompositionDuration: () => 0, ...params });
 
 function createVideo(attrs: Record<string, string>): HTMLVideoElement {
   const el = document.createElement("video");
@@ -40,12 +50,12 @@ describe("readElementPlaybackRate", () => {
     expect(readElementPlaybackRate(el)).toBe(1);
   });
 
-  it("clamps to [0.1, 5]", () => {
+  it("clamps to [0.1, 10]", () => {
     const el = document.createElement("video");
     Object.defineProperty(el, "defaultPlaybackRate", { value: 0.01, writable: true });
     expect(readElementPlaybackRate(el)).toBe(0.1);
-    Object.defineProperty(el, "defaultPlaybackRate", { value: 10, writable: true });
-    expect(readElementPlaybackRate(el)).toBe(5);
+    Object.defineProperty(el, "defaultPlaybackRate", { value: 20, writable: true });
+    expect(readElementPlaybackRate(el)).toBe(10);
   });
 
   it("defaults to 1 for NaN/negative/zero", () => {
@@ -56,6 +66,23 @@ describe("readElementPlaybackRate", () => {
     expect(readElementPlaybackRate(el)).toBe(1);
     Object.defineProperty(el, "defaultPlaybackRate", { value: 0, writable: true });
     expect(readElementPlaybackRate(el)).toBe(1);
+  });
+});
+
+describe("readElementPlaybackStart fallback", () => {
+  it.each([
+    ["", "1.5", 1.5],
+    ["   ", "1.5", 1.5],
+    ["later", "1.5", 1.5],
+    ["-1", "1.5", 1.5],
+    [null, "-1", 0],
+    ["0", "1.5", 0],
+    ["2.25", "1.5", 2.25],
+  ])("uses non-negative finite playback-start -> media-start -> 0", (playback, media, expected) => {
+    const el = document.createElement("audio");
+    if (playback !== null) el.setAttribute("data-playback-start", playback);
+    el.setAttribute("data-media-start", media);
+    expect(readElementPlaybackStart(el)).toBe(expected);
   });
 });
 
@@ -146,16 +173,16 @@ describe("refreshRuntimeMediaCache", () => {
     expect(result.mediaClips[0].playbackRate).toBe(1);
   });
 
-  it("clamps playback rate to [0.1, 5]", () => {
+  it("clamps playback rate to [0.1, 10]", () => {
     const el1 = createVideo({ "data-start": "0", "data-duration": "5" });
     Object.defineProperty(el1, "defaultPlaybackRate", { value: 0.01, writable: true });
     const r1 = refreshRuntimeMediaCache();
     expect(r1.mediaClips[0].playbackRate).toBe(0.1);
     document.body.innerHTML = "";
     const el2 = createVideo({ "data-start": "0", "data-duration": "5" });
-    Object.defineProperty(el2, "defaultPlaybackRate", { value: 10, writable: true });
+    Object.defineProperty(el2, "defaultPlaybackRate", { value: 20, writable: true });
     const r2 = refreshRuntimeMediaCache();
-    expect(r2.mediaClips[0].playbackRate).toBe(5);
+    expect(r2.mediaClips[0].playbackRate).toBe(10);
   });
 
   it("adjusts fallback duration by playback rate", () => {
@@ -185,6 +212,31 @@ describe("refreshRuntimeMediaCache", () => {
     // 5s source at 0.5x = 10s effective; should NOT be capped to 5s
     expect(result.mediaClips[0].duration).toBe(10);
     expect(result.mediaClips[0].end).toBe(10);
+  });
+
+  it.each([10, 11])(
+    "preserves an authoritative zero duration at or past EOF (start=%s)",
+    (mediaStart) => {
+      const el = createVideo({ "data-start": "3", "data-media-start": String(mediaStart) });
+      Object.defineProperty(el, "duration", { value: 10, writable: true });
+      const result = refreshRuntimeMediaCache({
+        resolveDurationSeconds: (element) =>
+          resolveNaturalMediaTimelineDuration(element, element.duration),
+      });
+
+      expect(result.mediaClips[0].duration).toBe(0);
+      expect(result.mediaClips[0].end).toBe(3);
+      expect(result.maxMediaEnd).toBe(3);
+    },
+  );
+
+  it("distinguishes an authoritative zero duration from an unknown duration", () => {
+    createVideo({ "data-start": "3" });
+    const knownZero = refreshRuntimeMediaCache({ resolveDurationSeconds: () => 0 });
+    const unknown = refreshRuntimeMediaCache({ resolveDurationSeconds: () => null });
+
+    expect(knownZero.mediaClips[0]).toMatchObject({ duration: 0, end: 3 });
+    expect(unknown.mediaClips[0]).toMatchObject({ duration: Infinity, end: Infinity });
   });
 
   it("reads native loop attribute", () => {
@@ -257,6 +309,17 @@ describe("resolveRuntimeMediaClipDuration", () => {
       }),
     ).toBe(1);
   });
+
+  it("preserves a known zero natural span instead of falling back to the host window", () => {
+    expect(
+      resolveRuntimeMediaClipDuration({
+        isVideo: true,
+        sourceDuration: 0,
+        hostRemaining: 8,
+        explicitDuration: null,
+      }),
+    ).toBe(0);
+  });
 });
 
 describe("syncRuntimeMedia", () => {
@@ -271,8 +334,11 @@ describe("syncRuntimeMedia", () => {
     });
   }
 
-  function createMockClip(overrides?: Partial<RuntimeMediaClip>): RuntimeMediaClip {
-    const el = document.createElement("video") as HTMLVideoElement;
+  function createMockClip(
+    overrides?: Partial<RuntimeMediaClip>,
+    mediaType: "audio" | "video" = "video",
+  ): RuntimeMediaClip {
+    const el = document.createElement(mediaType);
     document.body.appendChild(el);
     Object.defineProperty(el, "paused", { value: true, writable: true, configurable: true });
     el.play = vi.fn(() => Promise.resolve());
@@ -305,6 +371,194 @@ describe("syncRuntimeMedia", () => {
 
   afterEach(() => {
     document.body.innerHTML = "";
+  });
+
+  describe("speed ramp", () => {
+    it("seeks to the integrated source time and plays at the instantaneous rate", () => {
+      const rate = {
+        target: "rate",
+        points: [
+          { t: 0, v: 1 },
+          { t: 2, v: 3 },
+        ],
+      };
+      const clip = createMockClip({ start: 1, end: 5, rate });
+      Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+      syncRuntimeMedia({ clips: [clip], timeSeconds: 3, playing: false, playbackRate: 1 });
+      expect(clip.el.currentTime).toBeCloseTo(3.641, 2);
+      syncRuntimeMedia({ clips: [clip], timeSeconds: 3, playing: true, playbackRate: 1 });
+      expect(clip.el.playbackRate).toBeCloseTo(3, 5);
+    });
+  });
+
+  describe("volume automation lane", () => {
+    const DUCK = JSON.stringify({
+      version: 1,
+      lanes: [
+        {
+          target: "volume",
+          points: [
+            { t: 0, v: 0.8 },
+            { t: 2, v: 0.8 },
+            { t: 3, v: 0.1 },
+            { t: 8, v: 0.1 },
+          ],
+        },
+      ],
+    });
+
+    /**
+     * The runtime rewrites the transport's gain every tick. Before the lane fed
+     * this path it was scheduled onto the AudioParam instead and erased within a
+     * frame, so the envelope was inaudible in preview while being correct in the
+     * render.
+     */
+    function volumesAt(times: number[], automation?: string, volume = 0.55) {
+      const clip = createMockClip({ start: 0, end: 10, volume });
+      Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+      if (automation) clip.el.setAttribute("data-automation", automation);
+      const seen: number[] = [];
+      for (const t of times) {
+        syncRuntimeMedia({
+          clips: [clip],
+          timeSeconds: t,
+          playing: true,
+          playbackRate: 1,
+          onElementVolume: (_el, v) => seen.push(v),
+        });
+      }
+      return seen;
+    }
+
+    it("drives the transport gain from the lane, not from data-volume", () => {
+      const [held, ducked] = volumesAt([1, 5], DUCK);
+      expect(held).toBeCloseTo(0.8, 5);
+      expect(ducked).toBeCloseTo(0.1, 5);
+    });
+
+    it("keeps automation author-only while user volume remains a separate layer", () => {
+      const clip = createMockClip({ start: 0, end: 10, volume: 0.55 });
+      clip.el.setAttribute("data-automation", DUCK);
+      const onElementVolume = vi.fn();
+      syncRuntimeMedia({
+        clips: [clip],
+        timeSeconds: 1,
+        playing: true,
+        playbackRate: 1,
+        userVolume: 0.5,
+        onElementVolume,
+      });
+
+      expect(onElementVolume).toHaveBeenLastCalledWith(clip.el, 0.4, 0.8);
+    });
+
+    it("ramps between points across ticks", () => {
+      const [a, b, c] = volumesAt([2, 2.5, 3], DUCK);
+      expect(a).toBeCloseTo(0.8, 5);
+      expect(b).toBeGreaterThan(0.1);
+      expect(b).toBeLessThan(0.8);
+      expect(c).toBeCloseTo(0.1, 5);
+    });
+
+    it("falls back to data-volume when there is no lane", () => {
+      const [only] = volumesAt([5], undefined, 0.55);
+      expect(only).toBeCloseTo(0.55, 5);
+    });
+
+    it("sends boosted author gain to Web Audio while keeping the native element legal", () => {
+      const clip = createMockClip({ start: 0, end: 10, volume: 3.98 });
+      Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+      let transportGain = -1;
+
+      syncRuntimeMedia({
+        clips: [clip],
+        timeSeconds: 1,
+        playing: true,
+        playbackRate: 1,
+        // Third arg is the authored gain, which is the one the transport wants;
+        // the second is the element's, which the spec pins to [0,1].
+        onElementVolume: (_el, _effectiveVolume, authorVolume) => {
+          transportGain = authorVolume;
+        },
+      });
+
+      expect(transportGain).toBeCloseTo(3.98, 5);
+      expect(clip.el.volume).toBe(1);
+    });
+
+    /**
+     * The render bakes the lane at CLIP-LOCAL time: prepareAudioTrack already
+     * cut the wav with `-ss mediaStart`, so its t=0 is the clip's start, and
+     * normaliseEnvelope subtracts trackStart. Preview used to sample at MEDIA
+     * time — mediaStart included, scaled by playbackRate, wrapped on a loop — so
+     * the same envelope played somewhere else than it rendered.
+     */
+    it("samples the lane at clip-local time, the way the render bakes it", () => {
+      const trimmed = (t: number) => {
+        const clip = createMockClip({ start: 0, end: 10, volume: 0.55, mediaStart: 30 });
+        Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+        clip.el.setAttribute("data-automation", DUCK);
+        let seen = -1;
+        syncRuntimeMedia({
+          clips: [clip],
+          timeSeconds: t,
+          playing: true,
+          playbackRate: 1,
+          onElementVolume: (_el, v) => {
+            seen = v;
+          },
+        });
+        return seen;
+      };
+      // `data-media-start="30"` on a clip whose lane holds 0.8 until t=2 then
+      // ducks to 0.1 by t=3. At media time the playhead is already 30 s past the
+      // last point, so preview held 0.1 from the first frame and never ducked.
+      expect(trimmed(1)).toBeCloseTo(0.8, 5);
+      expect(trimmed(5)).toBeCloseTo(0.1, 5);
+    });
+
+    it("supersedes keyframes probed from the timeline", () => {
+      // Both present: the lane is the explicit one, and `lint` warns about it.
+      const clip = createMockClip({ start: 0, end: 10, volume: 0.55 });
+      Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+      clip.el.setAttribute("data-automation", DUCK);
+      clip.volumeKeyframes = [
+        { time: 0, volume: 1 },
+        { time: 10, volume: 1 },
+      ];
+      let seen = -1;
+      syncRuntimeMedia({
+        clips: [clip],
+        timeSeconds: 5,
+        playing: true,
+        playbackRate: 1,
+        onElementVolume: (_el, v) => {
+          seen = v;
+        },
+      });
+      expect(seen).toBeCloseTo(0.1, 5);
+    });
+  });
+
+  it("hands the transport an above-unity author gain, uncapped", () => {
+    // The preview terminus. `el.volume` is spec-bound to [0,1] and always will
+    // be, so the boost can only reach the ear through the Web Audio gain node —
+    // which means the author gain handed to the transport must NOT be capped on
+    // the way out, even though the native write beside it is.
+    const clip = createMockClip({ start: 0, end: 10, volume: 1.949845 });
+    const onElementVolume = vi.fn();
+
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 1,
+      playing: false,
+      playbackRate: 1,
+      onElementVolume,
+    });
+
+    const [, , authorVolume] = onElementVolume.mock.calls.at(-1) as [unknown, number, number];
+    expect(authorVolume).toBeCloseTo(1.949845, 6);
+    expect(clip.el.volume).toBe(1);
   });
 
   it("plays active clip when playing and buffered", () => {
@@ -346,6 +600,58 @@ describe("syncRuntimeMedia", () => {
     Object.defineProperty(clip.el, "readyState", { value: 0, writable: true });
     syncRuntimeMedia({ clips: [clip], timeSeconds: 5, playing: true, playbackRate: 1 });
     expect(clip.el.play).toHaveBeenCalled();
+  });
+
+  describe("data-hidden silences preview volume", () => {
+    const hiddenClip = () => {
+      const clip = createMockClip({ start: 0, end: 10, volume: 0.8 });
+      Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+      const hiddenAncestor = document.createElement("div");
+      hiddenAncestor.setAttribute("data-hidden", "");
+      document.body.appendChild(hiddenAncestor);
+      hiddenAncestor.appendChild(clip.el);
+      return clip;
+    };
+    const volumeSeen = (clip: ReturnType<typeof hiddenClip>) => {
+      let seen = -1;
+      syncRuntimeMedia({
+        clips: [clip],
+        timeSeconds: 1,
+        playing: true,
+        playbackRate: 1,
+        onElementVolume: (_el, v) => {
+          seen = v;
+        },
+      });
+      return seen;
+    };
+
+    it("zeroes effective volume for a clip under a data-hidden ancestor", () => {
+      expect(volumeSeen(hiddenClip())).toBe(0);
+    });
+
+    // A visible clip is the control: the zero above has to come from the
+    // ancestor, not from the fixture reading 0 for some other reason.
+    it("leaves a visible clip at its authored volume", () => {
+      const clip = createMockClip({ start: 0, end: 10, volume: 0.8 });
+      Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+      document.body.appendChild(clip.el);
+      expect(volumeSeen(clip)).toBe(0.8);
+    });
+
+    it("does not touch el.muted when silencing a hidden clip (RULES trap: transport owns el.muted)", () => {
+      const clip = hiddenClip();
+      clip.el.muted = false;
+
+      syncRuntimeMedia({
+        clips: [clip],
+        timeSeconds: 1,
+        playing: true,
+        playbackRate: 1,
+      });
+
+      expect(clip.el.muted).toBe(false);
+    });
   });
 
   describe("play() storm guard (unplayable elements)", () => {
@@ -510,12 +816,162 @@ describe("syncRuntimeMedia", () => {
     expect(clip.el.play).not.toHaveBeenCalled();
   });
 
+  it("holds a video that runs to the composition end on its last frame at the terminal time", () => {
+    const clip = createMockClip({ start: 2.5, end: 5, duration: 2.5, sourceDuration: 10 });
+    const seek = {
+      clips: [clip],
+      playing: false,
+      playbackRate: 1,
+      getCompositionDuration: () => 5,
+    };
+    syncRuntimeMedia({ ...seek, timeSeconds: 5 });
+    expect(clip.el.currentTime).toBe(2.5);
+    expect(clip.el.play).not.toHaveBeenCalled();
+  });
+
+  it("holds a speed-ramped video that runs to the composition end at the source time of its own end", () => {
+    const lane: HfAutomationLane = {
+      target: "rate",
+      points: [
+        { t: 0, v: 1 },
+        { t: 5, v: 2 },
+      ],
+    };
+    const clip = createMockClip({ start: 0, end: 5, duration: 5, sourceDuration: 100, rate: lane });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 6,
+      playing: false,
+      playbackRate: 1,
+      getCompositionDuration: () => 5,
+    });
+    expect(clip.el.currentTime).toBeCloseTo(sourceTimeAt(lane, 5), 5);
+    expect(clip.el.currentTime).toBeLessThan(sourceTimeAt(lane, 6));
+    expect(clip.el.play).not.toHaveBeenCalled();
+  });
+
+  it("clamps a terminal video hold to a shorter source tail", () => {
+    const clip = createMockClip({ start: 0, end: 5, duration: 5, sourceDuration: 0.25 });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5,
+      playing: true,
+      playbackRate: 1,
+      getCompositionDuration: () => 5,
+    });
+    expect(clip.el.currentTime).toBe(0.25);
+    expect(clip.el.play).not.toHaveBeenCalled();
+  });
+
+  it("does not hold a video that ended before the composition did", () => {
+    const clip = createMockClip({ start: 0, end: 2.5, duration: 2.5, sourceDuration: 10 });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5,
+      playing: false,
+      playbackRate: 1,
+      getCompositionDuration: () => 5,
+    });
+    expect(clip.el.currentTime).toBe(0);
+  });
+
   it("seeks an ended video backward into its playable source", () => {
     const clip = createMockClip({ start: 0, end: 5, duration: 5, sourceDuration: 1 });
     Object.defineProperty(clip.el, "currentTime", { value: 1, writable: true, configurable: true });
     Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
     syncRuntimeMedia({ clips: [clip], timeSeconds: 0.9, playing: true, playbackRate: 1 });
     expect(clip.el.currentTime).toBe(0.9);
+    expect(clip.el.play).toHaveBeenCalledTimes(1);
+  });
+
+  it("seeks an ended audio clip backward into its playable source", () => {
+    const clip = createMockClip(
+      { start: 3.12, end: 3.67, duration: 0.55, sourceDuration: 0.55 },
+      "audio",
+    );
+    Object.defineProperty(clip.el, "currentTime", {
+      value: 0.55,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 3.12, playing: true, playbackRate: 1 });
+
+    expect(clip.el.currentTime).toBe(0);
+    expect(clip.el.play).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not restart ended audio past its source duration", () => {
+    const clip = createMockClip(
+      { start: 3.12, end: 4.12, duration: 1, sourceDuration: 0.55 },
+      "audio",
+    );
+    Object.defineProperty(clip.el, "currentTime", {
+      value: 0.55,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 3.8, playing: true, playbackRate: 1 });
+
+    expect(clip.el.currentTime).toBe(0.55);
+    expect(clip.el.play).not.toHaveBeenCalled();
+  });
+
+  it("does not replay an audio tail when native EOF leads the runtime clock", () => {
+    const clip = createMockClip(
+      { start: 3.12, end: 3.67, duration: 0.55, sourceDuration: 0.55 },
+      "audio",
+    );
+    Object.defineProperty(clip.el, "paused", { value: false, writable: true });
+    Object.defineProperty(clip.el, "currentTime", { value: 0.53, writable: true });
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 3.65, playing: true, playbackRate: 1 });
+
+    clip.el.currentTime = 0.55;
+    Object.defineProperty(clip.el, "paused", { value: true, writable: true });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 3.66,
+      playing: true,
+      playbackRate: 1,
+      forceSync: true,
+    });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 3.665,
+      playing: true,
+      playbackRate: 1,
+      forceSync: true,
+    });
+
+    expect(clip.el.currentTime).toBe(0.55);
+    expect(clip.el.play).not.toHaveBeenCalled();
+  });
+
+  it("rewinds ended audio after a backward seek within the active clip", () => {
+    const clip = createMockClip(
+      { start: 3.12, end: 3.67, duration: 0.55, sourceDuration: 0.55 },
+      "audio",
+    );
+    Object.defineProperty(clip.el, "currentTime", { value: 0.5, writable: true });
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 3.62, playing: true, playbackRate: 1 });
+    vi.mocked(clip.el.play).mockClear();
+
+    clip.el.currentTime = 0.55;
+    Object.defineProperty(clip.el, "paused", { value: true, writable: true });
+    Object.defineProperty(clip.el, "ended", { value: true, writable: true, configurable: true });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 3.12,
+      playing: true,
+      playbackRate: 1,
+      forceSync: true,
+    });
+
+    expect(clip.el.currentTime).toBe(0);
     expect(clip.el.play).toHaveBeenCalledTimes(1);
   });
 
@@ -582,7 +1038,7 @@ describe("syncRuntimeMedia", () => {
     expect(clip.el.volume).toBe(0.5);
   });
 
-  it("reports the effective element volume to external audio transports", () => {
+  it("reports effective and author-only volume to external audio transports", () => {
     const clip = createMockClip({ start: 0, end: 10, volume: 0 });
     const onElementVolume = vi.fn();
     syncRuntimeMedia({
@@ -603,7 +1059,48 @@ describe("syncRuntimeMedia", () => {
     });
 
     expect(clip.el.volume).toBeCloseTo(0.375);
-    expect(onElementVolume).toHaveBeenLastCalledWith(clip.el, 0.375);
+    expect(onElementVolume).toHaveBeenLastCalledWith(clip.el, 0.375, 0.75);
+  });
+
+  it("preserves author volume through user zero then restore", () => {
+    const clip = createMockClip({ start: 0, end: 10, volume: 0.8 });
+    const onElementVolume = vi.fn();
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 1,
+      playing: false,
+      playbackRate: 1,
+      userVolume: 0,
+      onElementVolume,
+    });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 2,
+      playing: false,
+      playbackRate: 1,
+      userVolume: 0.5,
+      onElementVolume,
+    });
+
+    expect(onElementVolume.mock.calls.at(-2)).toEqual([clip.el, 0, 0.8]);
+    expect(onElementVolume.mock.calls.at(-1)).toEqual([clip.el, 0.4, 0.8]);
+  });
+
+  it("does not mistake routed upstream unity for an authored volume change", () => {
+    const clip = createMockClip({ start: 0, end: 10, volume: 0.8 });
+    clip.el.volume = 1;
+    const onElementVolume = vi.fn();
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 1,
+      playing: true,
+      playbackRate: 1,
+      userVolume: 0.5,
+      isWebAudioRouted: (el) => el === clip.el,
+      onElementVolume,
+    });
+
+    expect(onElementVolume).toHaveBeenLastCalledWith(clip.el, 0.4, 0.8);
   });
 
   describe("per-element mute (Web Audio ownership)", () => {
@@ -756,6 +1253,30 @@ describe("syncRuntimeMedia", () => {
     Object.defineProperty(clip.el, "currentTime", { value: 0, writable: true });
     syncRuntimeMedia({ clips: [clip], timeSeconds: 3, playing: true, playbackRate: 1 });
     expect(clip.el.currentTime).toBe(3);
+  });
+
+  it("rewinds stale short audio on its first tick after re-entry", () => {
+    const clip = createMockClip(
+      { start: 3.12, end: 3.67, duration: 0.55, sourceDuration: 0.55 },
+      "audio",
+    );
+    Object.defineProperty(clip.el, "currentTime", { value: 0.49, writable: true });
+
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 3.12, playing: true, playbackRate: 1 });
+
+    expect(clip.el.currentTime).toBe(0);
+  });
+
+  it("does not force cold audio forward on its first active tick", () => {
+    const clip = createMockClip(
+      { start: 3.12, end: 3.67, duration: 0.55, sourceDuration: 0.55 },
+      "audio",
+    );
+    Object.defineProperty(clip.el, "currentTime", { value: 0, writable: true });
+
+    syncRuntimeMedia({ clips: [clip], timeSeconds: 3.61, playing: true, playbackRate: 1 });
+
+    expect(clip.el.currentTime).toBe(0);
   });
 
   it("sets per-element playbackRate × global rate", () => {

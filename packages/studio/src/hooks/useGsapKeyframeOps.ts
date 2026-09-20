@@ -1,3 +1,5 @@
+// fallow-ignore-file code-duplication
+// Add/remove operation-family transaction shapes stay parallel until SDK graduation.
 import { useCallback } from "react";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { Composition } from "@hyperframes/sdk";
@@ -234,7 +236,7 @@ export function useGsapKeyframeOps({
   );
 
   const moveKeyframe = useCallback(
-    (
+    async (
       selection: DomEditSelection,
       animationId: string,
       fromPercentage: number,
@@ -245,18 +247,26 @@ export function useGsapKeyframeOps({
       // updateKeyframeCacheFromParsed re-keys the diamond from the fresh parse, so no
       // optimistic cache write is needed (mapping the tween-% to clip-% here would
       // duplicate that math). softReload mirrors remove-keyframe.
-      void commitMutation(selection, mutation, {
-        label: `Move keyframe to ${toPercentage}%`,
-        softReload: true,
-      }).catch((error) => {
+      try {
+        let changed = false;
+        await commitMutation(selection, mutation, {
+          label: `Move keyframe to ${toPercentage}%`,
+          softReload: true,
+          onResult: (result) => {
+            changed = result.changed !== false;
+          },
+        });
+        return changed;
+      } catch (error) {
         trackGsapSaveFailure(error, selection, mutation, `Move keyframe to ${toPercentage}%`);
-      });
+        return false;
+      }
     },
     [commitMutation, trackGsapSaveFailure],
   );
 
   const resizeKeyframedTween = useCallback(
-    (
+    async (
       selection: DomEditSelection,
       animationId: string,
       position: number,
@@ -273,12 +283,20 @@ export function useGsapKeyframeOps({
       // Boundary drag-to-retime: the server re-keys keyframes in place + grows the
       // tween window, preserving _auto / per-keyframe ease / easeEach / outer ease.
       // softReload re-keys the diamonds from the fresh parse (mirrors moveKeyframe).
-      void commitMutation(selection, mutation, {
-        label: "Retime keyframe (resize tween)",
-        softReload: true,
-      }).catch((error) => {
+      try {
+        let changed = false;
+        await commitMutation(selection, mutation, {
+          label: "Retime keyframe (resize tween)",
+          softReload: true,
+          onResult: (result) => {
+            changed = result.changed !== false;
+          },
+        });
+        return changed;
+      } catch (error) {
         trackGsapSaveFailure(error, selection, mutation, "Retime keyframe (resize tween)");
-      });
+        return false;
+      }
     },
     [commitMutation, trackGsapSaveFailure],
   );
@@ -317,11 +335,9 @@ export function useGsapKeyframeOps({
   const removeAllKeyframes = useCallback(
     async (selection: DomEditSelection, animationId: string) => {
       const targetPath = selection.sourceFile || activeCompPath || "index.html";
-      // remove-all-keyframes collapses the tween to a static hold and the commit
-      // path doesn't return parsed animations, so the keyframe cache is never
-      // refreshed — clear it here so the timeline diamonds disappear immediately.
-      const elementId = selection.id ?? selection.selector?.match(/^#([\w-]+)/)?.[1] ?? null;
-      if (elementId) clearKeyframeCacheForElement(targetPath, elementId);
+      // A class/descendant selector can resolve a live element whose selection
+      // deliberately has no id. The cache is still keyed by that DOM id.
+      const cacheElementId = selection.id || selection.element?.id;
       if (sdkSession && sdkDeps) {
         const handled = await sdkGsapRemoveAllKeyframesPersist(
           targetPath,
@@ -330,12 +346,26 @@ export function useGsapKeyframeOps({
           sdkDeps,
           { label: "Remove all keyframes" },
         );
-        if (cutoverCommittedOrThrow(handled)) return;
+        if (cutoverCommittedOrThrow(handled)) {
+          if (cacheElementId) clearKeyframeCacheForElement(targetPath, cacheElementId);
+          return;
+        }
       }
-      commitMutationSafely(
+      await commitMutationSafely(
         selection,
         { type: "remove-all-keyframes", animationId },
-        { label: "Remove all keyframes", softReload: true },
+        {
+          label: "Remove all keyframes",
+          softReload: true,
+          // The committed result is the single success boundary: clearing
+          // before it makes failed saves lie, while waiting for the reload leaves
+          // stale diamonds visible during the source round-trip.
+          onResult: (result) => {
+            if (result.changed !== false && cacheElementId) {
+              clearKeyframeCacheForElement(targetPath, cacheElementId);
+            }
+          },
+        },
       );
     },
     [commitMutationSafely, activeCompPath, sdkSession, sdkDeps],

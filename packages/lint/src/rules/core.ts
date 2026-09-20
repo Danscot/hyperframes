@@ -1,28 +1,153 @@
 import type { LintContext, HyperframeLintFinding } from "../context";
 import postcss from "postcss";
+import selectorParser from "postcss-selector-parser";
+import {
+  HTML_BODY_CSS_WIDTH_FIRST_RE,
+  HTML_BODY_CSS_HEIGHT_FIRST_RE,
+  VIEWPORT_META_SIZE_RE,
+} from "@hyperframes/parsers";
 import {
   readAttr,
   readDecodedAttr,
   truncateSnippet,
   stripJsComments,
+  stripStringLiterals,
   extractCompositionIdsFromCss,
   extractTimelineRegistryKeys,
   getInlineScriptSyntaxError,
+  hasUnquotedLessThan,
   TIMELINE_REGISTRY_INIT_PATTERN,
   TIMELINE_REGISTRY_ASSIGN_PATTERN,
   TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN,
   INVALID_SCRIPT_CLOSE_PATTERN,
 } from "../utils";
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function repeatedDescendantId(selector: string): string | null {
+  let repeated: string | null = null;
+
+  const requiredPseudoIds = (pseudo: selectorParser.Pseudo): Set<string> => {
+    if (![":is", ":where"].includes(pseudo.value.toLowerCase()) || pseudo.nodes.length === 0) {
+      return new Set<string>();
+    }
+
+    const optionIdSets: Set<string>[] = [];
+    for (const option of pseudo.nodes) {
+      // Only promote ids from a single compound. For selector-list branches with
+      // combinators, determining which compound is the subject requires fuller
+      // selector semantics; skipping them avoids false positives.
+      if (option.nodes.some((node) => node.type === "combinator")) return new Set<string>();
+      const optionIds = new Set<string>(
+        option.nodes.filter((node) => node.type === "id").map((node) => node.value),
+      );
+      optionIdSets.push(optionIds);
+    }
+    const [firstOptionIds, ...remainingOptionIds] = optionIdSets;
+    return new Set<string>(
+      [...(firstOptionIds ?? [])].filter((id) =>
+        remainingOptionIds.every((optionIds) => optionIds.has(id)),
+      ),
+    );
+  };
+
+  try {
+    selectorParser((root) => {
+      root.each((selectorNode) => {
+        const firstCompoundById = new Map<string, number>();
+        let compound = 0;
+        selectorNode.each((node) => {
+          if (repeated) return;
+          if (node.type === "combinator") {
+            compound += 1;
+            return;
+          }
+          const requiredIds =
+            node.type === "id"
+              ? [node.value]
+              : node.type === "pseudo"
+                ? [...requiredPseudoIds(node)]
+                : [];
+          for (const id of requiredIds) {
+            const firstCompound = firstCompoundById.get(id);
+            if (firstCompound !== undefined && firstCompound !== compound) {
+              repeated = id;
+              return;
+            }
+            firstCompoundById.set(id, compound);
+          }
+        });
+      });
+    }).processSync(selector);
+  } catch {
+    return null;
+  }
+  return repeated;
 }
 
-function selectorTargetsCompositionId(selector: string, compositionId: string): boolean {
-  const escaped = escapeRegExp(compositionId);
-  return new RegExp(
-    String.raw`\[\s*data-composition-id\s*=\s*(?:"${escaped}"|'${escaped}')\s*\]`,
-  ).test(selector);
+function resolvedRuleSelectors(rule: postcss.Rule): string[] {
+  let ancestor: postcss.AnyNode | undefined = rule.parent;
+  while (ancestor && ancestor.type !== "rule") ancestor = ancestor.parent;
+  if (!ancestor || ancestor.type !== "rule") return rule.selectors;
+
+  const parentSelectors = resolvedRuleSelectors(ancestor);
+  return parentSelectors.flatMap((parentSelector) =>
+    rule.selectors.map((childSelector) => {
+      const nestingToken = /(^|[\s>+~,(])&/g;
+      if (nestingToken.test(childSelector)) {
+        return childSelector.replace(
+          nestingToken,
+          (_, separator: string) => separator + parentSelector,
+        );
+      }
+      return `${parentSelector} ${childSelector}`;
+    }),
+  );
+}
+
+function selectorAliasesRuntimeHiddenStyle(selector: string): boolean {
+  let unsafe = false;
+  try {
+    selectorParser((root) => {
+      root.each((selectorNode) => {
+        const subject: selectorParser.Node[] = [];
+        selectorNode.each((node) => {
+          if (node.type === "combinator") subject.length = 0;
+          else subject.push(node);
+        });
+
+        const hostScoped = subject.some(
+          (node) =>
+            node.type === "attribute" &&
+            ["data-composition-src", "data-composition-file"].includes(
+              node.attribute.toLowerCase(),
+            ),
+        );
+        if (hostScoped) return;
+
+        if (
+          subject.some((node) => {
+            if (node.type !== "attribute" || node.attribute.toLowerCase() !== "style") return false;
+            if (node.operator !== "*=" || !node.value) return false;
+            const needle = node.insensitive ? node.value.toLowerCase() : node.value;
+            if (!needle.includes("visibility") && !needle.includes("hidden")) return false;
+            return "visibility: hidden !important;".includes(needle);
+          })
+        ) {
+          unsafe = true;
+        }
+      });
+    }).processSync(selector);
+  } catch {
+    return false;
+  }
+  return unsafe;
+}
+
+function ruleForcesOpacityZero(rule: postcss.Rule): boolean {
+  let forcesOpacityZero = false;
+  rule.walkDecls(/^opacity$/i, (declaration) => {
+    if (Number(declaration.value.trim()) === 0) forcesOpacityZero = true;
+  });
+  return forcesOpacityZero;
 }
 
 function isStudioTimelineElement(tag: { raw: string; name: string }): boolean {
@@ -59,17 +184,6 @@ function describeStudioElement(tag: { raw: string; name: string }): string {
   return parts.join("");
 }
 
-const HEAD_BLOCKS_TO_IGNORE_PATTERN =
-  /<(?:style|script|template|title|noscript)\b[^>]*>[\s\S]*?<\/(?:style|script|template|title|noscript)(?:\s[^>]*)?>/gi;
-const HTML_TAG_PATTERN = /<[^>]+>/g;
-const HEAD_CONTENT_PATTERN = /<head\b[^>]*>([\s\S]*?)(?:<\/head>|<body\b|$)/gi;
-const AFTER_HEAD_BEFORE_BODY_PATTERN = /<\/head(?:\s[^>]*)?>([\s\S]*?)(?=<body\b|$)/gi;
-const STRAY_HEAD_CLOSE_PATTERN = /<\/(?:style|script)(?:\s[^>]*)?>/i;
-const MARKDOWN_CODE_FENCE_PATTERN = /```[^\r\n`]*(?:\r?\n|$)[\s\S]*?```/i;
-const ORPHAN_CSS_AT_RULE_PATTERN =
-  /(?:^|\s)@(?:container|font-face|keyframes|layer|media|page|property|scope|supports)[^{<]*\{[\s\S]*?:[\s\S]*?\}/i;
-const ORPHAN_CSS_RULE_PATTERN =
-  /(?:^|\s)(?:\/\*[\s\S]*?\*\/\s*)?(?:@[a-z-]+[^{}<]*|[.#][\w-]+[^{}<]*|[a-z][\w-]*(?:\s+[.#:[\w-][^{}<]*)?)\s*\{[^{}]*:[^{}]*\}/i;
 const VISIBLE_MARKUP_COMMENT_PATTERN = /\/\*[\s\S]*?\*\//g;
 const VISIBLE_MARKUP_COMMENT_PROTECTED_BLOCK_PATTERN =
   /<(style|script|template|title|noscript|pre|code|textarea|text)\b[^>]*>[\s\S]*?<\/\1(?:\s[^>]*)?>/gi;
@@ -77,64 +191,6 @@ const VISIBLE_MARKUP_COMMENT_PROTECTED_BLOCK_PATTERN =
 interface SourceRange {
   start: number;
   end: number;
-}
-
-function findCodeFenceLeak(headWithoutValidBlocks: string): string | null {
-  return MARKDOWN_CODE_FENCE_PATTERN.exec(headWithoutValidBlocks)?.[0] ?? null;
-}
-
-function findOrphanCssLeak(headContent: string): string | null {
-  const residualText = headContent
-    .replace(HEAD_BLOCKS_TO_IGNORE_PATTERN, " ")
-    .replace(HTML_TAG_PATTERN, " ");
-  return (
-    ORPHAN_CSS_AT_RULE_PATTERN.exec(residualText)?.[0] ??
-    ORPHAN_CSS_RULE_PATTERN.exec(residualText)?.[0] ??
-    null
-  );
-}
-
-function findStrayCloseLeak(headWithoutValidBlocks: string): string | null {
-  return STRAY_HEAD_CLOSE_PATTERN.exec(headWithoutValidBlocks)?.[0] ?? null;
-}
-
-function findLeakedTextInHeadContent(headContent: string): string | null {
-  const withoutValidBlocks = headContent.replace(HEAD_BLOCKS_TO_IGNORE_PATTERN, " ");
-  return (
-    findCodeFenceLeak(withoutValidBlocks) ??
-    findOrphanCssLeak(headContent) ??
-    findStrayCloseLeak(withoutValidBlocks)
-  );
-}
-
-function findLeakedTextInHead(rawSource: string): string | null {
-  const headMatches = [...rawSource.matchAll(HEAD_CONTENT_PATTERN)];
-  for (const match of headMatches) {
-    const leakedText = findLeakedTextInHeadContent(match[1] ?? "");
-    if (leakedText) return leakedText;
-  }
-  return null;
-}
-
-function findLeakedTextBetweenHeadAndBody(rawSource: string): string | null {
-  const boundaryMatches = [...rawSource.matchAll(AFTER_HEAD_BEFORE_BODY_PATTERN)];
-  for (const match of boundaryMatches) {
-    const leakedText = findLeakedTextInHeadContent(match[1] ?? "");
-    if (leakedText) return leakedText;
-  }
-  return null;
-}
-
-function findLeakedTextBeforeCompositionRoot(
-  source: string,
-  rootTag: LintContext["rootTag"],
-): string | null {
-  if (!rootTag || rootTag.name === "body") return null;
-  const bodyOpenMatch = /<body\b[^>]*>/i.exec(source);
-  const prefixStart = bodyOpenMatch ? bodyOpenMatch.index + bodyOpenMatch[0].length : 0;
-  const prefixEnd = rootTag.index;
-  if (prefixEnd <= prefixStart) return null;
-  return findLeakedTextInHeadContent(source.slice(prefixStart, prefixEnd));
 }
 
 function findProtectedVisibleMarkupRanges(source: string): SourceRange[] {
@@ -181,6 +237,80 @@ function findVisibleMarkupCommentLeak(source: string): string | null {
   return null;
 }
 
+type ScaffoldSize = { width: string; height: string };
+
+// Groups 1 and 3 are prefix text for applyResolutionPreset's in-place
+// replace; lint only reads the digit groups (2 and 4).
+function readHtmlBodyCssSize(source: string): ScaffoldSize | null {
+  const widthFirst = source.match(HTML_BODY_CSS_WIDTH_FIRST_RE);
+  if (widthFirst) {
+    const [, , width = "", , height = ""] = widthFirst;
+    return { width, height };
+  }
+  const heightFirst = source.match(HTML_BODY_CSS_HEIGHT_FIRST_RE);
+  if (heightFirst) {
+    const [, , height = "", , width = ""] = heightFirst;
+    return { width, height };
+  }
+  return null;
+}
+
+function readViewportMetaSize(source: string): ScaffoldSize | null {
+  const match = source.match(VIEWPORT_META_SIZE_RE);
+  if (!match) return null;
+  const [, , width = "", , height = ""] = match;
+  return { width, height };
+}
+
+function describeSizeMismatch(
+  label: string,
+  size: ScaffoldSize | null,
+  dataWidth: string,
+  dataHeight: string,
+): string | null {
+  if (!size || (size.width === dataWidth && size.height === dataHeight)) return null;
+  return `${label} is ${size.width}x${size.height}`;
+}
+
+// Only html/body CSS actually clips the root; the CDP viewport comes from
+// data-width/data-height, not `<meta viewport>` — so a viewport-only drift gets distinct wording.
+function describeRootDimensionsDrift(
+  source: string,
+  dataWidth: string,
+  dataHeight: string,
+): { message: string; fixHint: string } | null {
+  const bodyCssMismatch = describeSizeMismatch(
+    "html/body CSS",
+    readHtmlBodyCssSize(source),
+    dataWidth,
+    dataHeight,
+  );
+  const viewportMismatch = describeSizeMismatch(
+    "the viewport meta",
+    readViewportMetaSize(source),
+    dataWidth,
+    dataHeight,
+  );
+  if (!bodyCssMismatch && !viewportMismatch) return null;
+
+  const declared = `Root composition declares data-width="${dataWidth}" data-height="${dataHeight}"`;
+  if (!bodyCssMismatch) {
+    return {
+      message: `${declared}, but ${viewportMismatch}. The viewport meta has no effect on capture — the renderer sizes the viewport from the root's own data-width/data-height — so this is stale metadata, not a clipping risk.`,
+      fixHint:
+        "update the meta viewport to match, or scaffold with `hyperframes init --resolution portrait`",
+    };
+  }
+  const mismatches = viewportMismatch
+    ? `${bodyCssMismatch} and ${viewportMismatch}`
+    : bodyCssMismatch;
+  return {
+    message: `${declared}, but ${mismatches}. The scaffolded body clips the composition at its old size.`,
+    fixHint:
+      "update html/body CSS and the meta viewport to match, or scaffold with `hyperframes init --resolution portrait`",
+  };
+}
+
 export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   // id_requires_css_escape
   ({ tags }) => {
@@ -202,6 +332,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   },
 
   // root_missing_composition_id + root_missing_dimensions
+  // fallow-ignore-next-line complexity
   ({ rootTag }) => {
     const findings: HyperframeLintFinding[] = [];
     if (!rootTag || !readDecodedAttr(rootTag.raw, "data-composition-id")) {
@@ -227,22 +358,67 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     return findings;
   },
 
-  // head_leaked_text
-  ({ source, rootTag }) => {
-    const snippet =
-      findLeakedTextInHead(source) ??
-      findLeakedTextBetweenHeadAndBody(source) ??
-      findLeakedTextBeforeCompositionRoot(source, rootTag);
-    if (!snippet) return [];
+  // root_dimensions_mismatch
+  //
+  // Render size and the runtime's forced #root size both read the root's own
+  // data-width/data-height, so they stay correct. But editing only those two
+  // attributes — rather than scaffolding with `hyperframes init --resolution`,
+  // which rewrites the scaffold's other copies of the resolution too — leaves
+  // the `html, body` CSS and the `<meta viewport>` at the old value, and a
+  // stale body with `overflow: hidden` visually clips the correctly-sized
+  // root. `hyperframes check`'s layout audits can't see it: they measure
+  // against the root's own (already-correct) rect, not the body's.
+  //
+  // Sub-compositions are exempt: loadExternalCompositions (packages/core/src/
+  // runtime/compositionLoader.ts) mounts only the matched <template>/<body>
+  // subtree, so a sub-comp's own <html>/<head>/<meta viewport> never reach
+  // the rendering document, even when it's a full standalone document.
+  ({ rootTag, source, options }) => {
+    if (!rootTag || options.isSubComposition) return [];
+    const dataWidth = readAttr(rootTag.raw, "data-width");
+    const dataHeight = readAttr(rootTag.raw, "data-height");
+    if (!dataWidth || !dataHeight) return [];
+
+    const drift = describeRootDimensionsDrift(source, dataWidth, dataHeight);
+    if (!drift) return [];
+
     return [
       {
-        code: "head_leaked_text",
+        code: "root_dimensions_mismatch",
+        severity: "warning",
+        message: drift.message,
+        elementId: readAttr(rootTag.raw, "id") || undefined,
+        fixHint: drift.fixHint,
+        snippet: truncateSnippet(rootTag.raw),
+      },
+    ];
+  },
+
+  // unbalanced_style_tags
+  ({ source }) => {
+    let opens = 0;
+    let closes = 0;
+    let firstTag = "";
+    for (const match of source.matchAll(
+      /<script\b[\s\S]*?<\/script[^>]*>|<style\b|<\/style\s*>/gi,
+    )) {
+      const token = match[0].toLowerCase();
+      if (token.startsWith("<script")) continue;
+      if (token.startsWith("</style")) closes += 1;
+      else opens += 1;
+      if (!firstTag) firstTag = match[0];
+    }
+    if (opens === closes) return [];
+    return [
+      {
+        code: "unbalanced_style_tags",
         severity: "error",
         message:
-          "Detected leaked code or CSS text around the document `<head>` or before the composition root. Browsers render this as visible text in the video.",
-        fixHint:
-          "Move CSS into a single `<style>...</style>` block and remove stray close tags, markdown fences, or code text from `<head>`, the `</head>`/`<body>` boundary, or the pre-root body prefix.",
-        snippet: truncateSnippet(snippet),
+          opens > closes
+            ? "A <style> block is never closed, so following markup is parsed as CSS and disappears from the frame."
+            : "An extra </style> closes the stylesheet early, so trailing CSS renders as visible on-screen text.",
+        fixHint: "Keep <style> and </style> paired. One extra closer dumps CSS into the body.",
+        snippet: truncateSnippet(firstTag || "<style>"),
       },
     ];
   },
@@ -264,7 +440,8 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     ];
   },
 
-  // missing_timeline_registry + timeline_registry_missing_init
+  // missing_timeline_registry
+  // fallow-ignore-next-line complexity
   ({ source, rawSource, rootTag, options }) => {
     // Sub-compositions inherit window.__timelines from the host composition
     if (options.isSubComposition || rawSource.trimStart().toLowerCase().startsWith("<template")) {
@@ -284,19 +461,17 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         fixHint: "Register each composition timeline on `window.__timelines[compositionId]`.",
       });
     }
-    if (
-      TIMELINE_REGISTRY_ASSIGN_PATTERN.test(source) &&
-      !TIMELINE_REGISTRY_INIT_PATTERN.test(source)
-    ) {
-      findings.push({
-        code: "timeline_registry_missing_init",
-        severity: "error",
-        message:
-          "`window.__timelines[…] = …` is used without initializing `window.__timelines` first.",
-        fixHint:
-          "Add `window.__timelines = window.__timelines || {};` before any timeline assignment.",
-      });
-    }
+    // `timeline_registry_missing_init` used to fire here, demanding
+    // `window.__timelines = window.__timelines || {}` before any assignment.
+    // The runtime already owns that invariant: runtime/entry.ts creates the
+    // registry at script-evaluation time, before any inline composition script
+    // runs, and both injection paths put the runtime bundle in <head> ahead of
+    // the body scripts that build timelines. Verified by rendering a
+    // composition whose only registration is a bare
+    // `window.__timelines["main"] = gsap.timeline(...)`: it renders and
+    // animates correctly. The rule made a working file fail lint, and a lint
+    // ERROR also suppresses the layout and contrast audits in `check`, so it
+    // cost far more than the line it was protecting.
     return findings;
   },
 
@@ -317,6 +492,77 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
           fixHint: `Change window.__timelines["${key}"] to match the data-composition-id attribute, or vice versa.`,
         });
       }
+    }
+    return findings;
+  },
+
+  // CSS selector safety
+  ({ styles }) => {
+    const findings: HyperframeLintFinding[] = [];
+    const reportedRepeatedIds = new Set<string>();
+    const reportedHiddenStyleSelectors = new Set<string>();
+    for (const style of styles) {
+      let root: postcss.Root;
+      try {
+        root = postcss.parse(style.content);
+      } catch (error) {
+        findings.push({
+          code: "css_parse_error",
+          severity: "error",
+          message: `CSS parse error: ${error instanceof Error ? error.message : "unknown"}`,
+        });
+        continue;
+      }
+      root.walkRules((rule) => {
+        const forcesOpacityZero = ruleForcesOpacityZero(rule);
+        for (const selector of resolvedRuleSelectors(rule)) {
+          const repeatedId = repeatedDescendantId(selector);
+          if (repeatedId && !reportedRepeatedIds.has(repeatedId)) {
+            reportedRepeatedIds.add(repeatedId);
+            findings.push({
+              code: "repeated_id_descendant_selector",
+              severity: "error",
+              message: `Selector "${selector}" requires #${repeatedId} to be nested inside another #${repeatedId}. IDs must be unique, so this selector cannot match a valid composition.`,
+              selector,
+              fixHint: `Remove the duplicate ancestor: change \`#${repeatedId} #${repeatedId}\` to \`#${repeatedId}\`.`,
+            });
+          }
+
+          if (
+            !forcesOpacityZero ||
+            reportedHiddenStyleSelectors.has(selector) ||
+            !selectorAliasesRuntimeHiddenStyle(selector)
+          ) {
+            continue;
+          }
+          reportedHiddenStyleSelectors.add(selector);
+          findings.push({
+            code: "runtime_hidden_style_opacity",
+            severity: "error",
+            message: `Selector "${selector}" observes HyperFrames' runtime-owned hidden style and forces opacity to zero. The renderer hides each native video before copying its computed opacity to the visible replacement frame, so this rule makes both transparent.`,
+            selector,
+            fixHint:
+              'Restrict the guard to sub-composition hosts, for example `[data-composition-src][style*="visibility: hidden"]` and `[data-composition-file][style*="visibility: hidden"]`. Do not derive arbitrary element or media opacity from runtime-owned inline visibility.',
+            snippet: truncateSnippet(rule.toString()),
+          });
+        }
+      });
+    }
+    return findings;
+  },
+
+  // unclosed_tag_swallowed_element
+  ({ tags }) => {
+    const findings: HyperframeLintFinding[] = [];
+    for (const tag of tags) {
+      if (!hasUnquotedLessThan(tag.attrs)) continue;
+      findings.push({
+        code: "unclosed_tag_swallowed_element",
+        severity: "error",
+        message: `<${tag.name}> is missing its closing \`>\` before the next \`<\` — the following element is swallowed as bogus attribute text and never becomes a real node.`,
+        fixHint: "Close the previous tag's `>` before opening the next element.",
+        snippet: truncateSnippet(tag.raw),
+      });
     }
     return findings;
   },
@@ -401,40 +647,6 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     return findings;
   },
 
-  // composition_self_attribute_selector
-  ({ styles, rootCompositionId, rootTag }) => {
-    const findings: HyperframeLintFinding[] = [];
-    if (!rootCompositionId) return findings;
-    const seenSelectors = new Set<string>();
-    const rootId = readAttr(rootTag?.raw || "", "id");
-    for (const style of styles) {
-      let root: postcss.Root;
-      try {
-        root = postcss.parse(style.content);
-      } catch {
-        continue;
-      }
-      root.walkRules((rule) => {
-        for (const selector of rule.selectors) {
-          if (!selectorTargetsCompositionId(selector, rootCompositionId)) continue;
-          if (seenSelectors.has(selector)) continue;
-          seenSelectors.add(selector);
-          findings.push({
-            code: "composition_self_attribute_selector",
-            severity: "warning",
-            message:
-              "Selector matches the block's own id; will leak to sibling instances when the block is embedded twice.",
-            selector,
-            fixHint: rootId
-              ? `Use #${rootId} for clearer authoring intent and instance-isolated styling.`
-              : "Add a stable id to the composition root and use that id selector for clearer authoring intent and instance-isolated styling.",
-          });
-        }
-      });
-    }
-    return findings;
-  },
-
   // studio_missing_editable_id
   ({ tags, rootTag }) => {
     const findings: HyperframeLintFinding[] = [];
@@ -462,7 +674,13 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   // non_deterministic_code
   ({ scripts }) => {
     const findings: HyperframeLintFinding[] = [];
-    const patterns: Array<{ pattern: RegExp; label: string; hint: string }> = [
+    const patterns: Array<{
+      pattern: RegExp;
+      label: string;
+      hint: string;
+      /** Match against raw source, because the value being matched is a string GSAP parses. */
+      scansStrings?: boolean;
+    }> = [
       {
         pattern: /Math\.random\s*\(/,
         label: "Math.random()",
@@ -474,7 +692,10 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         hint: "Remove time-dependent code. Use GSAP timeline position instead of wall-clock time.",
       },
       {
-        pattern: /new\s+Date\s*\(/,
+        // Zero-arg only. `new Date(<fixed timestamp>)` is fully deterministic and is how
+        // a composition labels a fixed date on an axis or card; the hint ("remove
+        // time-dependent code") cannot be applied to it without deleting the label.
+        pattern: /new\s+Date\s*\(\s*\)/,
         label: "new Date()",
         hint: "Remove time-dependent code. Use GSAP timeline position instead of wall-clock time.",
       },
@@ -486,7 +707,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       {
         pattern: /crypto\.getRandomValues\s*\(/,
         label: "crypto.getRandomValues()",
-        hint: "Remove time-dependent code. Use a seeded PRNG for deterministic renders.",
+        hint: "Use a seeded PRNG (e.g. a simple mulberry32) so renders are deterministic across frames.",
       },
       {
         pattern: /gsap\.utils\.random\s*\(/,
@@ -495,16 +716,25 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       },
       {
         // GSAP string form: "random(...)" / "+=random(...)" — re-rolls at tween init.
+        // `scansStrings` because here the string IS the executed value: GSAP parses it.
+        // Every other pattern above matches executable code, so a match inside a string
+        // literal is inert text and must not be reported.
         pattern: /["'`](?:[+-]=)?random\(\s*[-\d[]/,
+        scansStrings: true,
         label: '"random(...)" tween value',
         hint: "GSAP random string values re-roll at tween init and each render worker initializes independently. Use fixed values or precompute with a seeded PRNG.",
       },
     ];
 
     for (const script of scripts) {
-      const stripped = stripJsComments(script.content);
-      for (const { pattern, label, hint } of patterns) {
-        if (pattern.test(stripped)) {
+      const withoutComments = stripJsComments(script.content);
+      // Strings are content, not code. A composition that DISPLAYS source (the
+      // code-snippet blocks, /pr-to-video) carries `Math.random()` inside a string
+      // literal it never executes, and reported itself non-deterministic with no
+      // way to clear the error while still rendering the snippet.
+      const executable = stripStringLiterals(withoutComments);
+      for (const { pattern, label, hint, scansStrings } of patterns) {
+        if (pattern.test(scansStrings ? withoutComments : executable)) {
           findings.push({
             code: "non_deterministic_code",
             severity: "error",
@@ -515,59 +745,6 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         }
       }
     }
-    return findings;
-  },
-
-  // pointer_events_none
-  // fallow-ignore-next-line complexity
-  ({ tags, styles }) => {
-    const findings: HyperframeLintFinding[] = [];
-    const reported = new Set<string>();
-
-    for (const tag of tags) {
-      if (["script", "style", "link", "meta", "template", "noscript"].includes(tag.name)) continue;
-      const inlineStyle = readAttr(tag.raw, "style") ?? "";
-      if (!/pointer-events\s*:\s*none/i.test(inlineStyle)) continue;
-      const id = readAttr(tag.raw, "id");
-      const key = id ?? tag.raw;
-      if (reported.has(key)) continue;
-      reported.add(key);
-      findings.push({
-        code: "pointer_events_none",
-        severity: "info",
-        message: `<${tag.name}${id ? ` id="${id}"` : ""}> has \`pointer-events: none\` in its inline style. Elements with this property are harder to select in the Studio preview.`,
-        elementId: id || undefined,
-        fixHint:
-          "If this element should be selectable in the Studio, remove `pointer-events: none` or move it to a wrapper that doesn't contain editable content.",
-        snippet: truncateSnippet(tag.raw),
-      });
-    }
-
-    for (const style of styles) {
-      let root: postcss.Root;
-      try {
-        root = postcss.parse(style.content);
-      } catch {
-        continue;
-      }
-      root.walkDecls("pointer-events", (decl) => {
-        if (decl.value.trim().toLowerCase() !== "none") return;
-        const rule = decl.parent;
-        if (!rule || rule.type !== "rule") return;
-        const selector = (rule as postcss.Rule).selector;
-        if (reported.has(selector)) return;
-        reported.add(selector);
-        findings.push({
-          code: "pointer_events_none",
-          severity: "info",
-          message: `\`${selector}\` sets \`pointer-events: none\`. Elements matching this selector are harder to select in the Studio preview.`,
-          selector,
-          fixHint:
-            "If these elements should be selectable in the Studio, remove `pointer-events: none` or move it to a wrapper that doesn't contain editable content.",
-        });
-      });
-    }
-
     return findings;
   },
 ];

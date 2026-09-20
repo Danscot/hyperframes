@@ -6,12 +6,14 @@ import {
   deleteSelectedKeyframes,
   extendRootDurationIfNeeded,
   patchIframeDomTiming,
+  persistElementAttribute,
   persistTimelineBatchEdit,
   type PersistTimelineBatchChange,
 } from "./timelineEditingHelpers";
 import type { TimelineElement } from "../player/store/playerStore";
 import { usePlayerStore } from "../player/store/playerStore";
 import type { CommitMutationOptions } from "./gsapScriptCommitTypes";
+import { timelineKeyframeSelectionKey } from "../player/components/timelineKeyframeIdentity";
 
 afterEach(() => {
   usePlayerStore.getState().reset();
@@ -241,7 +243,6 @@ describe("persistTimelineBatchEdit", () => {
         writes.push([path, content]);
       },
       recordEdit: async () => {},
-      domEditSaveTimestampRef: { current: 0 },
       pendingTimelineEditPathRef: { current: new Set<string>() },
     };
   }
@@ -341,5 +342,167 @@ describe("deleteSelectedKeyframes", () => {
     expect(options[0]).not.toHaveProperty("softReload");
     expect(options[1]).not.toHaveProperty("softReload");
     expect(options[2]).not.toHaveProperty("skipReload");
+  });
+
+  it("deletes two expanded lanes through their own animation and tween percentages", () => {
+    usePlayerStore.setState({
+      selectedElementId: "card",
+      selectedKeyframes: new Set([
+        timelineKeyframeSelectionKey("card", {
+          percentage: 30,
+          tweenPercentage: 20,
+          propertyGroup: "position",
+          animationId: "card-position",
+        }),
+        timelineKeyframeSelectionKey("card", {
+          percentage: 70,
+          tweenPercentage: 80,
+          propertyGroup: "visual",
+          animationId: "card-visual",
+        }),
+      ]),
+    });
+    const handleGsapRemoveKeyframe =
+      vi.fn<(animId: string, pct: number, options?: Partial<CommitMutationOptions>) => void>();
+
+    deleteSelectedKeyframes({
+      selectedGsapAnimations: [
+        { id: "card-position", keyframes: {} },
+        { id: "card-visual", keyframes: {} },
+      ],
+      handleGsapRemoveKeyframe,
+    });
+
+    expect(handleGsapRemoveKeyframe).toHaveBeenCalledTimes(2);
+    expect(
+      handleGsapRemoveKeyframe.mock.calls.map(([animationId, percentage]) => [
+        animationId,
+        percentage,
+      ]),
+    ).toEqual([
+      ["card-position", 20],
+      ["card-visual", 80],
+    ]);
+    expect(handleGsapRemoveKeyframe.mock.calls[0]?.[2]).toEqual(
+      expect.objectContaining({ skipReload: true }),
+    );
+    expect(handleGsapRemoveKeyframe.mock.calls[1]?.[2]).toEqual(
+      expect.objectContaining({ softReload: true }),
+    );
+  });
+
+  it("drops keyframes that belong to other elements", () => {
+    // A stale selection from a previously active element must not delete
+    // anything on the element that is active now.
+    usePlayerStore.setState({
+      selectedElementId: "card",
+      selectedKeyframes: new Set([
+        timelineKeyframeSelectionKey("card", {
+          percentage: 30,
+          tweenPercentage: 20,
+          propertyGroup: "position",
+          animationId: "card-position",
+        }),
+        timelineKeyframeSelectionKey("other", {
+          percentage: 70,
+          tweenPercentage: 80,
+          propertyGroup: "position",
+          animationId: "card-position",
+        }),
+      ]),
+    });
+    const handleGsapRemoveKeyframe =
+      vi.fn<(animId: string, pct: number, options?: Partial<CommitMutationOptions>) => void>();
+
+    deleteSelectedKeyframes({
+      selectedGsapAnimations: [{ id: "card-position", keyframes: {} }],
+      handleGsapRemoveKeyframe,
+    });
+
+    expect(handleGsapRemoveKeyframe).toHaveBeenCalledTimes(1);
+    expect(handleGsapRemoveKeyframe.mock.calls[0]?.[1]).toBe(20);
+  });
+});
+
+describe("persistElementAttribute", () => {
+  /**
+   * The optimistic live patch used to run BEFORE the target was resolved, and
+   * only the save was wrapped in the unwind. So an unresolvable target threw
+   * with the preview holding a value that never reached disk — and the group
+   * writer's catch mirrors the live DOM into the store, so the UI reported the
+   * write as applied until a reload dropped it.
+   */
+  it("does not patch the live DOM when the target resolves to nothing", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ content: '<body><audio id="other"></audio></body>' })),
+      );
+    const patchLive = vi.fn();
+    const writeProjectFile = vi.fn();
+
+    await expect(
+      persistElementAttribute({
+        projectId: "p",
+        targetPath: "index.html",
+        patchTarget: { id: "missing" },
+        attr: "data-volume",
+        value: "0.4",
+        label: "Set volume",
+        writeProjectFile,
+        recordEdit: vi.fn(),
+        pendingTimelineEditPathRef: { current: new Set() },
+        patchLive,
+      }),
+    ).rejects.toThrow("Unable to patch element in index.html");
+
+    expect(patchLive).not.toHaveBeenCalled();
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+});
+
+describe("persistElementAttribute — unwind value", () => {
+  /**
+   * The unwind has to restore the value on DISK, not the one in the preview.
+   *
+   * Every live-write caller patches the DOM before committing (a fader drag is
+   * `setLive` per frame; hovering a preset auditions the whole chain), so by
+   * commit time the live DOM already holds the in-progress value. Reading it as
+   * `previousValue` made the unwind a no-op, and the group writer's catch —
+   * which deliberately re-mirrors the store off the live DOM — then mirrored the
+   * never-saved value: the panel agreed with the preview, and a reload dropped it.
+   */
+  it("restores the file's value, not the audition already in the live DOM", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ content: `<body><audio id="bgm" data-volume="0.25"></audio></body>` }),
+        ),
+      );
+    const patched: Array<string | null> = [];
+    const writeProjectFile = vi.fn(() => Promise.reject(new Error("save failed")));
+
+    await expect(
+      persistElementAttribute({
+        projectId: "p",
+        targetPath: "index.html",
+        patchTarget: { id: "bgm" },
+        attr: "data-volume",
+        value: "0.9",
+        label: "Set volume",
+        writeProjectFile,
+        recordEdit: vi.fn(),
+        pendingTimelineEditPathRef: { current: new Set() },
+        // The live DOM is ALREADY at the new value when the commit runs — that
+        // is what `setLive` does on every drag frame.
+        patchLive: (v) => patched.push(v),
+      }),
+    ).rejects.toThrow("save failed");
+
+    // First the optimistic write, then the unwind — back to what the FILE said.
+    expect(patched).toEqual(["0.9", "0.25"]);
+    fetchSpy.mockRestore();
   });
 });

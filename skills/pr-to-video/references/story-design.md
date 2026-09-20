@@ -2,12 +2,12 @@
 
 Use this reference in Step 3 to write `STORYBOARD.md` and `SCRIPT.md` for a **PR-to-video** — a code change (the diff, commits, files, +/− stats, and the people behind it) turned into an explainer. There is **no website and no captured assets**; the PR was ingested into `capture/extracted/` in Step 1.
 
-This file defines the story: what the video explains, in what order, and why each frame exists. It does not define layout, effects, animation, or file syntax. For exact storyboard syntax follow `../hyperframes-core/references/storyboard-format.md` and `../hyperframes-core/references/script-format.md`.
+This file defines the story: what the video explains, in what order, and why each frame exists. It does not define layout, effects, animation, or file syntax. For exact storyboard syntax follow `../hyperframes/references/storyboard-format.md` and `../hyperframes/references/script-format.md`.
 
 ## Read first
 
 1. `hyperframes.json` — locked brief: angle (archetype), audience, length, aspect, language.
-2. `frame.md` — tone, type, design system (the shipped preset is **claude**: warm editorial, a serif that thinks, scarce coral, a navy code surface).
+2. `frame.md` — tone, type, design system (the shipped preset is **code-editorial**: warm editorial, a serif that thinks, scarce coral, a navy code surface).
 3. `capture/extracted/visible-text.txt` — the assembled PR brief: title, meta (`base ← head · +N/−M across F files`), people, body, commits, changed files, and a budget-bounded set of **representative diff hunks**. This is your source of **information**.
 4. `capture/diff.patch` — the full unified diff, for deeper hunk selection than the brief's excerpt.
 5. `capture/extracted/people.json` — contributors (author / committers / reviewers / commenters), bot-filtered, each with an avatar in `assets/<login>.png` (for the credits close).
@@ -27,7 +27,7 @@ Do **not** narrate the diff file-by-file or read the PR description aloud — th
 
 **Value before evidence** (`../hyperframes-creative/references/story-spine.md`): the viewer-facing payoff — what the change unlocks, fixes, or speeds up — lands by the second beat; the diff and the mechanism are the **evidence** for that claim, never the opening. Implementation is the footnote of the story, not the spine.
 
-Default to a **plain, technical, unhurried developer voice** — accurate, specific, no hype, no marketing gloss. You are explaining a real change to engineers; respect their time and intelligence. `frame.md` (claude) tunes the voice toward considered and literary; it does not change the structure.
+Default to a **plain, technical, unhurried developer voice** — accurate, specific, no hype, no marketing gloss. You are explaining a real change to engineers; respect their time and intelligence. `frame.md` (code-editorial) tunes the voice toward considered and literary; it does not change the structure.
 
 ## PR archetypes
 
@@ -42,9 +42,9 @@ Choose **one** archetype (or name a compound). Each is a complete path through u
 
 ## PR-native frame types
 
-Set each frame's `type` to one of these PR-native values. (The storyboard parser keeps `type` verbatim; it is a narrative + pacing label, not a hard enum.) Each maps to a claude frame treatment and a typical visual — so the type, the design, and the visual stay aligned end to end. Note `mechanism` is the **show-the-behavior** beat (an invented animated diagram), distinct from `diff` (show the code).
+Set each frame's `type` to one of these PR-native values. (The storyboard parser keeps `type` verbatim; it is a narrative + pacing label, not a hard enum.) Each maps to a code-editorial frame treatment and a typical visual — so the type, the design, and the visual stay aligned end to end. Note `mechanism` is the **show-the-behavior** beat (an invented animated diagram), distinct from `diff` (show the code).
 
-| `type`         | The frame's job                                                                                                             | claude treatment (frame.md)                                        | typical visual (see code-vocabulary.md)                                                 |
+| `type`         | The frame's job                                                                                                             | code-editorial treatment (frame.md)                                | typical visual (see code-vocabulary.md)                                                 |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `hook`         | The high-leverage opening 3–5s                                                                                              | Cover                                                              | — (or `code-3d-extrude` for a hero code moment)                                         |
 | `problem`      | The bug / smell / pain / why-care the PR resolves                                                                           | Statement or Pull-quote                                            | `code-highlight` (spotlight the offending line)                                         |
@@ -125,7 +125,7 @@ Pick 2–3 for the whole video and repeat. Frame 1 is `cut` (no previous frame).
 
 ## The diff is the centerpiece
 
-Code beats live on the **navy code surface** (claude's Code Surface treatment) — but the body is **not** all code (pair them with `mechanism` beats, next section). Plan the code beats deliberately:
+Code beats live on the **navy code surface** (code-editorial's Code Surface treatment) — but the body is **not** all code (pair them with `mechanism` beats, next section). Plan the code beats deliberately:
 
 - **Feature 2–4 real diff hunks**, named in each frame's `scene` — each a small, legible snippet (~4–12 lines), **never a whole file**. Pull them from `capture/diff.patch` / the brief's "Representative diff."
 - Name **which code animation block** the frame wants in `scene` (the Step-4 visual phase and the worker read it). See `code-vocabulary.md` for the full map; the short version: before→after = `code-diff`; refactor/rename continuity = `code-morph`; new code written on = `code-typing`; spotlight one line = `code-highlight`; walk a long file = `code-scroll`; a hero reveal = `code-3d-extrude` / `code-particle-assemble`.
@@ -135,7 +135,7 @@ Code beats live on the **navy code surface** (claude's Code Surface treatment) �
 
 A diff shows **what changed in the code**. It does **not** show **what the change does** — and "what it does" is usually the more memorable, more explanatory beat. The single biggest reason a PR video feels flat is that every body frame is a code surface or a number: it _tells_ (here are the lines, here is the stat) but never _shows_ (here is the request actually recovering).
 
-A **`mechanism` frame animates the runtime behavior** the PR changes — built as an **invented animated diagram** (SVG / HTML / GSAP on claude's cream ground: hairline-ink nodes / edges / lanes, one coral marker on the active or changed element), where **the build _is_ the teaching** — each part appears on beat, the flow plays out across the shot. It is **not** a code block and **not** a headline. Reach for the `flowchart` / `flowchart-vertical` / `data-chart` registry blocks where they fit; otherwise invent it (visual-design.md's diagram / abstract-graphics register).
+A **`mechanism` frame animates the runtime behavior** the PR changes — built as an **invented animated diagram** (SVG / HTML / GSAP on code-editorial's cream ground: hairline-ink nodes / edges / lanes, one coral marker on the active or changed element), where **the build _is_ the teaching** — each part appears on beat, the flow plays out across the shot. It is **not** a code block and **not** a headline. Reach for the `flowchart` / `flowchart-vertical` / `data-chart` registry blocks where they fit; otherwise invent it (visual-design.md's diagram / abstract-graphics register).
 
 Plan **at least one `mechanism` beat** for any PR with a visible runtime behavior (most feature and fix PRs have one). What to animate, by what the change touches:
 

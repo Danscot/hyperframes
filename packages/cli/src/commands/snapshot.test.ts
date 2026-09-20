@@ -1,11 +1,36 @@
-import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import {
+import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { sourceTimeAt } from "@hyperframes/core";
+
+const snapshotState = vi.hoisted(() => ({
+  openSettledPage: vi.fn(async () => {
+    throw new Error("browser capture reached");
+  }),
+  closeServer: vi.fn(async () => undefined),
+}));
+
+vi.mock("../capture/captureCompositionFrame.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../capture/captureCompositionFrame.js")>()),
+  openSettledCompositionPage: snapshotState.openSettledPage,
+}));
+
+vi.mock("../utils/staticProjectServer.js", () => ({
+  serveStaticProjectHtml: vi.fn(async () => ({
+    url: "http://127.0.0.1:1",
+    close: snapshotState.closeServer,
+  })),
+}));
+
+import snapshotCommand, {
   computeSnapshotTimes,
   formatSnapshotTimestamp,
   parseZoomScale,
   requireSnapshotFfmpeg,
+  resolveSnapshotVideoClipStart,
   resolveSnapshotVideoFrameTime,
+  resolveSnapshotVideoRateSpec,
   tailFrameTime,
 } from "./snapshot.js";
 
@@ -51,6 +76,73 @@ describe("transparent snapshot capture", () => {
     expect(source).toContain("proxy: {");
     expect(source).toContain("autoProxy: args.proxy as boolean | undefined");
     expect(source).toContain("opts.autoProxy");
+  });
+
+  it("pairs every frame with the frame-exact reference frame under --against", () => {
+    const source = readFileSync(new URL("./snapshot.ts", import.meta.url), "utf8");
+    expect(source).toContain("against: {");
+    expect(source).toContain("extractVideoFrameToBuffer(opts.against, time, false, true)");
+    expect(source).toContain('labels: ["render", "reference"]');
+    // accurate seek = `-ss` after `-i`, never the keyframe-snap fast path
+    expect(source).toContain(
+      'accurateSeek ? ["-i", videoPath, ...seek] : [...seek, "-i", videoPath]',
+    );
+  });
+
+  it("resolves and forwards the shared local browser GPU policy", () => {
+    const source = readFileSync(new URL("./snapshot.ts", import.meta.url), "utf8");
+    expect(source).toContain("resolveLocalBrowserGpuMode");
+    expect(source).toContain("browserGpuMode: opts.browserGpuMode");
+    expect(source).toContain('"browser-gpu": {');
+  });
+});
+
+describe("snapshot lint preflight", () => {
+  async function runEntryMismatch(candidate: string): Promise<string> {
+    const project = mkdtempSync(join(tmpdir(), "hf-snapshot-entry-mismatch-"));
+    const candidatePath = join(project, candidate);
+    mkdirSync(dirname(candidatePath), { recursive: true });
+    writeFileSync(
+      join(project, "index.html"),
+      `<html><body><div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="10"></div></body></html>`,
+    );
+    writeFileSync(
+      candidatePath,
+      `<html><body><div data-composition-id="authored" data-width="1920" data-height="1080" data-start="0" data-duration="5"><div class="clip" data-start="0" data-duration="5">Visible</div></div></body></html>`,
+    );
+    snapshotState.openSettledPage.mockClear();
+    const lines: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...parts: unknown[]) => {
+      lines.push(parts.map(String).join(" "));
+    });
+
+    try {
+      await expect(
+        snapshotCommand.run?.({ args: { dir: project } } as never),
+      ).rejects.toMatchObject({
+        name: "CliRuntimeError",
+      });
+      expect(snapshotState.openSettledPage).not.toHaveBeenCalled();
+      return lines.join("\n");
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  }
+
+  it("does not suggest a directory for a standalone file that is not index.html", async () => {
+    const output = await runEntryMismatch("compositions/card.html");
+
+    expect(output).toContain("compositions/card.html");
+    expect(output).not.toContain("hyperframes snapshot <project>/compositions");
+    expect(output).toContain("snapshot accepts project directories, not individual HTML files");
+  });
+
+  it("suggests the reported index.html directory with the re-rooting caveat", async () => {
+    const output = await runEntryMismatch("compositions/index.html");
+
+    expect(output).toContain("hyperframes snapshot <project>/compositions");
+    expect(output).toContain("assets are self-contained under that directory");
   });
 });
 
@@ -151,6 +243,72 @@ describe("resolveSnapshotVideoFrameTime", () => {
     const result = resolveSnapshotVideoFrameTime(input);
     if (expected === null) expect(result).toBeNull();
     else expect(result).toBeCloseTo(expected, 6);
+  });
+});
+
+describe("resolveSnapshotVideoClipStart", () => {
+  it("offsets a scene-local video start by its later template host", () => {
+    expect(
+      resolveSnapshotVideoClipStart({
+        authoredStart: 0,
+        runtimeResolvedStart: 3,
+      }),
+    ).toBe(3);
+  });
+
+  it("uses the runtime's recursively resolved start for deeply nested media", () => {
+    expect(
+      resolveSnapshotVideoClipStart({
+        authoredStart: 1,
+        runtimeResolvedStart: 8,
+      }),
+    ).toBe(8);
+  });
+
+  it("keeps authored starts as a compatibility fallback", () => {
+    expect(
+      resolveSnapshotVideoClipStart({
+        authoredStart: 3,
+        runtimeResolvedStart: null,
+      }),
+    ).toBe(3);
+  });
+});
+
+describe("resolveSnapshotVideoRateSpec", () => {
+  it("prefers the authored data-playback-rate over the browser default", () => {
+    expect(resolveSnapshotVideoRateSpec({ authoredRate: "1.8", defaultRate: 1 })).toBe(1.8);
+  });
+
+  it("falls back to the browser default when the authored rate is invalid", () => {
+    expect(resolveSnapshotVideoRateSpec({ authoredRate: "abc", defaultRate: 2 })).toBe(2);
+    expect(resolveSnapshotVideoRateSpec({ authoredRate: "0", defaultRate: 2 })).toBe(2);
+  });
+
+  it("allows rates up to the shared 10x bound", () => {
+    expect(resolveSnapshotVideoRateSpec({ authoredRate: "8", defaultRate: 1 })).toBe(8);
+  });
+
+  it("maps a frame through a rate lane instead of the constant", () => {
+    const lane = JSON.stringify({
+      version: 1,
+      lanes: [
+        {
+          target: "rate",
+          points: [
+            { t: 0, v: 1 },
+            { t: 2, v: 3 },
+          ],
+        },
+      ],
+    });
+    const spec = resolveSnapshotVideoRateSpec({
+      authoredRate: "1",
+      authoredAutomation: lane,
+      defaultRate: 1,
+    });
+    expect(typeof spec).toBe("object");
+    expect(sourceTimeAt(spec, 2)).toBeCloseTo(3.641, 2);
   });
 });
 

@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication
 import { parseHTML } from "linkedom";
 import { describe, expect, it } from "vitest";
 import {
@@ -30,6 +31,20 @@ describe("splitElementInHtml", () => {
     expect(result.html).toContain('id="box-split"');
     expect(result.html).toContain('data-start="3"');
     expect(result.html).toContain('data-duration="4"');
+  });
+
+  it("pins both halves to the caller-supplied track so an unauthored clip's split half can't drift to a new row", () => {
+    // #box has no data-track-index/data-layer — this is the common, unauthored
+    // case that relies on the runtime's positional-index fallback. Without an
+    // explicit stamp, splitting only the clone changes DOM sibling order and
+    // the runtime resolves the clone to a different fallback track.
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split", {
+      start: 1,
+      duration: 6,
+      track: 2,
+    });
+    expect(result.matched).toBe(true);
+    expect(result.html.match(/data-track-index="2"/g)).toHaveLength(2);
   });
 
   it("canonicalizes legacy timing attributes on both split halves", () => {
@@ -123,6 +138,36 @@ describe("splitElementInHtml", () => {
     expect(result.html).toMatch(/id="box-split"[^>]*data-playback-start="2"/);
   });
 
+  it.each(["audio", "video"])(
+    "seeds the second %s half with a media in-point when the source starts at zero",
+    (tag) => {
+      const mediaSource = `<!DOCTYPE html><html><body><div data-composition-id="root"><${tag} id="media" class="clip" src="asset.mp4" data-start="1" data-duration="6"></${tag}></div></body></html>`;
+
+      const result = splitElementInHtml(mediaSource, { id: "media" }, 3, "media-split");
+      const { document } = parseHTML(result.html);
+
+      expect(result.matched).toBe(true);
+      expect(document.getElementById("media")?.getAttribute("data-media-start")).toBe("0");
+      expect(document.getElementById("media-split")?.getAttribute("data-media-start")).toBe("2");
+    },
+  );
+
+  it("advances a zero-based media in-point by playback rate", () => {
+    const mediaSource = `<!DOCTYPE html><html><body><div data-composition-id="root"><video id="media" class="clip" src="asset.mp4" data-start="1" data-duration="6" data-playback-rate="2"></video></div></body></html>`;
+
+    const result = splitElementInHtml(mediaSource, { id: "media" }, 3, "media-split");
+    const { document } = parseHTML(result.html);
+
+    expect(document.getElementById("media-split")?.getAttribute("data-media-start")).toBe("4");
+  });
+
+  it("does not add a media in-point to non-media elements", () => {
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split");
+
+    expect(result.html).not.toContain("data-media-start");
+    expect(result.html).not.toContain("data-playback-start");
+  });
+
   it("stamps a legacy composition offset and advances the second half by playback rate", () => {
     const result = splitElementInHtml(source, { id: "box" }, 3, "box-split", {
       start: 1,
@@ -167,6 +212,32 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     return element;
   }
 
+  it.each([
+    ["Group 1", "group-1"],
+    [" --HELLO___World!! ", "hello-world"],
+    ["a---b---c", "a-b-c"],
+    ["--123--", "123"],
+    ["", "group"],
+    [" --- ", "group"],
+    ["你好", "group"],
+    ["-".repeat(100_000) + "Title" + "-".repeat(100_000), "title"],
+  ])("preserves normalized group IDs and collision suffixes (case %#)", (name, id) => {
+    const source = FIXTURE.replace(
+      "</body>",
+      `<div id="${id}"></div><div id="${id}-2"></div></body>`,
+    );
+    const result = wrapElementsInHtml(source, TARGETS, name, BBOX, REBASES);
+    expect(result.matched).toBe(true);
+    const { document } = parseHTML(result.html);
+    const group = document.getElementById(`${id}-3`);
+    expect(group?.getAttribute("data-hf-group")).toBe(name);
+    expect(Array.from(group?.children ?? []).map((child) => child.id)).toEqual([
+      "title",
+      "logo",
+      "badge",
+    ]);
+  });
+
   it("wraps members in a data-hf-group div, preserving order and rebasing left/top", () => {
     const { html, matched, groupId } = wrapElementsInHtml(
       FIXTURE,
@@ -197,6 +268,19 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     );
   });
 
+  it("stamps each member's resolved track so grouping an unauthored clip can't drift it to a new row", () => {
+    const rebasesWithTrack = [
+      { target: { id: "title" }, left: 0, top: 50, track: 1 },
+      { target: { id: "logo" }, left: 40, top: 150, track: 3 },
+      { target: { id: "badge" }, left: 140, top: 0 },
+    ];
+    const { html } = wrapElementsInHtml(FIXTURE, TARGETS, "Group 1", BBOX, rebasesWithTrack);
+    const { document } = parseHTML(html);
+    expect(requireElement(document, "#title").getAttribute("data-track-index")).toBe("1");
+    expect(requireElement(document, "#logo").getAttribute("data-track-index")).toBe("3");
+    expect(requireElement(document, "#badge").hasAttribute("data-track-index")).toBe(false);
+  });
+
   it("round-trips: unwrap restores original structure and coordinates", () => {
     const wrapped = wrapElementsInHtml(FIXTURE, TARGETS, "Group 1", BBOX, REBASES).html;
     const { html, unwrapped } = unwrapElementsFromHtml(wrapped, {
@@ -223,6 +307,23 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     expect(requireElement(document, "#badge").getAttribute("style")).toContain(
       "--hf-studio-offset: 12px",
     );
+  });
+
+  it("stamps each child's resolved track on ungroup so it can't drift to a new row when it moves back out of the wrapper", () => {
+    const wrapped = wrapElementsInHtml(FIXTURE, TARGETS, "Group 1", BBOX, REBASES).html;
+    const childTracks = [
+      { target: { id: "title" }, track: 1 },
+      { target: { id: "logo" }, track: 3 },
+    ];
+    const { html } = unwrapElementsFromHtml(
+      wrapped,
+      { selector: '[data-hf-group="Group 1"]' },
+      childTracks,
+    );
+    const { document } = parseHTML(html);
+    expect(requireElement(document, "#title").getAttribute("data-track-index")).toBe("1");
+    expect(requireElement(document, "#logo").getAttribute("data-track-index")).toBe("3");
+    expect(requireElement(document, "#badge").hasAttribute("data-track-index")).toBe(false);
   });
 
   it("rejects members that do not share a single parent", () => {

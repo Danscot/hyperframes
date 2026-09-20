@@ -456,6 +456,41 @@ describe("GET /projects/:id/renders/file/* — path safety", () => {
     tmpDirs.length = 0;
   });
 
+  it("serves non-Latin-1 filenames with RFC 6266 content dispositions", async () => {
+    const filename = "測試.mp4";
+    const { app, rendersDir } = buildApp();
+    const outputPath = join(rendersDir, filename);
+    writeFileSync(outputPath, "render-bytes");
+
+    const listResponse = await app.request("http://localhost/projects/demo/renders");
+    expect(listResponse.status).toBe(200);
+    const jobId = encodeURIComponent(filename.replace(/\.mp4$/, ""));
+    const expectedFilename = `filename="__.mp4"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+    const responses = [
+      {
+        response: await app.request(`http://localhost/render/${jobId}/view`),
+        disposition: "inline",
+      },
+      {
+        response: await app.request(`http://localhost/render/${jobId}/download`),
+        disposition: "attachment",
+      },
+      {
+        response: await app.request(
+          `http://localhost/projects/demo/renders/file/${encodeURIComponent(filename)}`,
+        ),
+        disposition: "inline",
+      },
+    ];
+
+    for (const { response, disposition } of responses) {
+      expect(response.status).toBe(200);
+      const header = response.headers.get("Content-Disposition");
+      expect(header).toBe(`${disposition}; ${expectedFilename}`);
+      expect(header).toMatch(/^[\x20-\x7e]+$/);
+    }
+  });
+
   it("serves a render file that lives inside rendersDir", async () => {
     const { app, rendersDir } = buildApp();
     writeFileSync(join(rendersDir, "demo.mp4"), "render-bytes");
@@ -601,6 +636,55 @@ describe("POST /projects/:id/render — telemetryDistinctId forwarding", () => {
       cleanup();
     }
   });
+
+  // Explicit suppression, forwarded so the CLI can honour a browser opt-out
+  // it has no other way to observe.
+  it("forwards an explicit telemetryOptOut", async () => {
+    const spy = vi.fn();
+    const { app, cleanup } = buildApp(spy);
+    try {
+      const res = await app.request("http://localhost/projects/demo/render", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          fps: 30,
+          quality: "standard",
+          format: "mp4",
+          telemetryOptOut: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(spy.mock.calls[0][0].telemetryOptOut).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // An old client omits the flag, and a non-boolean is not a signal either.
+  // Defaulting those to "opted out" would silently drop every pre-upgrade
+  // render outcome.
+  it.each([undefined, false, "true"])(
+    "treats telemetryOptOut %s as not opted out",
+    async (flag) => {
+      const spy = vi.fn();
+      const { app, cleanup } = buildApp(spy);
+      try {
+        await app.request("http://localhost/projects/demo/render", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            fps: 30,
+            quality: "standard",
+            format: "mp4",
+            telemetryOptOut: flag,
+          }),
+        });
+        expect(spy.mock.calls[0][0].telemetryOptOut).toBe(false);
+      } finally {
+        cleanup();
+      }
+    },
+  );
 
   it("ignores a non-string telemetryDistinctId", async () => {
     const spy = vi.fn();

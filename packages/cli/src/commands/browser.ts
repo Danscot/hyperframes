@@ -1,3 +1,4 @@
+import { failCommand } from "../utils/commandResult.js";
 import { defineCommand } from "citty";
 import type { Example } from "./_examples.js";
 import * as clack from "@clack/prompts";
@@ -14,7 +15,7 @@ import {
   ensureBrowser,
   findBrowser,
   clearBrowser,
-  CHROME_VERSION,
+  managedChromeVersion,
   CACHE_DIR,
   isLinuxArm,
 } from "../browser/manager.js";
@@ -56,7 +57,7 @@ async function runEnsure(options?: { force?: boolean }): Promise<void> {
       trackCommandFailure("browser", err);
       clack.log.error(err instanceof Error ? err.message : String(err));
       clack.outro(c.warn("Manual setup required (see instructions above)."));
-      process.exit(1);
+      failCommand();
     }
     return;
   }
@@ -77,7 +78,7 @@ async function runEnsure(options?: { force?: boolean }): Promise<void> {
         if (pct > lastPct) {
           lastPct = pct;
           s.message(
-            `Downloading Chrome Headless Shell ${c.dim("v" + CHROME_VERSION)} — ${c.progress(pct + "%")} ${c.dim("(" + formatBytes(downloaded) + " / " + formatBytes(total) + ")")}`,
+            `Downloading Chrome Headless Shell ${c.dim("v" + managedChromeVersion())} — ${c.progress(pct + "%")} ${c.dim("(" + formatBytes(downloaded) + " / " + formatBytes(total) + ")")}`,
           );
         }
       },
@@ -96,7 +97,9 @@ async function runEnsure(options?: { force?: boolean }): Promise<void> {
   s.start("Purging cached download and re-downloading...");
 
   const downloadSpinner = clack.spinner();
-  downloadSpinner.start(`Downloading Chrome Headless Shell ${c.dim("v" + CHROME_VERSION)}...`);
+  downloadSpinner.start(
+    `Downloading Chrome Headless Shell ${c.dim("v" + managedChromeVersion())}...`,
+  );
 
   let lastPct = -1;
   const result = await ensureBrowser({
@@ -107,7 +110,7 @@ async function runEnsure(options?: { force?: boolean }): Promise<void> {
       if (pct > lastPct) {
         lastPct = pct;
         downloadSpinner.message(
-          `Downloading Chrome Headless Shell ${c.dim("v" + CHROME_VERSION)} — ${c.progress(pct + "%")} ${c.dim("(" + formatBytes(downloaded) + " / " + formatBytes(total) + ")")}`,
+          `Downloading Chrome Headless Shell ${c.dim("v" + managedChromeVersion())} — ${c.progress(pct + "%")} ${c.dim("(" + formatBytes(downloaded) + " / " + formatBytes(total) + ")")}`,
         );
       }
     },
@@ -134,7 +137,7 @@ async function runPath(): Promise<void> {
     } catch (err: unknown) {
       trackCommandFailure("browser", err);
       console.error(err instanceof Error ? err.message : "Failed to find browser");
-      process.exit(1);
+      failCommand();
     }
     return;
   }
@@ -203,7 +206,7 @@ ${c.bold("EXAMPLES:")}
         console.error(
           `${c.error("Unknown subcommand:")} ${subcommand}\n\nRun ${c.accent("hyperframes browser --help")} for usage.`,
         );
-        process.exit(1);
+        failCommand();
     }
   },
 });

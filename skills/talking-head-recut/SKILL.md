@@ -3,7 +3,7 @@ name: talking-head-recut
 description: Package an existing talking-head / interview / podcast video with timed, designed GRAPHIC OVERLAY cards — kinetic titles, lower-thirds, data callouts, quotes, side panels, picture-in-picture — synced to the transcript, on a 16:9 / 9:16 / 4:5 canvas of your choice; the clip plays untouched underneath. Trigger on "graphic overlays", "on-screen graphics", "package / dress up my video". Not plain subtitles (/embedded-captions). Unclear → /hyperframes.
 ---
 
-> **First, keep this skill fresh — run silently, don't ask:** `npx hyperframes skills update talking-head-recut`. A fast no-op when everything is current; otherwise it refreshes this skill plus the core domain skills it depends on before you rely on them.
+> **First, keep this skill fresh — confirm with the user before running:** `npx hyperframes skills update talking-head-recut`. A fast no-op when everything is current; otherwise it refreshes this skill plus the core domain skills it depends on before you rely on them.
 
 # Talking Head Recut
 
@@ -279,8 +279,7 @@ densityMultiplier)))`) so the "auto" option's label can show the
 Not every runtime exposes the same structured-question tool. Apply this
 order:
 
-1. **`AskUserQuestion`** (Claude Code, Anthropic Console) — use the
-   structured 4-question call below.
+1. **Native clarification tool** — use the structured 4-question call below.
 2. **Other native clarification tool** (e.g. `ask_question`,
    `request_user_input`, IDE-specific prompt) — use that tool with the
    same 4 question texts and option lists. Preserve the recommendation
@@ -299,7 +298,7 @@ Rules that apply to every channel:
 - If the user has already pre-approved defaults ("just use defaults",
   "no need to ask", "auto-pick everything"), asked you not to ask, or the
   run carries an ongoing autonomous signal ("surprise me" / "decide for me" —
-  `../hyperframes-core/references/brief-contract.md` § 1) — **skip
+  `../hyperframes/references/brief-contract.md` § 1) — **skip
   the question entirely** and use: `recommendedRatio`, `layout="stack"`
   (safest cross-ratio default), `style` chosen from transcript tone in
   the most neutral group (editorial/data), `autoCount`. Tell the user
@@ -756,6 +755,13 @@ table column that matches the storyboard's `layout` field.
 
 #### Available `data-anim` Kinds
 
+This list is closed, and deliberately so: a card is an HTML fragment whose motion this
+skill compiles into the shared overlay timeline in Step 9 (see the GSAP mapping table
+there). That is why this workflow does not search the HyperFrames component registry the
+way the composition workflows do — `npx hyperframes catalog` returns standalone
+compositions that carry their own timeline, and a card has no place to mount one. Reach a
+look the kinds below cannot express with plain CSS inside the card's scoped `<style>`.
+
 | kind            | use for             | key params                                                                                      |
 | --------------- | ------------------- | ----------------------------------------------------------------------------------------------- |
 | `fade-in`       | enter               | `at`, `duration`, `ease?`                                                                       |
@@ -951,10 +957,11 @@ ffmpeg -y -i "$VIDEO_PATH" -c:v libx264 -crf 18 -g 30 -keyint_min 30 \
       <!-- Layer 2: each card-host sits at the bounds dictated by its layout. -->
       <!-- IMPORTANT: every card-host MUST carry BOTH "card-host" and "clip" classes. -->
       <!--   - "card-host"  → our positioning + pointer-events styles                 -->
-      <!--   - "clip"       → HyperFrames runtime uses this to enforce visibility     -->
-      <!--                    only during data-start … data-start+data-duration.      -->
-      <!--                    Without "clip" the host stays visible the whole video   -->
-      <!--                    (lint: timed_element_missing_clip_class).               -->
+      <!--   - "clip"       → the marker Studio and the linter use to recognise a     -->
+      <!--                    clip. Visibility itself comes from data-start /         -->
+      <!--                    data-duration, which the runtime honours with or        -->
+      <!--                    without this class                                      -->
+      <!--                    (lint: timed_element_missing_clip_class, a warning).    -->
       <!-- Example: card-01 with zone="fullscreen" → card-host covers (0,0,1920,1080) -->
       <div
         class="card-host clip"
@@ -1159,7 +1166,7 @@ decides where the actual visible card sits.
 - Animate wrappers such as `#video-wrap`, not the video element dimensions directly.
 - Avoid animating the same property on the same element from multiple timelines at the same time.
 - Use `data-track-index`, not `data-layer`; use `data-duration`, not `data-end`.
-- Every timed element (`card-host`, sub-composition, etc.) MUST include `class="clip"` alongside its own classes — e.g. `class="card-host clip"`. The HyperFrames runtime uses `.clip` to gate visibility to the `data-start … data-start+data-duration` window. Without it the element is visible for the whole video (lint: `timed_element_missing_clip_class`).
+- Every timed element (`card-host`, sub-composition, etc.) should include `class="clip"` alongside its own classes — e.g. `class="card-host clip"`. Visibility itself is driven by `data-start` / `data-duration`: the runtime gates every `[data-start]` element to its window whether or not this class is present. `.clip` is the marker Studio and the GSAP clip-ownership rules read to recognise a clip, so leaving it off makes the element harder to edit and to lint (lint: `timed_element_missing_clip_class`, a warning).
 - For body / global `font-family`, list **concrete font names** (`'Inter', 'Caveat', …`) — not a CSS variable like `var(--font-family)`. The HyperFrames font resolver doesn't expand CSS vars during static analysis (lint: `font_family_without_font_face`). Cards may still use `var(--font-family)` internally since their `@font-face` declarations are loaded.
 
 ### 10. Render to MP4
@@ -1205,7 +1212,7 @@ Tell the user:
 **Optional live preview (on request only).** The clip plays unchanged inside `public/index.html` with the overlays on top, so it previews faithfully. **Don't open it during the run.** When the user asks, start a long-lived server **after** render and report the URL:
 
 ```bash
-(cd "$WORK_DIR/public" && npx hyperframes preview)   # or `npx hyperframes play` for a shareable link
+(cd "$WORK_DIR/public" && npx hyperframes preview --background)   # or `npx hyperframes play` for a shareable link
 ```
 
 Do not delete the work directory unless the user asks.

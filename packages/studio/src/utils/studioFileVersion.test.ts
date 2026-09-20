@@ -1,5 +1,15 @@
-import { describe, expect, it } from "vitest";
-import { studioExpectedFileVersion, studioFileContentVersion } from "./studioFileVersion";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  consumeStudioWriteToken,
+  createStudioWriteToken,
+  markStudioWriteToken,
+  resetStudioWriteTokens,
+  studioExpectedFileVersion,
+  studioFileContentVersion,
+  studioWriteHeaders,
+} from "./studioFileVersion";
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("studioFileContentVersion", () => {
   it("matches the strong SHA-256 ETag format used by studio-server", async () => {
@@ -32,5 +42,58 @@ describe("studioFileContentVersion", () => {
 
     expect(await studioExpectedFileVersion(versions, "missing.html")).toBeNull();
     expect(await studioExpectedFileVersion(versions, "untracked.html")).toBeUndefined();
+  });
+});
+
+describe("studio write-token echo identity", () => {
+  it("prefers the platform randomUUID implementation", () => {
+    const randomUUID = vi.fn(() => "11111111-2222-4333-8444-555555555555");
+    vi.stubGlobal("crypto", { randomUUID });
+    resetStudioWriteTokens();
+
+    expect(studioWriteHeaders()).toEqual({
+      "X-Hyperframes-Write-Token": "11111111-2222-4333-8444-555555555555",
+    });
+    expect(randomUUID).toHaveBeenCalledOnce();
+    expect(consumeStudioWriteToken("11111111-2222-4333-8444-555555555555")).toBe(true);
+  });
+
+  it("creates an RFC 4122 UUID-v4 token from getRandomValues when randomUUID is unavailable", () => {
+    const source = Uint8Array.from({ length: 16 }, (_, index) => index);
+    vi.stubGlobal("crypto", {
+      getRandomValues: vi.fn((target: Uint8Array) => {
+        target.set(source);
+        return target;
+      }),
+    });
+
+    expect(createStudioWriteToken()).toBe("00010203-0405-4607-8809-0a0b0c0d0e0f");
+  });
+
+  it("fails explicitly when Web Crypto cannot provide secure random bytes", () => {
+    vi.stubGlobal("crypto", {});
+
+    expect(() => createStudioWriteToken()).toThrow(
+      "Web Crypto getRandomValues is required for Studio write identity",
+    );
+  });
+
+  it("suppresses exactly one matching API write receipt without hiding path-only external writes", () => {
+    resetStudioWriteTokens();
+    markStudioWriteToken("studio-write-1");
+
+    expect(consumeStudioWriteToken("studio-write-1")).toBe(true);
+    expect(consumeStudioWriteToken("studio-write-1")).toBe(false);
+    expect(consumeStudioWriteToken(null)).toBe(false);
+  });
+
+  it("keeps a token through a slow write and expires abandoned identity state", () => {
+    resetStudioWriteTokens();
+    markStudioWriteToken("slow-studio-write", 1_000);
+
+    expect(consumeStudioWriteToken("slow-studio-write", 61_000)).toBe(true);
+
+    markStudioWriteToken("abandoned-studio-write", 1_000);
+    expect(consumeStudioWriteToken("abandoned-studio-write", 301_000)).toBe(false);
   });
 });

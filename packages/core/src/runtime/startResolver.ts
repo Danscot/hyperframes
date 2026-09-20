@@ -1,26 +1,17 @@
 import type { RuntimeTimelineLike } from "./types";
 import { swallow } from "./diagnostics";
-import { readElementPlaybackRate } from "./media";
-import { parseNumeric, parseStartExpression } from "./startExpression";
-
-const AUTHORED_DURATION_ATTR = "data-hf-authored-duration";
-const AUTHORED_END_ATTR = "data-hf-authored-end";
-
-function parseDurationAttr(element: Element): number | null {
-  return parseNumeric(element.getAttribute("data-duration"));
-}
-
-function parseEndAttr(element: Element): number | null {
-  return parseNumeric(element.getAttribute("data-end"));
-}
-
-function parseAuthoredDurationAttr(element: Element): number | null {
-  return parseNumeric(element.getAttribute(AUTHORED_DURATION_ATTR));
-}
-
-function parseAuthoredEndAttr(element: Element): number | null {
-  return parseNumeric(element.getAttribute(AUTHORED_END_ATTR));
-}
+import { resolveAuthoredTimingWindow } from "./authoredTiming";
+// Straight from playbackRate, not through media.ts's re-export: media.ts
+// imports mediaVolumeEnvelope, which needs this resolver, and the round trip
+// would be an import cycle.
+import {
+  parseStrictFiniteTimingNumber,
+  resolveNaturalMediaTimelineDuration,
+  resolveTimedImageDurationSeconds,
+} from "./playbackRate";
+import { isMediaElement } from "./domRealm";
+import { parseStartExpression } from "./startExpression";
+import { MEDIA_START_BASIS_ATTR, resolveMediaStartSeconds } from "../mediaTiming";
 
 export function createRuntimeStartTimeResolver(params: {
   timelineRegistry?: Record<string, RuntimeTimelineLike | undefined>;
@@ -35,6 +26,7 @@ export function createRuntimeStartTimeResolver(params: {
 }): {
   resolveStartForElement: (element: Element, fallback?: number) => number;
   resolveDurationForElement: (element: Element) => number | null;
+  resolveMediaStartForElement: (element: Element) => number;
 } {
   const timelineRegistry = params.timelineRegistry ?? {};
   const includeAuthoredTimingAttrs = params.includeAuthoredTimingAttrs ?? false;
@@ -51,45 +43,37 @@ export function createRuntimeStartTimeResolver(params: {
     );
   };
 
-  // Realm-safe: an iframe document's media elements are instances of THAT
-  // frame's HTMLMediaElement, never this module's global one.
-  const isMediaElement = (el: Element): el is HTMLMediaElement => {
-    const RealmMedia = el.ownerDocument.defaultView?.HTMLMediaElement;
-    if (RealmMedia) return el instanceof RealmMedia;
-    return typeof HTMLMediaElement !== "undefined" && el instanceof HTMLMediaElement;
-  };
-
   const resolveDurationForElement = (element: Element): number | null => {
     const cached = durationCache.get(element);
     if (cached !== undefined) return cached;
     let resolved: number | null = null;
-    const durationAttr =
-      parseDurationAttr(element) ??
-      (includeAuthoredTimingAttrs ? parseAuthoredDurationAttr(element) : null);
-    if (durationAttr != null && durationAttr > 0) {
-      resolved = durationAttr;
+    const durationTiming = resolveAuthoredTimingWindow({
+      start: 0,
+      duration: element.getAttribute("data-duration"),
+      authoredDuration: includeAuthoredTimingAttrs
+        ? element.getAttribute("data-hf-authored-duration")
+        : null,
+    });
+    if (durationTiming?.duration != null && durationTiming.duration > 0) {
+      resolved = durationTiming.duration;
     }
     if (resolved == null || resolved <= 0) {
-      const endAttr =
-        parseEndAttr(element) ??
-        (includeAuthoredTimingAttrs ? parseAuthoredEndAttr(element) : null);
-      if (endAttr != null) {
-        const start = resolveStartForElementInternal(element, 0);
-        const delta = endAttr - start;
-        if (Number.isFinite(delta) && delta > 0) {
-          resolved = delta;
-        }
+      const start = resolveStartForElementInternal(element, 0);
+      const endTiming = resolveAuthoredTimingWindow({
+        start,
+        end: element.getAttribute("data-end"),
+        authoredEnd: includeAuthoredTimingAttrs
+          ? element.getAttribute("data-hf-authored-end")
+          : null,
+      });
+      if (endTiming?.duration != null && endTiming.duration > 0) {
+        resolved = endTiming.duration;
       }
     }
     if ((resolved == null || resolved <= 0) && isMediaElement(element)) {
-      const playbackStart =
-        parseNumeric(element.getAttribute("data-playback-start")) ??
-        parseNumeric(element.getAttribute("data-media-start")) ??
-        0;
-      if (Number.isFinite(element.duration) && element.duration > playbackStart) {
-        resolved = (element.duration - playbackStart) / readElementPlaybackRate(element);
-      }
+      resolved = resolveNaturalMediaTimelineDuration(element, element.duration);
     }
+    if (resolved == null || resolved <= 0) resolved = resolveTimedImageDurationSeconds(element);
     if (resolved == null || resolved <= 0) {
       const compositionId = element.getAttribute("data-composition-id");
       if (compositionId) {
@@ -190,10 +174,34 @@ export function createRuntimeStartTimeResolver(params: {
     }
   };
 
+  /**
+   * The ONE owner of "when does this media element start on the root timeline".
+   *
+   * A media element is not a plain timed clip: `data-hf-media-start-basis`
+   * decides whether its `data-start` is composition-local (the default, so the
+   * host offset is added) or a legacy root-global timestamp (already absolute,
+   * so adding the host offset double-counts it). Anything that derives a media
+   * start from attributes — the clip manifest, the visibility pass, the media
+   * cache, WebAudio scheduling — must come through here, or the timeline the
+   * editor draws stops matching the timeline that plays.
+   */
+  const resolveMediaStartForElement = (element: Element): number => {
+    const compositionRoot = element.closest("[data-composition-id]");
+    const hostStart = compositionRoot ? resolveStartForElementInternal(compositionRoot, 0) : 0;
+    return resolveMediaStartSeconds({
+      authoredStart: parseStrictFiniteTimingNumber(element.getAttribute("data-start")),
+      hostStart,
+      hasAutoStart: element.hasAttribute("data-hf-auto-start"),
+      basis: element.getAttribute(MEDIA_START_BASIS_ATTR),
+      ordinaryStart: () => resolveStartForElementInternal(element, hostStart),
+    });
+  };
+
   return {
     resolveStartForElement: (element: Element, fallback = 0) =>
       resolveStartForElementInternal(element, Math.max(0, fallback)),
     resolveDurationForElement: (element: Element) => resolveDurationForElement(element),
+    resolveMediaStartForElement,
   };
 }
 

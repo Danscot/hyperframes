@@ -50,10 +50,14 @@ export {
 export {
   RUNTIME_BOOTSTRAP_ATTR,
   injectScriptsAtHeadStart,
+  injectTagsAtHeadStart,
   injectScriptsIntoHtml,
   parseHTMLContent,
   stripEmbeddedRuntimeScripts,
 } from "./htmlDocument";
+
+// Script ordering shared by the bundler and the producer coalescers
+export { inlineScriptRuns, type InlineScriptRun } from "./scriptRuns";
 
 // Static guard
 export {
@@ -88,3 +92,11 @@ export {
 
 // Asset-path primitives (shared across core, producer, CLI)
 export { CSS_URL_RE, PATH_ATTRS, isNonRelativeUrl, isPathInside } from "./assetPaths";
+
+export {
+  AUDIO_GROUP_RENDER_ID_ATTR,
+  MEDIA_RENDER_ID_ATTR,
+  assignMediaRenderIds,
+} from "./mediaRenderIds";
+
+export { ensureExternalScriptTag } from "./externalScripts";

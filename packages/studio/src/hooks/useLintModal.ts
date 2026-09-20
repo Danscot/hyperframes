@@ -1,3 +1,4 @@
+import { buildProjectApiPath } from "../utils/projectRouting";
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import type { LintFinding } from "../components/LintModal";
 import { usePlayerStore } from "../player";
@@ -35,7 +36,7 @@ export function useLintModal(projectId: string | null, refreshKey?: number) {
       if (!projectId) return;
       if (!opts?.background) setLinting(true);
       try {
-        const res = await fetch(`/api/projects/${projectId}/lint`);
+        const res = await fetch(buildProjectApiPath(projectId, `/lint`));
         const data = await res.json();
         const parsed = ((data.findings ?? []) as RawFinding[]).map(parseFinding);
         if (opts?.background) {
@@ -95,6 +96,8 @@ export function useLintModal(projectId: string | null, refreshKey?: number) {
 
   const findingsByElement = useMemo(() => groupFindings((f) => f.elementId), [groupFindings]);
   const findingsByFile = useMemo(() => groupFindings((f) => f.file), [groupFindings]);
+  // Reads the list the badge count reads: the manual result when present, else the background one.
+  const hasLintError = (lintModal ?? backgroundFindings).some((f) => f.severity === "error");
 
   // Sync lint findings directly to the player store — eliminates the
   // mirroring useEffect that was previously in App.tsx.
@@ -110,5 +113,6 @@ export function useLintModal(projectId: string | null, refreshKey?: number) {
     backgroundFindings,
     findingsByElement,
     findingsByFile,
+    hasLintError,
   };
 }

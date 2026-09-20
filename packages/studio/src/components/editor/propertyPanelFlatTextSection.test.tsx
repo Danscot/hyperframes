@@ -2,8 +2,7 @@
 
 import React, { act, useState } from "react";
 import { createRoot } from "react-dom/client";
-import postcss from "postcss";
-import tailwindcss from "tailwindcss";
+import { compile } from "tailwindcss";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FlatTextLayerList, FlatTextSection } from "./propertyPanelFlatTextSection";
 import type { DomEditSelection, DomEditTextField } from "./domEditingTypes";
@@ -299,22 +298,17 @@ describe("FlatTextFieldEditor controls", () => {
 
 describe("FlatTextSection — multi-field", () => {
   it("shows the layer list, switches the active field's rows on selection, and has no doubled heading (this component never renders its own heading — the parent FlatGroup does)", () => {
-    const host = document.createElement("div");
-    document.body.append(host);
-    const root = createRoot(host);
-    act(() => {
-      root.render(
-        <FlatTextSection
-          element={makeMultiFieldElement()}
-          styles={{}}
-          fontAssets={[]}
-          onSetText={vi.fn()}
-          onSetTextFieldStyle={vi.fn()}
-          onAddTextField={vi.fn()}
-          onRemoveTextField={vi.fn()}
-        />,
-      );
-    });
+    const { host, root } = renderInto(
+      <FlatTextSection
+        element={makeMultiFieldElement()}
+        styles={{}}
+        fontAssets={[]}
+        onSetText={vi.fn()}
+        onSetTextFieldStyle={vi.fn()}
+        onAddTextField={vi.fn()}
+        onRemoveTextField={vi.fn()}
+      />,
+    );
     expect(host.textContent).toContain("Headline");
     expect(host.textContent).toContain("Subhead");
     // Active field's editor rows are visible (Font/Weight/etc. from FlatTextFieldEditor).
@@ -408,6 +402,27 @@ describe("FlatTextSection — multi-field", () => {
     act(() => root.unmount());
   });
 
+  it("does not steal canvas focus when a multi-field element is selected", () => {
+    const focusOwner = document.createElement("button");
+    document.body.append(focusOwner);
+    focusOwner.focus();
+
+    const { root } = renderInto(
+      <FlatTextSection
+        element={makeMultiFieldElement()}
+        styles={{}}
+        fontAssets={[]}
+        onSetText={vi.fn()}
+        onSetTextFieldStyle={vi.fn()}
+        onAddTextField={vi.fn()}
+        onRemoveTextField={vi.fn()}
+      />,
+    );
+
+    expect(document.activeElement).toBe(focusOwner);
+    act(() => root.unmount());
+  });
+
   it("auto-focuses the Content textarea when a new text field is added", async () => {
     let addResolved = false;
 
@@ -495,13 +510,13 @@ describe("FlatTextSection — multi-field", () => {
     expect(contentTextarea?.classList).toContain("resize-y");
     expect(contentTextarea?.classList).toContain("overflow-y-auto");
 
-    const compiled = await postcss([
-      tailwindcss({
-        content: [{ raw: host.innerHTML, extension: "html" }],
-        corePlugins: { preflight: false },
-      }),
-    ]).process("@tailwind utilities;", { from: undefined });
-    expect(compiled.css).toContain("field-sizing: content");
+    // Tailwind v4 has no PostCSS-plugin JS API; `compile` takes the stylesheet
+    // and is handed the candidates directly instead of scanning raw content.
+    const candidates = Array.from(host.querySelectorAll<HTMLElement>("*")).flatMap((el) =>
+      Array.from(el.classList),
+    );
+    const compiled = await compile("@tailwind utilities;");
+    expect(compiled.build(candidates)).toContain("field-sizing: content");
 
     act(() => root.unmount());
   });

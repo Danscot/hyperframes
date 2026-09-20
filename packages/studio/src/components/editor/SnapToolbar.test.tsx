@@ -5,9 +5,9 @@ import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAppHotkeys } from "../../hooks/useAppHotkeys";
 import { usePlayerStore } from "../../player/store/playerStore";
-import type { LeftSidebarHandle } from "../sidebar/LeftSidebar";
 import type { DomEditSelection } from "./domEditing";
 import { SnapToolbar } from "./SnapToolbar";
+import { usePreviewGuidesStore } from "./previewGuidesStore";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -30,11 +30,9 @@ function renderToolbar(onSnapChange = vi.fn()) {
 function AppHotkeyHarness() {
   const domEditSelectionRef = useRef<DomEditSelection | null>(null);
   const clearDomSelectionRef = useRef<() => void>(() => undefined);
-  const domEditSaveTimestampRef = useRef(0);
-  const leftSidebarRef = useRef<LeftSidebarHandle | null>(null);
 
   useAppHotkeys({
-    handleTimelineElementDelete: vi.fn(),
+    handleTimelineElementsDelete: vi.fn(async () => {}),
     handleTimelineElementSplit: vi.fn(),
     handleDomEditElementDelete: vi.fn(),
     domEditSelectionRef,
@@ -47,16 +45,16 @@ function AppHotkeyHarness() {
     readOptionalProjectFile: vi.fn(async () => ""),
     readProjectFile: vi.fn(async () => ""),
     writeProjectFile: vi.fn(async () => undefined),
-    domEditSaveTimestampRef,
     showToast: vi.fn(),
     syncHistoryPreviewAfterApply: vi.fn(async () => undefined),
     waitForPendingDomEditSaves: vi.fn(async () => undefined),
-    leftSidebarRef,
     handleCopy: vi.fn(() => false),
     handlePaste: vi.fn(async () => undefined),
     handleCut: vi.fn(async () => false),
+    handleDuplicate: vi.fn(async () => false),
     onResetKeyframes: vi.fn(() => false),
     onDeleteSelectedKeyframes: vi.fn(),
+    readOnlyPreview: false,
   });
 
   return null;
@@ -118,6 +116,25 @@ describe("SnapToolbar keyboard shortcuts", () => {
     });
 
     expect(onSnapChange).not.toHaveBeenCalled();
+    act(() => root.unmount());
+  });
+});
+
+describe("SnapToolbar ruler and safe-margin toggles", () => {
+  it.each([
+    ["Toggle ruler", "rulerVisible"],
+    ["Toggle safe margins", "safeMarginsVisible"],
+  ])("%s flips %s and remembers it", (label, key) => {
+    usePreviewGuidesStore.setState({ rulerVisible: false, safeMarginsVisible: false });
+    const { root } = renderToolbar();
+    const button = () => document.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`);
+    expect(button()?.getAttribute("aria-pressed")).toBe("false");
+
+    act(() => button()?.click());
+
+    expect(button()?.getAttribute("aria-pressed")).toBe("true");
+    const stored = window.localStorage.getItem("hf-studio-ui-preferences") ?? "{}";
+    expect(JSON.parse(stored)[key]).toBe(true);
     act(() => root.unmount());
   });
 });

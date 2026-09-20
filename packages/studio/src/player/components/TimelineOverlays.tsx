@@ -1,4 +1,6 @@
-import type { KeyframeCacheEntry, TimelineElement } from "../store/playerStore";
+import { useEffect, type MutableRefObject } from "react";
+import type { TimelineElement } from "../store/playerStore";
+import { usePlayerStore } from "../store/playerStore";
 import type { TimelineTheme } from "./timelineTheme";
 import type { TimelineRangeSelection } from "./timelineEditing";
 import type { TimelineEditCallbacks } from "./timelineCallbacks";
@@ -10,11 +12,14 @@ import {
 import { ClipContextMenu } from "./ClipContextMenu";
 import { TrackGapContextMenu } from "./TrackGapContextMenu";
 import { TimelineShortcutHint } from "./TimelineShortcutHint";
+import { copyTextToClipboard } from "../../utils/clipboard";
+import { trackStudioSegmentEaseEdit } from "../../telemetry/events";
 
-interface ClipContextMenuState {
+export interface ClipContextMenuState {
   x: number;
   y: number;
   element: TimelineElement;
+  sessionEpoch: number;
 }
 
 /** Resolved model for the empty-lane-space (track gap) context menu. */
@@ -28,6 +33,8 @@ interface TrackGapContextMenuState {
 }
 
 interface TimelineOverlaysProps {
+  elements: readonly TimelineElement[];
+  elementsRef: MutableRefObject<readonly TimelineElement[]>;
   theme: TimelineTheme;
   showShortcutHint: boolean;
   showPopover: boolean;
@@ -38,15 +45,17 @@ interface TimelineOverlaysProps {
   setKfContextMenu: (value: KeyframeDiamondContextMenuState | null) => void;
   onDeleteKeyframe: TimelineEditCallbacks["onDeleteKeyframe"];
   onDeleteAllKeyframes: TimelineEditCallbacks["onDeleteAllKeyframes"];
-  onChangeKeyframeEase: TimelineEditCallbacks["onChangeKeyframeEase"];
   onMoveKeyframeToPlayhead: TimelineEditCallbacks["onMoveKeyframeToPlayhead"];
-  keyframeCache: Map<string, KeyframeCacheEntry>;
   clipContextMenu: ClipContextMenuState | null;
   setClipContextMenu: (value: ClipContextMenuState | null) => void;
   currentTime: number;
   onSplitElement: TimelineEditCallbacks["onSplitElement"];
   pinZoomBeforeEdit: () => void;
   onDeleteElement?: (element: TimelineElement) => Promise<void> | void;
+  onCopyClip?: () => boolean;
+  onPasteClip?: () => Promise<void>;
+  onDuplicateClip?: () => Promise<boolean>;
+  canPasteClip?: () => boolean;
   gapContextMenu: TrackGapContextMenuState | null;
   onDismissGapContextMenu: () => void;
   onCloseTrackGap: () => void;
@@ -54,10 +63,49 @@ interface TimelineOverlaysProps {
   onHoverGapAction: (action: "close-gap" | "close-all" | null) => void;
 }
 
+interface TimelineContextTargetInput {
+  capturedElement: TimelineElement;
+  targetSessionEpoch: number | undefined;
+  sessionEpoch: number;
+  selectedElementId: string | null;
+  elements: readonly TimelineElement[];
+}
+
+/** The captured project session and current selection jointly own a context target. */
+export function resolveTimelineContextElement({
+  capturedElement,
+  targetSessionEpoch,
+  sessionEpoch,
+  selectedElementId,
+  elements,
+}: TimelineContextTargetInput): TimelineElement | null {
+  const identity = capturedElement.key ?? capturedElement.id;
+  if (targetSessionEpoch !== sessionEpoch) return null;
+  if (selectedElementId !== identity) return null;
+  return elements.find((element) => (element.key ?? element.id) === identity) ?? null;
+}
+
+function readTimelineContextElement(
+  capturedElement: TimelineElement,
+  targetSessionEpoch: number | undefined,
+  elements: readonly TimelineElement[],
+): TimelineElement | null {
+  const state = usePlayerStore.getState();
+  return resolveTimelineContextElement({
+    capturedElement,
+    targetSessionEpoch,
+    sessionEpoch: state.timelineSessionEpoch,
+    selectedElementId: state.selectedElementId,
+    elements,
+  });
+}
+
 // The timeline's floating overlays, rendered as siblings above the scroll area:
 // the shortcut hint, the range-edit popover, the keyframe-diamond context menu,
 // and the clip context menu.
 export function TimelineOverlays({
+  elements,
+  elementsRef,
   theme,
   showShortcutHint,
   showPopover,
@@ -68,21 +116,56 @@ export function TimelineOverlays({
   setKfContextMenu,
   onDeleteKeyframe,
   onDeleteAllKeyframes,
-  onChangeKeyframeEase,
   onMoveKeyframeToPlayhead,
-  keyframeCache,
   clipContextMenu,
   setClipContextMenu,
   currentTime,
   onSplitElement,
   pinZoomBeforeEdit,
   onDeleteElement,
+  onCopyClip,
+  onPasteClip,
+  onDuplicateClip,
+  canPasteClip,
   gapContextMenu,
   onDismissGapContextMenu,
   onCloseTrackGap,
   onCloseAllTrackGaps,
   onHoverGapAction,
 }: TimelineOverlaysProps) {
+  const selectedElementId = usePlayerStore((state) => state.selectedElementId);
+  const sessionEpoch = usePlayerStore((state) => state.timelineSessionEpoch);
+  const kfTargetSessionEpoch = kfContextMenu?.sessionEpoch;
+  const clipTargetSessionEpoch = clipContextMenu?.sessionEpoch;
+  const keyframeElement = kfContextMenu
+    ? resolveTimelineContextElement({
+        capturedElement: kfContextMenu.element,
+        targetSessionEpoch: kfTargetSessionEpoch,
+        sessionEpoch,
+        selectedElementId,
+        elements,
+      })
+    : null;
+  const clipElement = clipContextMenu
+    ? resolveTimelineContextElement({
+        capturedElement: clipContextMenu.element,
+        targetSessionEpoch: clipTargetSessionEpoch,
+        sessionEpoch,
+        selectedElementId,
+        elements,
+      })
+    : null;
+  const readCurrentElement = (element: TimelineElement, targetSessionEpoch: number | undefined) =>
+    readTimelineContextElement(element, targetSessionEpoch, elementsRef.current);
+
+  useEffect(() => {
+    if (kfContextMenu && !keyframeElement) setKfContextMenu(null);
+  }, [keyframeElement, kfContextMenu, setKfContextMenu]);
+
+  useEffect(() => {
+    if (clipContextMenu && !clipElement) setClipContextMenu(null);
+  }, [clipContextMenu, clipElement, setClipContextMenu]);
+
   return (
     <>
       {showShortcutHint && !showPopover && !rangeSelection && (
@@ -102,40 +185,82 @@ export function TimelineOverlays({
         />
       )}
 
-      {kfContextMenu && (
+      {kfContextMenu && keyframeElement && (
         <KeyframeDiamondContextMenu
-          state={kfContextMenu}
+          state={{ ...kfContextMenu, element: keyframeElement }}
           onClose={() => setKfContextMenu(null)}
-          onDelete={(elId, pct) => onDeleteKeyframe?.(elId, pct)}
-          onDeleteAll={(elId) => onDeleteAllKeyframes?.(elId)}
-          onChangeEase={(elId, pct, ease) => onChangeKeyframeEase?.(elId, pct, ease)}
+          onDelete={(...args) => {
+            if (!readCurrentElement(keyframeElement, kfTargetSessionEpoch)) return;
+            onDeleteKeyframe?.(...args);
+          }}
+          onDeleteAll={(_element, animationId) => {
+            const element = readCurrentElement(keyframeElement, kfTargetSessionEpoch);
+            if (element) onDeleteAllKeyframes?.(element, animationId);
+          }}
           onMoveToPlayhead={
             onMoveKeyframeToPlayhead
-              ? (elId, pct) => onMoveKeyframeToPlayhead(elId, pct)
+              ? (_element, ...args) => {
+                  const element = readCurrentElement(keyframeElement, kfTargetSessionEpoch);
+                  if (element) onMoveKeyframeToPlayhead(element, ...args);
+                }
               : undefined
           }
-          onCopyProperties={(elId, pct) => {
-            const kfData = keyframeCache.get(elId);
-            const kf = kfData?.keyframes.find((k) => k.percentage === pct);
-            if (kf) {
-              void navigator.clipboard.writeText(JSON.stringify(kf.properties, null, 2));
-            }
+          // Routed to the same focused-ease-segment path a segment click takes,
+          // so the menu advertises the editor that exists rather than growing a
+          // second one. Offered only for a keyframe that names a tween to focus.
+          onEditEase={
+            kfContextMenu.animationId !== undefined && kfContextMenu.tweenPercentage !== undefined
+              ? (elementId, keyframe) => {
+                  if (
+                    keyframe.animationId === undefined ||
+                    keyframe.tweenPercentage === undefined
+                  ) {
+                    return;
+                  }
+                  usePlayerStore.getState().setFocusedEaseSegment({
+                    animationId: keyframe.animationId,
+                    collidingAnimationTargets: keyframe.collidingAnimationTargets,
+                    tweenPercentage: keyframe.tweenPercentage,
+                    elementId,
+                  });
+                  trackStudioSegmentEaseEdit({ action: "open" });
+                }
+              : undefined
+          }
+          onCopyProperties={(elementId, keyframe) => {
+            const entry = usePlayerStore.getState().keyframeCache.get(elementId);
+            // Tolerance match on clip-%, the same basis the cache is keyed on —
+            // an exact float compare misses a keyframe the menu just opened over.
+            const kf = entry?.keyframes.find(
+              (item) => Math.abs(item.percentage - keyframe.percentage) < 0.5,
+            );
+            if (!kf) return false;
+            return copyTextToClipboard(JSON.stringify(kf.properties, null, 2));
           }}
         />
       )}
 
-      {clipContextMenu && (
+      {clipContextMenu && clipElement && (
         <ClipContextMenu
           x={clipContextMenu.x}
           y={clipContextMenu.y}
-          element={clipContextMenu.element}
+          element={clipElement}
           currentTime={currentTime}
           onClose={() => setClipContextMenu(null)}
-          onSplit={(el, time) => onSplitElement?.(el, time)}
-          onDelete={(el) => {
-            pinZoomBeforeEdit();
-            onDeleteElement?.(el);
+          onSplit={(_element, time) => {
+            const element = readCurrentElement(clipElement, clipTargetSessionEpoch);
+            if (element) onSplitElement?.(element, time);
           }}
+          onDelete={() => {
+            const element = readCurrentElement(clipElement, clipTargetSessionEpoch);
+            if (!element) return;
+            pinZoomBeforeEdit();
+            onDeleteElement?.(element);
+          }}
+          onCopy={onCopyClip}
+          onPaste={onPasteClip}
+          onDuplicate={onDuplicateClip}
+          canPaste={canPasteClip?.() ?? false}
         />
       )}
 

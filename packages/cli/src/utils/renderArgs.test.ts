@@ -9,6 +9,7 @@ import {
   resolveDiagnosticNavigationTimeoutMs,
   parseCompositionEntryArg,
   parseGifLoopArg,
+  parseHlsSegmentSecondsArg,
   resolveDefaultFpsArg,
   type BrowserTimeoutParseResult,
   type CompositionEntryParseResult,
@@ -117,6 +118,23 @@ describe("resolveDiagnosticNavigationTimeoutMs", () => {
     expect(
       resolveDiagnosticNavigationTimeoutMs({ PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS: "invalid" }),
     ).toBe(10_000);
+  });
+
+  it("raises the diagnostic navigation budget to a larger caller-provided minimum", () => {
+    expect(resolveDiagnosticNavigationTimeoutMs({}, 30_000)).toBe(30_000);
+  });
+
+  it("does not let a caller-provided minimum shorten the default budget", () => {
+    expect(resolveDiagnosticNavigationTimeoutMs({}, 3_000)).toBe(10_000);
+  });
+
+  it("does not let a caller-provided minimum shorten the environment override", () => {
+    expect(
+      resolveDiagnosticNavigationTimeoutMs(
+        { PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS: "90000" },
+        30_000,
+      ),
+    ).toBe(90_000);
   });
 });
 
@@ -279,5 +297,22 @@ describe("parseGifLoopArg", () => {
     expect(parseGifLoopArg("65536").ok).toBe(false);
     expect(parseGifLoopArg("1.5").ok).toBe(false);
     expect(parseGifLoopArg(" ").ok).toBe(false);
+  });
+});
+
+describe("parseHlsSegmentSecondsArg", () => {
+  it("accepts absent flag and whole seconds in range", () => {
+    expect(parseHlsSegmentSecondsArg(undefined)).toEqual({ ok: true, value: undefined });
+    expect(parseHlsSegmentSecondsArg("1")).toEqual({ ok: true, value: 1 });
+    expect(parseHlsSegmentSecondsArg(" 6 ")).toEqual({ ok: true, value: 6 });
+    expect(parseHlsSegmentSecondsArg("60")).toEqual({ ok: true, value: 60 });
+  });
+
+  // Fractional seconds would make ffmpeg's integer #EXT-X-TARGETDURATION lie.
+  it("rejects zero, fractional, out-of-range, and empty inputs", () => {
+    expect(parseHlsSegmentSecondsArg("0").ok).toBe(false);
+    expect(parseHlsSegmentSecondsArg("2.5").ok).toBe(false);
+    expect(parseHlsSegmentSecondsArg("61").ok).toBe(false);
+    expect(parseHlsSegmentSecondsArg(" ").ok).toBe(false);
   });
 });

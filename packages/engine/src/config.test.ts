@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   resolveConfig,
+  resolveDefaultDrawElement,
+  explainDrawElementDisabled,
   DEFAULT_CONFIG,
   scaleProtocolTimeoutForComposition,
   shouldClampToScreenshotForConcreteGpu,
@@ -51,6 +53,7 @@ describe("resolveConfig", () => {
     expect(config.browserGpuMode).toBe("software");
     expect(config.enableStreamingEncode).toBe(true);
     expect(config.streamingEncodeMaxDurationSeconds).toBe(240);
+    expect(config.streamingEncodeDurationCapEnabled).toBe(false);
     expect((config as Record<string, unknown>).vp9CpuUsed).toBe(4);
     expect(config.audioGain).toBe(1);
     expect(config.debug).toBe(false);
@@ -101,6 +104,18 @@ describe("resolveConfig", () => {
 
     const config = resolveConfig();
     expect(config.streamingEncodeMaxDurationSeconds).toBe(0);
+  });
+
+  it("reads the streaming duration cap enable flag from env", () => {
+    setEnv("PRODUCER_STREAMING_ENCODE_DURATION_CAP_ENABLED", "true");
+
+    const config = resolveConfig();
+    expect(config.streamingEncodeDurationCapEnabled).toBe(true);
+  });
+
+  it("keeps the streaming duration cap disabled when the flag is unset", () => {
+    const config = resolveConfig();
+    expect(config.streamingEncodeDurationCapEnabled).toBe(false);
   });
 
   it("reads VP9 cpu-used from env", () => {
@@ -232,6 +247,137 @@ describe("resolveConfig", () => {
     });
   });
 
+  // Every resolveDefaultDrawElement branch returns a bare `false`, so a render
+  // that never became a DE candidate reached telemetry with no reason at all
+  // and landed in the dashboard's `other` bucket. These pin that each silent
+  // refusal now has a name, and that the names stay in the same ORDER as the
+  // resolver's branches — if the two drift, the reason is a plausible lie,
+  // which is worse than no reason.
+  describe("explainDrawElementDisabled (names the silent refusals)", () => {
+    const base = { browserGpuMode: "hardware" as const, workerEncode: true };
+
+    it("turns fast capture off by default on a host capped at Chrome 150, unless opted in", () => {
+      const args = {
+        useDrawElement: true,
+        platform: "darwin" as const,
+        browserGpuMode: "hardware" as const,
+        workerEncode: true,
+        chromeCeiling: 150,
+      };
+      expect(resolveDefaultDrawElement({ ...args, explicitOptIn: false })).toBe(false);
+      expect(resolveDefaultDrawElement({ ...args, explicitOptIn: true })).toBe(true);
+      expect(
+        resolveDefaultDrawElement({ ...args, chromeCeiling: undefined, explicitOptIn: false }),
+      ).toBe(true);
+      expect(explainDrawElementDisabled({ ...base, platform: "darwin", chromeCeiling: 150 })).toBe(
+        "old_chrome",
+      );
+    });
+
+    it("names each refusal", () => {
+      expect(explainDrawElementDisabled({ ...base, platform: "linux" })).toBe(
+        "unsupported_platform",
+      );
+      expect(
+        explainDrawElementDisabled({ ...base, platform: "darwin", browserGpuMode: "software" }),
+      ).toBe("software_gpu");
+      expect(explainDrawElementDisabled({ ...base, platform: "win32", workerEncode: false })).toBe(
+        "worker_encode_off",
+      );
+    });
+
+    // The Windows case this shipped for: hardware GPU, supported platform,
+    // worker-encode on — nothing environmental explains it, so it was an
+    // explicit opt-out. Must NOT masquerade as one of the other three.
+    // The caller-side path: resolveDefaultDrawElement never even runs when the
+    // feature is off at a higher config level, so the orchestrator seeds from
+    // the environment alone and must land on `disabled` rather than inventing
+    // an environmental cause.
+    it("reports `disabled` for a config-time refusal on a healthy host", () => {
+      expect(
+        resolveDefaultDrawElement({ ...base, useDrawElement: false, platform: "darwin" }),
+      ).toBe(false);
+      expect(explainDrawElementDisabled({ ...base, platform: "darwin" })).toBe("disabled");
+    });
+
+    it("falls back to `disabled` when nothing environmental explains it", () => {
+      expect(explainDrawElementDisabled({ ...base, platform: "win32" })).toBe("disabled");
+      expect(explainDrawElementDisabled({ ...base, platform: "darwin" })).toBe("disabled");
+    });
+
+    // Platform is checked BEFORE gpu mode, matching the resolver. A linux
+    // software host is reported as unsupported_platform, not software_gpu:
+    // fixing the GPU would not help.
+    it("orders platform ahead of gpu mode, like the resolver", () => {
+      expect(
+        explainDrawElementDisabled({
+          platform: "linux",
+          browserGpuMode: "software",
+          workerEncode: false,
+        }),
+      ).toBe("unsupported_platform");
+    });
+
+    // The contract that keeps the two functions honest: whenever the resolver
+    // says false, the explainer must produce a reason, and whenever it says
+    // true the caller must not ask.
+    it("covers every input where the resolver refuses", () => {
+      const platforms: NodeJS.Platform[] = ["darwin", "win32", "linux"];
+      const gpuModes = ["hardware", "software", "auto"] as const;
+      for (const platform of platforms) {
+        for (const browserGpuMode of gpuModes) {
+          for (const workerEncode of [true, false]) {
+            const on = resolveDefaultDrawElement({
+              useDrawElement: true,
+              explicitOptIn: false,
+              platform,
+              browserGpuMode,
+              workerEncode,
+            });
+            if (on) continue;
+            expect(explainDrawElementDisabled({ platform, browserGpuMode, workerEncode })).not.toBe(
+              "disabled",
+            );
+          }
+        }
+      }
+    });
+  });
+
+  describe("resolveDefaultDrawElement (pure host clamp)", () => {
+    const base = {
+      useDrawElement: true,
+      explicitOptIn: false,
+      browserGpuMode: "hardware" as const,
+      workerEncode: true,
+    };
+    it("engages on darwin and win32, not linux", () => {
+      expect(resolveDefaultDrawElement({ ...base, platform: "darwin" })).toBe(true);
+      expect(resolveDefaultDrawElement({ ...base, platform: "win32" })).toBe(true);
+      expect(resolveDefaultDrawElement({ ...base, platform: "linux" })).toBe(false);
+    });
+    it("software GPU clamps off even on supported platforms", () => {
+      expect(
+        resolveDefaultDrawElement({ ...base, platform: "win32", browserGpuMode: "software" }),
+      ).toBe(false);
+    });
+    it("explicit opt-in overrides platform and GPU clamps", () => {
+      expect(
+        resolveDefaultDrawElement({
+          ...base,
+          explicitOptIn: true,
+          platform: "linux",
+          browserGpuMode: "software",
+        }),
+      ).toBe(true);
+    });
+    it("no worker-encode (no verify net) clamps the default off", () => {
+      expect(resolveDefaultDrawElement({ ...base, platform: "darwin", workerEncode: false })).toBe(
+        false,
+      );
+    });
+  });
+
   describe("useDrawElement (PRODUCER_EXPERIMENTAL_FAST_CAPTURE)", () => {
     it("default is clamped off on software-GPU hosts (page-side compositing preserved)", () => {
       setEnv("PRODUCER_BROWSER_GPU_MODE", "software");
@@ -242,21 +388,20 @@ describe("resolveConfig", () => {
       expect(config.enablePageSideCompositing).toBe(true);
     });
 
-    it("default engages on macOS with a hardware-GPU browser", () => {
-      setEnv("PRODUCER_BROWSER_GPU_MODE", "hardware");
-      unsetEnv("PRODUCER_EXPERIMENTAL_FAST_CAPTURE");
-      unsetEnv("HF_DE_WORKER_ENCODE");
-      const config = resolveConfig();
-      expect(config.useDrawElement).toBe(process.platform === "darwin");
-    });
-
-    it("default engages on macOS with auto GPU mode (the stock CLI path)", () => {
-      setEnv("PRODUCER_BROWSER_GPU_MODE", "auto");
-      unsetEnv("PRODUCER_EXPERIMENTAL_FAST_CAPTURE");
-      unsetEnv("HF_DE_WORKER_ENCODE");
-      const config = resolveConfig();
-      expect(config.useDrawElement).toBe(process.platform === "darwin");
-    });
+    // win32 opened 2026-07-27 (was darwin-only): ~206k non-CI hardware-GPU
+    // Windows renders / 30d sat on the screenshot path behind the old clamp.
+    // "auto" is the stock CLI path; both must pass the platform clamp.
+    for (const gpuMode of ["hardware", "auto"] as const) {
+      it(`default engages on macOS/Windows with ${gpuMode} GPU mode`, () => {
+        setEnv("PRODUCER_BROWSER_GPU_MODE", gpuMode);
+        unsetEnv("PRODUCER_EXPERIMENTAL_FAST_CAPTURE");
+        unsetEnv("HF_DE_WORKER_ENCODE");
+        const config = resolveConfig();
+        expect(config.useDrawElement).toBe(
+          process.platform === "darwin" || process.platform === "win32",
+        );
+      });
+    }
 
     it("default requires worker-encode (the verified drain)", () => {
       setEnv("PRODUCER_BROWSER_GPU_MODE", "hardware");
@@ -624,40 +769,58 @@ describe("resolveConfig", () => {
       Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
     });
 
-    it("auto-disables on win32 + software-GPU + workers=1 + no user opt-in", () => {
-      setPlatform("win32");
-      setEnv("PRODUCER_BROWSER_GPU_MODE", "software");
-      setEnv("PRODUCER_MAX_WORKERS", "1");
+    /**
+     * Shared setup/assert for the win32 software-GPU compound: fixed common
+     * env (low-memory on, no explicit streaming opt-in), variable platform /
+     * gpu / workers, then assert whether the auto-disable fired.
+     */
+    function expectCompoundOutcome(opts: {
+      platform: NodeJS.Platform;
+      gpuMode?: string;
+      workers?: string;
+      autoDisabled: boolean;
+    }): void {
+      setPlatform(opts.platform);
+      if (opts.gpuMode === undefined) unsetEnv("PRODUCER_BROWSER_GPU_MODE");
+      else setEnv("PRODUCER_BROWSER_GPU_MODE", opts.gpuMode);
+      if (opts.workers === undefined) unsetEnv("PRODUCER_MAX_WORKERS");
+      else setEnv("PRODUCER_MAX_WORKERS", opts.workers);
       setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
       unsetEnv("PRODUCER_ENABLE_STREAMING_ENCODE");
-
       const config = resolveConfig();
-      expect(config.enableStreamingEncode).toBe(false);
-      expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBe(true);
+      expect(config.enableStreamingEncode).toBe(!opts.autoDisabled);
+      if (opts.autoDisabled) {
+        expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBe(true);
+      } else {
+        expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBeUndefined();
+      }
+    }
+
+    it("auto-disables on win32 + software-GPU + workers=1 + no user opt-in", () => {
+      expectCompoundOutcome({
+        platform: "win32",
+        gpuMode: "software",
+        workers: "1",
+        autoDisabled: true,
+      });
     });
 
     it("leaves streaming-encode on when platform is linux", () => {
-      setPlatform("linux");
-      setEnv("PRODUCER_BROWSER_GPU_MODE", "software");
-      setEnv("PRODUCER_MAX_WORKERS", "1");
-      setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
-      unsetEnv("PRODUCER_ENABLE_STREAMING_ENCODE");
-
-      const config = resolveConfig();
-      expect(config.enableStreamingEncode).toBe(true);
-      expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBeUndefined();
+      expectCompoundOutcome({
+        platform: "linux",
+        gpuMode: "software",
+        workers: "1",
+        autoDisabled: false,
+      });
     });
 
     it("leaves streaming-encode on when workers > 1", () => {
-      setPlatform("win32");
-      setEnv("PRODUCER_BROWSER_GPU_MODE", "software");
-      setEnv("PRODUCER_MAX_WORKERS", "4");
-      setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
-      unsetEnv("PRODUCER_ENABLE_STREAMING_ENCODE");
-
-      const config = resolveConfig();
-      expect(config.enableStreamingEncode).toBe(true);
-      expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBeUndefined();
+      expectCompoundOutcome({
+        platform: "win32",
+        gpuMode: "software",
+        workers: "4",
+        autoDisabled: false,
+      });
     });
 
     it("respects explicit env opt-in (PRODUCER_ENABLE_STREAMING_ENCODE=true) on the compound", () => {
@@ -703,16 +866,8 @@ describe("resolveConfig", () => {
       // --low-memory-mode implies screenshot capture. Compound applies even
       // if browserGpuMode is not literal "software" (defense-in-depth: matches
       // the OR semantics in `softwareGpuForced`).
-      setPlatform("win32");
-      unsetEnv("PRODUCER_BROWSER_GPU_MODE");
       unsetEnv("PRODUCER_DISABLE_GPU");
-      setEnv("PRODUCER_MAX_WORKERS", "1");
-      setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
-      unsetEnv("PRODUCER_ENABLE_STREAMING_ENCODE");
-
-      const config = resolveConfig();
-      expect(config.enableStreamingEncode).toBe(false);
-      expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBe(true);
+      expectCompoundOutcome({ platform: "win32", workers: "1", autoDisabled: true });
     });
 
     it("does not trigger when concurrency is 'auto' (workers not explicitly pinned)", () => {
@@ -720,15 +875,7 @@ describe("resolveConfig", () => {
       // helper's numeric workers check treats NaN as "unknown, don't trigger".
       // Downstream workers may still resolve to 1 via lowMemoryMode, but the
       // config-time clamp is deliberately conservative.
-      setPlatform("win32");
-      setEnv("PRODUCER_BROWSER_GPU_MODE", "software");
-      unsetEnv("PRODUCER_MAX_WORKERS");
-      setEnv("PRODUCER_LOW_MEMORY_MODE", "true");
-      unsetEnv("PRODUCER_ENABLE_STREAMING_ENCODE");
-
-      const config = resolveConfig();
-      expect(config.enableStreamingEncode).toBe(true);
-      expect(config.streamingEncodeAutoDisabledOnWin32Compound).toBeUndefined();
+      expectCompoundOutcome({ platform: "win32", gpuMode: "software", autoDisabled: false });
     });
   });
 

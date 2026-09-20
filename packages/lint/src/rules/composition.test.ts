@@ -28,6 +28,42 @@ describe("composition rules", () => {
         result.findings.find(({ code }) => code === "overlapping_clips_same_track"),
       ).toBeUndefined();
     });
+
+    // Regression: cli-feedback field cluster (crons 61-68, n=25+ across
+    // darwin/linux/win32 and versions 0.7.56-0.7.64). `bundleToSingleHtml`
+    // compiles `data-duration` into `data-end`, then re-validates the compiled
+    // HTML. Before this fix the linter fired `deprecated_data_end` on the
+    // compiler's own consistent output — a false-positive that reporters
+    // routed as "check --strict passes but StaticGuard still logs
+    // deprecated-attribute noise" (ts=1784548892, ts=1784541122).
+    it("does not flag deprecated_data_end when compiled data-end matches data-duration", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="30">
+          <audio id="bgm" src="bgm.mp3" data-start="0" data-duration="18" data-end="18"></audio>
+          <audio id="narration" src="narr.mp3" data-start="5" data-duration="10" data-end="15"></audio>
+        </div>
+        <script>window.__timelines = { main: {} };</script>
+      </body></html>`);
+
+      const deprecatedEnd = result.findings.filter(({ code }) => code === "deprecated_data_end");
+      expect(deprecatedEnd).toEqual([]);
+    });
+
+    // Companion regression: a manually authored stale `data-end` still fires
+    // `deprecated_data_end`, with a message that names the disagreement so
+    // the author can spot the drift rather than reading the legacy phrasing.
+    it("still flags deprecated_data_end when data-end disagrees with data-duration", async () => {
+      const result = await lintHyperframeHtml(`<!doctype html><html><body>
+        <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="30">
+          <audio id="bgm" src="bgm.mp3" data-start="0" data-duration="18" data-end="20"></audio>
+        </div>
+        <script>window.__timelines = { main: {} };</script>
+      </body></html>`);
+
+      const deprecatedEnd = result.findings.find(({ code }) => code === "deprecated_data_end");
+      expect(deprecatedEnd).toBeDefined();
+      expect(deprecatedEnd?.message).toMatch(/disagrees with data-duration/);
+    });
   });
 
   describe("subcomposition guidance", () => {
@@ -279,6 +315,50 @@ describe("composition rules", () => {
       expect(finding).toBeUndefined();
     });
 
+    it("does not flag one sub-composition mounted repeatedly with per-instance values", async () => {
+      // Regression: sub-compositions.md "Per-Instance Variables" documents
+      // mounting one source several times with different data-variable-values.
+      // That necessarily repeats the id, and the runtime rewrites repeated
+      // mounts to `id__hf1`/`id__hf2` so they coexist. Flagging it made the
+      // documented pattern an error with no correct way to satisfy it.
+      const html = `<!DOCTYPE html>
+<html>
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="6" data-no-timeline>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-variable-values='{"text":"one"}' data-start="0" data-duration="2"></div>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-variable-values='{"text":"two"}' data-start="2" data-duration="2"></div>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-variable-values='{"text":"three"}' data-start="4" data-duration="2"></div>
+  </div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "duplicate_composition_id")).toBeUndefined();
+    });
+
+    it("still flags a real collision between a root and a non-mount element", async () => {
+      // The guard that keeps the exemption honest: skipping mounts must not
+      // blind the rule to the meta-versus-root collision it exists for, even
+      // when a legitimately repeated mount is present in the same file.
+      const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta name="composition-id" data-composition-id="main">
+</head>
+<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="4" data-no-timeline>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-start="0" data-duration="2"></div>
+    <div data-composition-id="word" data-composition-src="compositions/word-caption.html" data-start="2" data-duration="2"></div>
+  </div>
+</body>
+</html>`;
+
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find((f) => f.code === "duplicate_composition_id");
+      expect(finding).toBeDefined();
+      expect(finding?.message).toContain("main");
+    });
+
     it("ignores composition ids inside inert template content", async () => {
       const html = `<!DOCTYPE html>
 <html><body>
@@ -394,6 +474,94 @@ describe("composition rules", () => {
     expect(findings[0]?.fixHint).toContain('[data-composition-id="scene"][data-start="0"]');
   });
 
+  it("keeps reporting a missing duration source when the same script defeats the lexer", async () => {
+    const html = `
+<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    var of = 2; var r = of /2;
+    // window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html, { filePath: "compositions/main.html" });
+    const findings = result.findings.filter(
+      (f) => f.code === "root_composition_missing_duration_source",
+    );
+    expect(findings.length).toBe(1);
+    expect(findings[0]?.severity).toBe("error");
+  });
+
+  it("reports a split data-attribute selector that lives only in a script string literal", async () => {
+    const html = `
+<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    document.querySelector('[data-composition-id="main" data-start="0"]');
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html, { filePath: "compositions/main.html" });
+    const findings = result.findings.filter((f) => f.code === "split_data_attribute_selector");
+    expect(findings.length).toBe(1);
+    expect(findings[0]?.severity).toBe("error");
+  });
+
+  it("does not report a template-literal selector that only appears in a comment or a string", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><code id="snippet"></code></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    // Hardcoded on purpose — do NOT use document.querySelector(\`#\${id}\`) here.
+    const SAMPLE = 'document.querySelector(\`[data-composition-id="\${compId}"]\`)';
+    document.getElementById("snippet").textContent = SAMPLE;
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "template_literal_selector")).toBeUndefined();
+  });
+
+  it("reports a template-literal selector in code position and quotes the real source", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const compId = "main";
+    const el = document.querySelector(\`[data-composition-id="\${compId}"]\`);
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "template_literal_selector");
+    expect(finding?.severity).toBe("error");
+    expect(finding?.snippet).toContain("data-composition-id");
+  });
+
+  it("does not report a split data-attribute selector written inside a CSS comment", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <style>
+    /* never write [data-composition-id="main" data-start="0"] — split the brackets */
+    #root { background: #111; }
+  </style>
+  <script>
+    window.__timelines = window.__timelines || {};
+    // and not [data-composition-id="main" data-start="0"] in a JS comment either
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.filter((f) => f.code === "split_data_attribute_selector")).toHaveLength(
+      0,
+    );
+  });
+
   describe("timed_element_missing_clip_class", () => {
     it("flags element with data-start but no class='clip'", async () => {
       const html = `
@@ -409,7 +577,10 @@ describe("composition rules", () => {
       const result = await lintHyperframeHtml(html);
       const finding = result.findings.find((f) => f.code === "timed_element_missing_clip_class");
       expect(finding).toBeDefined();
-      expect(finding?.severity).toBe("error");
+      // A warning, not an error: the runtime hides the element either way (see
+      // the message), so a missing marker class is an authoring-convention gap.
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.message).not.toContain("visible for the entire composition");
     });
 
     it("does not flag element that has class='clip'", async () => {
@@ -428,12 +599,16 @@ describe("composition rules", () => {
       expect(finding).toBeUndefined();
     });
 
-    it("does not flag audio or video elements", async () => {
+    it("does not flag the media primitives: audio, video, img", async () => {
+      // All three are authored without class="clip" in the canonical clip block
+      // (packages/core/docs/core.md). `img` used to be the only one of the three
+      // that errored, so the documented example failed its own linter.
       const html = `
 <html><body>
   <div data-composition-id="c1" data-width="1920" data-height="1080">
     <audio data-start="0" data-duration="5" src="music.mp3"></audio>
     <video data-start="0" data-duration="5" src="clip.mp4"></video>
+    <img data-start="5" data-duration="4" src="still.png" />
   </div>
   <script>
     window.__timelines = window.__timelines || {};
@@ -443,6 +618,27 @@ describe("composition rules", () => {
       const result = await lintHyperframeHtml(html);
       const finding = result.findings.find((f) => f.code === "timed_element_missing_clip_class");
       expect(finding).toBeUndefined();
+    });
+
+    it("leaves the documented canonical clip block completely clean", async () => {
+      // Verbatim from packages/core/docs/core.md. If this ever goes red again,
+      // the docs and the linter have drifted apart and one of them is wrong.
+      const html = `
+<html><body>
+  <div id="comp-1" data-composition-id="my-video" data-width="1920" data-height="1080" data-start="0">
+    <video id="el-1" data-start="0" data-duration="10" data-track-index="0" src="a.mp4" muted></video>
+    <img id="el-3" data-start="5" data-duration="4" data-track-index="1" src="a.png" />
+    <audio id="el-4" data-start="0" data-duration="30" data-track-index="2" src="a.mp3"></audio>
+  </div>
+  <script src="gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    window.__timelines["my-video"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const blocking = result.findings.filter((f) => f.severity !== "info");
+      expect(blocking.map((f) => `${f.severity}:${f.code}`)).toEqual([]);
     });
 
     it("does not flag element with only data-track-index (layer container, no timing)", async () => {
@@ -460,78 +656,6 @@ describe("composition rules", () => {
 </body></html>`;
       const result = await lintHyperframeHtml(html);
       const finding = result.findings.find((f) => f.code === "timed_element_missing_clip_class");
-      expect(finding).toBeUndefined();
-    });
-  });
-
-  describe("overlapping_clips_same_track", () => {
-    it("flags overlapping clips on the same track", async () => {
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0" data-duration="3" data-track-index="0">A</div>
-    <div class="clip" data-start="2" data-duration="3" data-track-index="0">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
-      expect(finding).toBeDefined();
-      expect(finding?.severity).toBe("error");
-    });
-
-    it("does not flag clips on different tracks", async () => {
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0" data-duration="3" data-track-index="0">A</div>
-    <div class="clip" data-start="1" data-duration="3" data-track-index="1">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
-      expect(finding).toBeUndefined();
-    });
-
-    it("does not flag sequential clips on the same track", async () => {
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0" data-duration="2" data-track-index="0">A</div>
-    <div class="clip" data-start="2" data-duration="2" data-track-index="0">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
-      expect(finding).toBeUndefined();
-    });
-
-    it("does not flag adjacencies where parseFloat + add drifts by a few ulps", async () => {
-      // parseFloat("0.1") + parseFloat("0.2") = 0.30000000000000004
-      const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div class="clip" data-start="0.1" data-duration="0.2" data-track-index="0">A</div>
-    <div class="clip" data-start="0.3" data-duration="0.2" data-track-index="0">B</div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    window.__timelines["c1"] = gsap.timeline({ paused: true });
-  </script>
-</body></html>`;
-      const result = await lintHyperframeHtml(html);
-      const finding = result.findings.find((f) => f.code === "overlapping_clips_same_track");
       expect(finding).toBeUndefined();
     });
   });
@@ -731,6 +855,41 @@ describe("composition rules", () => {
         (f) => f.code === "requestanimationframe_in_composition",
       );
       expect(finding).toBeUndefined();
+    });
+
+    it("does not flag a call the composition only renders as on-screen text", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><code id="snippet"></code></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const fn = "step";
+    document.getElementById("snippet").textContent = "requestAnimationFrame(step);";
+    document.getElementById("snippet").title = \`requestAnimationFrame(\${fn});\`;
+    window.__timelines["c1"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "requestanimationframe_in_composition"),
+      ).toBeUndefined();
+    });
+
+    it("still flags a call inside a template interpolation, which is code", async () => {
+      const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><code id="snippet"></code></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const label = \`frame \${requestAnimationFrame(() => {})}\`;
+    document.getElementById("snippet").textContent = label;
+    window.__timelines["c1"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(
+        result.findings.find((f) => f.code === "requestanimationframe_in_composition")?.severity,
+      ).toBe("error");
     });
   });
 
@@ -1013,6 +1172,24 @@ describe("composition rules", () => {
       expect(finding).toBeUndefined();
     });
 
+    it("does not warn for an HTML-entity-encoded declarations array", async () => {
+      const declarations = JSON.stringify([
+        {
+          id: "title",
+          type: "string",
+          label: "Title",
+          description: 'A "quoted" title',
+          default: "Hello",
+        },
+      ]).replaceAll('"', "&quot;");
+      const html = `<html data-composition-variables='${declarations}'><body><div data-composition-id="x"></div></body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const finding = result.findings.find(
+        (f) => f.code === "invalid_composition_variables_declaration",
+      );
+      expect(finding).toBeUndefined();
+    });
+
     it("does not warn when data-composition-variables is absent", async () => {
       const html = `<html><body><div data-composition-id="x"></div></body></html>`;
       const result = await lintHyperframeHtml(html);
@@ -1020,6 +1197,38 @@ describe("composition rules", () => {
         (f) => f.code === "invalid_composition_variables_declaration",
       );
       expect(finding).toBeUndefined();
+    });
+  });
+
+  describe("unloadable_media_variable_default", () => {
+    const CODE = "unloadable_media_variable_default";
+    const find = (r: { findings: { code: string }[] }) => r.findings.find((f) => f.code === CODE);
+
+    it("errors on an image variable defaulting to a file:// URL", async () => {
+      const html = `<html data-composition-variables='[{"id":"bg","type":"image","label":"BG","default":"file:///abs/assets/blue.png"}]'><body><img data-composition-id="x" src="assets/red.png" data-var-src="bg"></body></html>`;
+      const finding = find(await lintHyperframeHtml(html));
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toMatch(/authored fallback/);
+    });
+
+    it("errors on a non-image variable that a data-var-src binding consumes as a URL", async () => {
+      const html = `<html data-composition-variables='[{"id":"clip","type":"string","label":"Clip","default":"file:///abs/a.mp4"}]'><body><video data-composition-id="x" src="a.mp4" data-var-src="clip"></video></body></html>`;
+      expect(find(await lintHyperframeHtml(html))).toBeDefined();
+    });
+
+    it("stays quiet for relative, http(s) and data:image defaults", async () => {
+      const html = `<html data-composition-variables='[
+        {"id":"a","type":"image","label":"A","default":"assets/blue.png"},
+        {"id":"b","type":"image","label":"B","default":"https://example.com/b.png"},
+        {"id":"c","type":"image","label":"C","default":"data:image/png;base64,iVBORw0KGgo="}
+      ]'><body><img data-composition-id="x" src="r.png" data-var-src="a"></body></html>`;
+      expect(find(await lintHyperframeHtml(html))).toBeUndefined();
+    });
+
+    it("does not treat an unbound scalar variable as a URL", async () => {
+      const html = `<html data-composition-variables='[{"id":"note","type":"string","label":"Note","default":"mailto:hi@example.com"}]'><body><div data-composition-id="x"></div></body></html>`;
+      expect(find(await lintHyperframeHtml(html))).toBeUndefined();
     });
   });
 
@@ -1428,6 +1637,55 @@ describe("composition rules", () => {
       const finding = find(result.findings);
       expect(finding).toBeDefined();
       expect(finding?.severity).toBe("error");
+    });
+
+    it("warns, and says where to author the length, when timed clips give the root a length", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <img src="a.png" data-start="2" />
+          <div class="clip" data-start="0" data-duration="6"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)).toBeUndefined();
+      const derived = result.findings.find((f) => f.code === "root_composition_duration_derived");
+      expect(derived?.severity).toBe("warning");
+      expect(derived?.message).toContain("at least 6s");
+      expect(derived?.fixHint).toContain("data-duration");
+    });
+
+    it("counts a clip with a reference start or a video with no length as known only at runtime", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <img src="a.png" data-start="0" />
+          <video src="v.mp4" data-start="0"></video>
+          <div class="clip" data-start="a+1" data-duration="2"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      const derived = result.findings.find((f) => f.code === "root_composition_duration_derived");
+      expect(derived?.message).toContain("at least 3s");
+      expect(derived?.message).toContain("2 clip(s) whose length is only known at runtime");
+    });
+
+    it("does not count a clip whose data-end is before its start", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <div class="clip" data-start="5" data-end="3"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)?.severity).toBe("error");
+    });
+
+    it("still errors when the only clips have no length to derive from", async () => {
+      const html = `<html><body>
+        <div data-composition-id="main" data-start="0" data-width="1920" data-height="1080">
+          <div class="clip" data-start="0"></div>
+        </div>
+      </body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(find(result.findings)?.severity).toBe("error");
     });
 
     it("does not error when data-duration is declared on the root", async () => {

@@ -8,7 +8,9 @@ import type { DomEditSelection, DomEditTextField } from "../components/editor/do
 import type { ImportedFontAsset } from "../components/editor/fontAssets";
 import { usePlayerStore } from "../player";
 import { StudioSaveHttpError } from "../utils/studioSaveDiagnostics";
+import { createDomEditSaveQueue } from "../utils/domEditSaveQueue";
 import { trackStudioEvent } from "../utils/studioTelemetry";
+import type { CutoverResult } from "../utils/sdkCutover";
 import { useDomEditCommits } from "./useDomEditCommits";
 
 Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
@@ -22,6 +24,8 @@ interface PatchResponseBody {
   changed?: boolean;
   matched?: boolean;
   content?: string;
+  path?: string;
+  version?: string;
 }
 
 interface RenderedDomEditCommits {
@@ -35,6 +39,9 @@ interface RenderedDomEditCommits {
 interface RenderDomEditCommitsOptions {
   importedFontAssets?: ImportedFontAsset[];
   writeProjectFile?: (path: string, content: string, expectedContent?: string) => Promise<void>;
+  onTrySdkPersist?: () => Promise<CutoverResult>;
+  queueDomEditSave?: <T>(save: () => Promise<T>) => Promise<T>;
+  projectIdRef?: MutableRefObject<string | null>;
 }
 
 type FetchHandler = (
@@ -113,14 +120,6 @@ function stubPatchFetch(
       throw new Error(`Unexpected fetch: ${url}`);
     },
   );
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
-}
-
-function stubUnexpectedPersistFetch() {
-  const fetchMock = vi.fn(async (): Promise<Response> => {
-    throw new Error("persist should not run");
-  });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
@@ -209,8 +208,7 @@ function renderDomEditCommits(
   const showToast = makeShowToast();
   const recordEdit = vi.fn(async () => {});
   const previewIframeRef: MutableRefObject<HTMLIFrameElement | null> = { current: iframe };
-  const projectIdRef: MutableRefObject<string | null> = { current: "p1" };
-  const domEditSaveTimestampRef: MutableRefObject<number> = { current: 0 };
+  const projectIdRef: MutableRefObject<string | null> = options.projectIdRef ?? { current: "p1" };
   const reloadPreview = vi.fn();
 
   function Probe() {
@@ -218,9 +216,8 @@ function renderDomEditCommits(
       activeCompPath: "index.html",
       previewIframeRef,
       showToast,
-      queueDomEditSave: async (save) => save(),
+      queueDomEditSave: options.queueDomEditSave ?? (async (save) => save()),
       writeProjectFile: options.writeProjectFile ?? (async () => {}),
-      domEditSaveTimestampRef,
       editHistory: { recordEdit },
       fileTree: [],
       importedFontAssetsRef: { current: options.importedFontAssets ?? [] },
@@ -232,6 +229,8 @@ function renderDomEditCommits(
       clearDomSelection: vi.fn(),
       refreshDomEditSelectionFromPreview: vi.fn(),
       buildDomSelectionFromTarget: vi.fn(async () => null),
+      onTrySdkPersist: options.onTrySdkPersist,
+      readOnlyPreview: false,
     });
     return null;
   }
@@ -780,11 +779,13 @@ async function commitStyleAgainst(response: Parameters<typeof stubPatchFetch>[0]
   const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
   const { iframe, element } = createPreviewElement();
   const rendered = renderDomEditCommits(createSelection(element), iframe);
+  let outcome: Awaited<ReturnType<typeof rendered.hook.handleDomStyleCommit>> | undefined;
   await act(async () => {
-    await rendered.hook.handleDomStyleCommit("color", "blue");
+    outcome = await rendered.hook.handleDomStyleCommit("color", "blue");
   });
   return {
     element,
+    outcome,
     rendered,
     warnSpy,
     cleanup: () => {
@@ -812,14 +813,26 @@ function renderStyleCommitWithFetch(fetchHandler: FetchHandler) {
   };
 }
 
-async function expectRejectedTextStructureEdit(
+/**
+ * Adding or removing a text layer, which no per-child operation can express.
+ *
+ * Both used to be refused outright — the panel offered the buttons and neither
+ * could ever save — so this asserts the opposite of what it used to: one
+ * `rich-text` operation carrying the element's new markup, and no complaint.
+ */
+async function expectPersistedTextStructureEdit(
   commit: (hook: ReturnType<typeof useDomEditCommits>) => Promise<unknown>,
+  expectedMarkup: (markup: string) => void,
 ): Promise<void> {
-  const fetchMock = stubUnexpectedPersistFetch();
+  const fetchMock = stubPatchFetch({
+    ok: true,
+    changed: true,
+    matched: true,
+    content: '<div data-hf-id="hf-card"><span>First</span></div>',
+  });
   const { iframe, element } = createPreviewElement(
     '<div data-hf-id="hf-card"><span>First</span><span>Second</span></div>',
   );
-  const originalInnerHtml = element.innerHTML;
   const selection = createSelection(element, {
     textFields: [
       textField({ key: "first", value: "First", source: "child" }),
@@ -833,17 +846,81 @@ async function expectRejectedTextStructureEdit(
       await commit(rendered.hook);
     });
 
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(rendered.showToast).toHaveBeenCalledWith(
-      expect.stringContaining("text structure change"),
-      "error",
+    const patchPost = fetchMock.mock.calls.find((call) =>
+      requestUrl(call[0]).includes("/file-mutations/patch-element/"),
     );
-    expect(element.innerHTML).toBe(originalInnerHtml);
-    expect(rendered.recordEdit).not.toHaveBeenCalled();
+    expect(patchPost).toBeDefined();
+    const body = JSON.parse(String(patchPost?.[1]?.body)) as {
+      operations: Array<{ type: string; value?: string }>;
+    };
+    expect(body.operations).toHaveLength(1);
+    expect(body.operations[0]?.type).toBe("rich-text");
+    expectedMarkup(body.operations[0]?.value ?? "");
+    expect(rendered.showToast).not.toHaveBeenCalled();
   } finally {
     rendered.cleanup();
   }
 }
+
+describe("useDomEditCommits rich-text persist handling", () => {
+  beforeEach(() => {
+    ensureCssEscape();
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
+
+  it("restores the session snapshot when rich-text persistence fails", async () => {
+    stubPatchFetch({ ok: true, changed: false, matched: false });
+    const previousHtml = '<span style="color: red">Before</span>';
+    const html = '<span style="color: blue">After</span>';
+    const { iframe, element } = createPreviewElement(`<div data-hf-id="hf-card">${html}</div>`);
+    const rendered = renderDomEditCommits(createSelection(element), iframe);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await act(async () => {
+        await rendered.hook.handleDomRichTextCommit({ element, html, previousHtml });
+      });
+
+      expect(element.innerHTML).toBe(previousHtml);
+      expect(rendered.showToast).toHaveBeenCalledWith(
+        expect.stringMatching(/Couldn't save "Hero title"/),
+        "error",
+      );
+    } finally {
+      warnSpy.mockRestore();
+      rendered.cleanup();
+    }
+  });
+
+  it("does not retarget a commit onto a replacement preview node", async () => {
+    const fetchMock = stubPatchFetch({ ok: true, changed: true, matched: true });
+    const html = '<span style="color: blue">After</span>';
+    const { iframe, element } = createPreviewElement(`<div data-hf-id="hf-card">${html}</div>`);
+    const rendered = renderDomEditCommits(createSelection(element), iframe);
+    const replacement = document.createElement("div");
+    replacement.dataset.hfId = "hf-card";
+    replacement.innerHTML = "Reloaded elsewhere";
+    element.replaceWith(replacement);
+
+    try {
+      await act(async () => {
+        await rendered.hook.handleDomRichTextCommit({
+          element,
+          html,
+          previousHtml: "Before",
+        });
+      });
+
+      expect(replacement.innerHTML).toBe("Reloaded elsewhere");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(rendered.showToast).not.toHaveBeenCalled();
+    } finally {
+      rendered.cleanup();
+    }
+  });
+});
 
 describe("useDomEditCommits style persist handling", () => {
   beforeEach(() => {
@@ -876,10 +953,12 @@ describe("useDomEditCommits style persist handling", () => {
   });
 
   it("warns without a toast when the server matched the element but reported no change", async () => {
-    const { rendered, warnSpy, cleanup } = await commitStyleAgainst({
+    const { rendered, outcome, warnSpy, cleanup } = await commitStyleAgainst({
       ok: true,
       changed: false,
       matched: true,
+      path: "index.html",
+      version: '"sha256:current"',
     });
 
     try {
@@ -888,8 +967,52 @@ describe("useDomEditCommits style persist handling", () => {
         "[Studio] DOM edit persist no-op",
         expect.objectContaining({ operations: "inline-style:color" }),
       );
+      expect(outcome).toEqual({
+        ok: true,
+        persistence: {
+          sourceFile: "index.html",
+          version: '"sha256:current"',
+          changed: false,
+        },
+      });
     } finally {
       cleanup();
+    }
+  });
+
+  it("rebinds the paused preview after a saved optimistic style commit", async () => {
+    stubPatchFetch({
+      ok: true,
+      changed: true,
+      matched: true,
+      path: "index.html",
+      version: '"sha256:changed"',
+    });
+    const { iframe, element } = createPreviewElement();
+    const seek = vi.fn();
+    const forceTimelineRebind = vi.fn();
+    Object.defineProperty(iframe.contentWindow, "__player", {
+      configurable: true,
+      value: { seek },
+    });
+    Object.defineProperty(iframe.contentWindow, "__hfForceTimelineRebind", {
+      configurable: true,
+      value: forceTimelineRebind,
+    });
+    usePlayerStore.setState({ currentTime: 2.4 });
+    const rendered = renderDomEditCommits(createSelection(element), iframe);
+
+    try {
+      await act(async () => {
+        await rendered.hook.handleDomStyleCommit("color", "blue");
+      });
+
+      expect(seek).toHaveBeenCalledWith(2.4);
+      expect(forceTimelineRebind).toHaveBeenCalledTimes(1);
+      expect(rendered.reloadPreview).not.toHaveBeenCalled();
+    } finally {
+      rendered.cleanup();
+      usePlayerStore.getState().reset();
     }
   });
 
@@ -908,19 +1031,200 @@ describe("useDomEditCommits style persist handling", () => {
   });
 
   it("keeps the optimistic style and records history when the patch succeeds", async () => {
-    const { element, rendered, cleanup } = await commitStyleAgainst({
+    const { element, rendered, outcome, cleanup } = await commitStyleAgainst({
       ok: true,
       changed: true,
       matched: true,
       content: '<div data-hf-id="hf-card" style="color: blue">Card</div>',
+      path: "index.html",
+      version: '"sha256:after"',
     });
 
     try {
       expect(rendered.showToast).not.toHaveBeenCalled();
       expect(element.style.getPropertyValue("color")).toBe("blue");
       expect(rendered.recordEdit).toHaveBeenCalledTimes(1);
+      expect(outcome).toEqual({
+        ok: true,
+        persistence: {
+          sourceFile: "index.html",
+          version: '"sha256:after"',
+          changed: true,
+        },
+      });
     } finally {
       cleanup();
+    }
+  });
+
+  it("serializes the full read, write, and history transaction across overlapping commits", async () => {
+    const firstPatch = createDeferred<Response>();
+    let readCount = 0;
+    let patchCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+        const url = requestUrl(input);
+        if (url.includes("/api/projects/p1/files/")) {
+          readCount += 1;
+          return jsonResponse({
+            content:
+              readCount === 1
+                ? '<div data-hf-id="hf-card" style="color: red">Card</div>'
+                : '<div data-hf-id="hf-card" style="color: blue">Card</div>',
+          });
+        }
+        if (url.includes("/api/projects/p1/file-mutations/patch-element/")) {
+          patchCount += 1;
+          if (patchCount === 1) return firstPatch.promise;
+          return jsonResponse({
+            ok: true,
+            changed: true,
+            matched: true,
+            content: '<div data-hf-id="hf-card" style="color: green">Card</div>',
+            path: "index.html",
+            version: '"sha256:green"',
+          });
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }),
+    );
+    const queue = createDomEditSaveQueue();
+    const { iframe, element } = createPreviewElement();
+    const rendered = renderDomEditCommits(createSelection(element), iframe, {
+      queueDomEditSave: queue.enqueue,
+    });
+
+    try {
+      const first = rendered.hook.handleDomStyleCommit("color", "blue");
+      await flushAsyncWork();
+      const second = rendered.hook.handleDomStyleCommit("color", "green");
+      await flushAsyncWork();
+
+      expect(readCount).toBe(1);
+      expect(patchCount).toBe(1);
+
+      firstPatch.resolve(
+        jsonResponse({
+          ok: true,
+          changed: true,
+          matched: true,
+          content: '<div data-hf-id="hf-card" style="color: blue">Card</div>',
+          path: "index.html",
+          version: '"sha256:blue"',
+        }),
+      );
+      await first;
+      await second;
+
+      expect(readCount).toBe(2);
+      expect(patchCount).toBe(2);
+      expect(rendered.recordEdit).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          files: {
+            "index.html": expect.objectContaining({
+              before: expect.stringContaining("color: red"),
+              after: expect.stringContaining("color: blue"),
+            }),
+          },
+        }),
+      );
+      expect(rendered.recordEdit).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          files: {
+            "index.html": expect.objectContaining({
+              before: expect.stringContaining("color: blue"),
+              after: expect.stringContaining("color: green"),
+            }),
+          },
+        }),
+      );
+    } finally {
+      queue.destroy();
+      rendered.cleanup();
+    }
+  });
+
+  it("refuses queued persistence after the active project changes", async () => {
+    const firstPatch = createDeferred<Response>();
+    const projectIdRef: MutableRefObject<string | null> = { current: "p1" };
+    const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      const url = requestUrl(input);
+      if (url.includes("/api/projects/p1/files/")) {
+        return jsonResponse({
+          content: '<div data-hf-id="hf-card" style="color: red">Card</div>',
+        });
+      }
+      if (url.includes("/api/projects/p1/file-mutations/patch-element/")) {
+        return firstPatch.promise;
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const queue = createDomEditSaveQueue();
+    const { iframe, element } = createPreviewElement();
+    const rendered = renderDomEditCommits(createSelection(element), iframe, {
+      queueDomEditSave: queue.enqueue,
+      projectIdRef,
+    });
+
+    try {
+      const first = rendered.hook.handleDomStyleCommit("color", "blue");
+      await flushAsyncWork();
+      const second = rendered.hook.handleDomStyleCommit("color", "green");
+      projectIdRef.current = "p2";
+      firstPatch.resolve(
+        jsonResponse({
+          ok: true,
+          changed: true,
+          matched: true,
+          content: '<div data-hf-id="hf-card" style="color: blue">Card</div>',
+          path: "index.html",
+          version: '"sha256:blue"',
+        }),
+      );
+
+      await first;
+      await expect(second).resolves.toMatchObject({
+        ok: false,
+        reason: "persist-failed",
+      });
+      expect(fetchMock.mock.calls.some(([input]) => requestUrl(input).includes("/p2/"))).toBe(
+        false,
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      queue.destroy();
+      rendered.cleanup();
+    }
+  });
+
+  it("preserves the SDK cutover version as the style commit's durable evidence", async () => {
+    const fetchMock = stubPatchFetch({ ok: true, changed: true, matched: true });
+    const { iframe, element } = createPreviewElement();
+    const rendered = renderDomEditCommits(createSelection(element), iframe, {
+      onTrySdkPersist: async () => ({ status: "committed", version: "sdk-version-2" }),
+    });
+
+    try {
+      let outcome: Awaited<ReturnType<typeof rendered.hook.handleDomStyleCommit>> | undefined;
+      await act(async () => {
+        outcome = await rendered.hook.handleDomStyleCommit("color", "blue");
+      });
+
+      expect(outcome).toEqual({
+        ok: true,
+        persistence: { sourceFile: "index.html", version: "sdk-version-2", changed: true },
+      });
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          requestUrl(input).includes("/file-mutations/patch-element/"),
+        ),
+      ).toBe(false);
+    } finally {
+      rendered.cleanup();
     }
   });
 
@@ -1146,12 +1450,26 @@ describe("useDomEditCommits style persist handling", () => {
     }
   });
 
-  it("refuses added child text fields without persisting serialized markup", async () => {
-    await expectRejectedTextStructureEdit((hook) => hook.handleDomAddTextField("first"));
+  it("persists an added child text field as the element's new markup", async () => {
+    await expectPersistedTextStructureEdit(
+      (hook) => hook.handleDomAddTextField("first"),
+      (markup) => {
+        expect(markup).toContain("First");
+        expect(markup).toContain("Second");
+        // The layer that was added, between the two that were there.
+        expect(markup.match(/<span/g) ?? []).toHaveLength(3);
+      },
+    );
   });
 
-  it("refuses removed child text fields without persisting serialized markup", async () => {
-    await expectRejectedTextStructureEdit((hook) => hook.handleDomRemoveTextField("first"));
+  it("persists a removed child text field as the element's new markup", async () => {
+    await expectPersistedTextStructureEdit(
+      (hook) => hook.handleDomRemoveTextField("first"),
+      (markup) => {
+        expect(markup).not.toContain("First");
+        expect(markup).toContain("Second");
+      },
+    );
   });
 
   it("keeps single self text commits on the text-content path", async () => {
@@ -1256,6 +1574,68 @@ describe("useDomEditCommits attribute persist handling", () => {
     }
   });
 
+  it("applies a preview-only write without persisting it", async () => {
+    // What a drag needs from every pointermove: the preview and the audio graph
+    // follow, the file does not. Persisting each move filled the undo stack with
+    // fragments of one gesture — and because those writes race, a follow-up's
+    // "before" often was not the previous entry's "after", so history refused to
+    // coalesce them and undo took back a few milliseconds of the drag.
+    const fetchSpy = stubPatchFetch({ ok: true, changed: true, matched: true });
+    const { iframe, element } = createPreviewElement();
+    const rendered = renderDomEditCommits(createSelection(element), iframe);
+
+    try {
+      await act(async () => {
+        await rendered.hook.handleDomAttributeLiveCommit("volume", "0.7", undefined, {
+          previewOnly: true,
+        });
+      });
+      expect(element.getAttribute("data-volume")).toBe("0.7");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      rendered.cleanup();
+    }
+  });
+
+  it("still persists a live write that does not ask to be preview-only", async () => {
+    const fetchSpy = stubPatchFetch({ ok: true, changed: true, matched: true });
+    const { iframe, element } = createPreviewElement();
+    const rendered = renderDomEditCommits(createSelection(element), iframe);
+
+    try {
+      await act(async () => {
+        await rendered.hook.handleDomAttributeLiveCommit("volume", "0.7");
+      });
+      expect(fetchSpy).toHaveBeenCalled();
+    } finally {
+      rendered.cleanup();
+    }
+  });
+
+  it("sets and removes data-audio-group like any other data attribute", async () => {
+    stubPatchFetch({ ok: true, changed: true, matched: true });
+    const { iframe, element } = createPreviewElement();
+    const rendered = renderDomEditCommits(createSelection(element), iframe);
+
+    try {
+      await act(async () => {
+        await rendered.hook.handleDomAttributeLiveCommit("audio-group", "voiceover", undefined, {
+          previewOnly: true,
+        });
+      });
+      expect(element.getAttribute("data-audio-group")).toBe("voiceover");
+
+      await act(async () => {
+        await rendered.hook.handleDomAttributeLiveCommit("audio-group", "", undefined, {
+          previewOnly: true,
+        });
+      });
+      expect(element.getAttribute("data-audio-group")).toBeNull();
+    } finally {
+      rendered.cleanup();
+    }
+  });
+
   it("keeps a data-attribute commit on success", async () => {
     stubPatchFetch({
       ok: true,
@@ -1322,9 +1702,7 @@ describe("useDomEditCommits attribute persist handling", () => {
       // optimistic apply) and succeeds before the older one rejects. Without the
       // per-key version guard, the stale rejection would revert to the older
       // commit's own previousValue (null) and stomp the newer commit's value.
-      const firstCommit = act(async () => {
-        await rendered.hook.handleDomHtmlAttributeCommit("muted", "first-value");
-      });
+      const firstCommit = rendered.hook.handleDomHtmlAttributeCommit("muted", "first-value");
       await act(async () => {
         await rendered.hook.handleDomHtmlAttributeCommit("muted", "second-value");
       });

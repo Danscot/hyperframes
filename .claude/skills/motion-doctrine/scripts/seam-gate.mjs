@@ -71,7 +71,30 @@ async function ensureServer() {
     const port = 5380 + Math.floor(Math.random() * 20);
     const env = { ...process.env };
     delete env.HYPERFRAME_RUNTIME_URL; // wrong value fails silently as 200 HTML
-    const cmd = flag("server-cmd", `npx --yes hyperframes preview --no-open --port ${port}`);
+    // `preview` backgrounds itself when stdin/stdout aren't TTYs, which they never are here: the
+    // launcher would exit 0 before the server is up and detach it out of our process group.
+    // Default to the REPO-LOCAL CLI whenever this skill is running from its repo
+    // checkout. The gate this script backs is defined against that build, and the
+    // skill forbids `npx hyperframes@latest` for it, so defaulting to the published
+    // package here would let the two gates measure different runtimes. npx stays the
+    // fallback for a copy of the skill living outside the repo.
+    const repoCli = join(
+      import.meta.dirname,
+      "..",
+      "..",
+      "..",
+      "..",
+      "packages",
+      "cli",
+      "bin",
+      "hyperframes.mjs",
+    );
+    const cmd = flag(
+      "server-cmd",
+      existsSync(repoCli)
+        ? `node "${repoCli}" preview --foreground --no-open --port ${port}`
+        : `npx --yes hyperframes preview --foreground --no-open --port ${port}`,
+    );
     const child = spawn("sh", ["-c", cmd.replace(/\{port\}/g, String(port))], {
       cwd: project,
       env,

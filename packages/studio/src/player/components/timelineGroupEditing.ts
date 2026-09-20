@@ -192,12 +192,12 @@ function canTrimEdge(element: TimelineElement, edge: TimelineGroupResizeEdge): b
     kind: element.kind,
     duration: element.duration,
     domId: element.domId,
+    hfId: element.hfId,
     selector: element.selector,
     compositionSrc: element.compositionSrc,
     playbackStart: element.playbackStart,
     playbackStartAttr: element.playbackStartAttr,
     sourceDuration: element.sourceDuration,
-    timingSource: element.timingSource,
     timelineLocked: element.timelineLocked,
   });
   return edge === "start" ? caps.canTrimStart : caps.canTrimEnd;

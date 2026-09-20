@@ -40,10 +40,14 @@ export interface MessageHandlerCallbacks extends PlaybackStateCallbacks {
    *  uses it to replay current bridge state (mute, volume, playback rate) so
    *  control messages sent before the iframe's listener registered aren't lost. */
   onRuntimeReady: () => void;
+  /** Invoked when the runtime reports its composition assets settled. */
+  onRuntimeAssetsReady?: (timedOut: boolean) => void;
+  onRuntimeDataApplied?: (channel: unknown, requestId: unknown) => void;
+  onRuntimeDataError?: (channel: unknown, requestId: unknown, message: unknown) => void;
   /** Invoked when the runtime posts a finite positive timeline duration. The
    *  player uses this as the cross-origin readiness signal because the
    *  same-origin composition probe cannot inspect CDN iframes. */
-  onRuntimeTimelineReady: (duration: number) => void;
+  onRuntimeTimelineReady: (duration: number, assetsReady: boolean | undefined) => void;
   setRuntimeFps?: (fps: number) => void;
   /** Called with the scene list whenever a "timeline" message is received. */
   setScenes: (scenes: SceneRecord[]) => void;
@@ -92,6 +96,21 @@ export function handleRuntimeMessage(
     return;
   }
 
+  if (data["type"] === "assets-ready") {
+    callbacks.onRuntimeAssetsReady?.(data["timedOut"] === true);
+    return;
+  }
+
+  if (data["type"] === "runtime-data-error") {
+    callbacks.onRuntimeDataError?.(data["channel"], data["requestId"], data["message"]);
+    return;
+  }
+
+  if (data["type"] === "runtime-data-applied") {
+    callbacks.onRuntimeDataApplied?.(data["channel"], data["requestId"]);
+    return;
+  }
+
   if (data["type"] === "state") {
     callbacks.setPlaybackState(
       applyRuntimeStateMessage(
@@ -130,7 +149,10 @@ export function handleRuntimeMessage(
       const pb = callbacks.getPlaybackState();
       callbacks.setPlaybackState({ ...pb, duration });
       callbacks.updateControlsTime(pb.currentTime, duration);
-      callbacks.onRuntimeTimelineReady(duration);
+      callbacks.onRuntimeTimelineReady(
+        duration,
+        typeof data["assetsReady"] === "boolean" ? data["assetsReady"] : undefined,
+      );
     }
     if (
       Number.isFinite(data["compositionWidth"]) &&

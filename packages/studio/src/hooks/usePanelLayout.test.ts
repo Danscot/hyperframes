@@ -2,117 +2,151 @@
 
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { usePanelLayout } from "./usePanelLayout";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useDockLayoutStore, type DockController } from "../components/dock/dockLayoutStore";
+import { PANEL_IDS, type PanelId } from "../components/dock/panelRegistry";
+import { trackStudioEvent } from "../utils/studioTelemetry";
+import { usePanelLayout, type InitialPanelLayoutState } from "./usePanelLayout";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-afterEach(() => {
-  document.body.innerHTML = "";
-  vi.doUnmock("../components/editor/manualEditingAvailability");
-  vi.resetModules();
-});
+vi.mock("../utils/studioTelemetry", () => ({ trackStudioEvent: vi.fn() }));
 
-function renderPanelLayoutWith(hook: typeof usePanelLayout) {
+function fakeController(): DockController {
+  return {
+    open: vi.fn(),
+    activate: vi.fn(),
+    close: vi.fn(),
+    setTitle: vi.fn(),
+    setGroupVisible: vi.fn(),
+    reset: vi.fn(),
+  };
+}
+
+function showDock(visible: PanelId[], controller = fakeController()) {
+  useDockLayoutStore.setState({
+    controller,
+    openPanels: new Set(PANEL_IDS),
+    visiblePanels: new Set(visible),
+    lastActive: {},
+    activePanel: null,
+  });
+  return controller;
+}
+
+function renderLayout(initial?: InitialPanelLayoutState) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
   let current: ReturnType<typeof usePanelLayout> | null = null;
-
   function Harness() {
-    current = hook();
+    current = usePanelLayout(initial);
     return null;
   }
-
-  act(() => {
-    root.render(React.createElement(Harness));
-  });
-
+  act(() => root.render(React.createElement(Harness)));
   return {
-    getState: (): ReturnType<typeof usePanelLayout> => {
-      if (!current) throw new Error("usePanelLayout did not render");
+    get layout() {
+      if (!current) throw new Error("layout not rendered");
       return current;
     },
     unmount: () => act(() => root.unmount()),
   };
 }
 
-function renderPanelLayout() {
-  return renderPanelLayoutWith(usePanelLayout);
-}
+beforeEach(() => vi.mocked(trackStudioEvent).mockClear());
+afterEach(() => {
+  document.body.innerHTML = "";
+  useDockLayoutStore.setState({ controller: null });
+});
 
-describe("usePanelLayout — right inspector panes", () => {
-  it("toggleRightInspectorPane independently flips one pane, allowing both open at once", () => {
-    const harness = renderPanelLayout();
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: false, design: true });
-
-    act(() => harness.getState().toggleRightInspectorPane("layers"));
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: true, design: true });
-
-    harness.unmount();
+describe("usePanelLayout over the dock", () => {
+  it("reads the tab of the right-zone panel that is showing", () => {
+    showDock(["preview", "timeline", "compositions", "renders"]);
+    const view = renderLayout();
+    expect(view.layout.rightPanelTab).toBe("renders");
+    expect(view.layout.rightCollapsed).toBe(false);
   });
 
-  it("toggleRightInspectorPane refuses to turn off the last remaining pane", () => {
-    const harness = renderPanelLayout();
-    act(() => harness.getState().toggleRightInspectorPane("design"));
-    // Only "design" was on; toggling it off would leave both false — guarded.
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: false, design: true });
-    harness.unmount();
+  it("is collapsed when no right-zone panel is showing", () => {
+    showDock(["preview", "timeline", "compositions"]);
+    const view = renderLayout();
+    expect(view.layout.rightCollapsed).toBe(true);
+    expect(view.layout.rightPanelTab).toBe("design");
   });
 
-  it("setExclusiveRightInspectorPane is radio-style — selecting one turns the other off", () => {
-    const harness = renderPanelLayout();
-    act(() => harness.getState().toggleRightInspectorPane("layers"));
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: true, design: true });
-
-    act(() => harness.getState().setExclusiveRightInspectorPane("layers"));
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: true, design: false });
-
-    act(() => harness.getState().setExclusiveRightInspectorPane("design"));
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: false, design: true });
-
-    harness.unmount();
-  });
-
-  it("setRightPanelTab additively opens a pane when the flat inspector is off (legacy behavior)", async () => {
-    vi.resetModules();
-    vi.doMock("../components/editor/manualEditingAvailability", async () => {
-      const actual = await vi.importActual<
-        typeof import("../components/editor/manualEditingAvailability")
-      >("../components/editor/manualEditingAvailability");
-      return { ...actual, STUDIO_FLAT_INSPECTOR_ENABLED: false };
+  it("opens the Design panel for the legacy block-params tab and reports the tab switch", () => {
+    const controller = showDock(["preview"]);
+    const view = renderLayout();
+    act(() => view.layout.setRightPanelTab("block-params"));
+    expect(controller.setGroupVisible).toHaveBeenCalledWith("design", true);
+    expect(controller.activate).toHaveBeenCalledWith("design");
+    expect(trackStudioEvent).toHaveBeenCalledWith("tab_switch", {
+      panel: "right_panel",
+      tab: "block-params",
     });
-    const { usePanelLayout: usePanelLayoutFlatOff } = await import("./usePanelLayout");
-    const harness = renderPanelLayoutWith(usePanelLayoutFlatOff);
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: false, design: true });
-
-    act(() => harness.getState().setRightPanelTab("layers"));
-    // Legacy (split-view) behavior: additive, both panes end up open.
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: true, design: true });
-
-    harness.unmount();
   });
 
-  it("setRightPanelTab is flat-aware: exclusivity holds for callers other than a direct in-panel tab click", async () => {
-    vi.resetModules();
-    vi.doMock("../components/editor/manualEditingAvailability", async () => {
-      const actual = await vi.importActual<
-        typeof import("../components/editor/manualEditingAvailability")
-      >("../components/editor/manualEditingAvailability");
-      return { ...actual, STUDIO_FLAT_INSPECTOR_ENABLED: true };
+  it("reports a tab switch only when the tab actually changes", () => {
+    showDock(["preview", "design"]);
+    const view = renderLayout();
+    vi.mocked(trackStudioEvent).mockClear();
+    act(() => view.layout.setRightPanelTab("design"));
+    expect(trackStudioEvent).not.toHaveBeenCalled();
+    act(() => view.layout.setRightPanelTab("layers"));
+    expect(trackStudioEvent).toHaveBeenCalledWith("tab_switch", {
+      panel: "right_panel",
+      tab: "layers",
     });
-    const { usePanelLayout: usePanelLayoutFlatOn } = await import("./usePanelLayout");
-    const harness = renderPanelLayoutWith(usePanelLayoutFlatOn);
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: false, design: true });
+  });
 
-    // Element-select / block-params-close / header Inspector-button callers
-    // all reach setRightPanelTab directly, not through the in-panel tab
-    // click's own setExclusiveRightInspectorPane call — this must still
-    // enforce exclusivity under the flat flag, or both tabs end up
-    // highlighted while only one pane actually renders.
-    act(() => harness.getState().setRightPanelTab("layers"));
-    expect(harness.getState().rightInspectorPanes).toEqual({ layers: true, design: false });
+  it("collapses every open right-zone panel group and leaves the other zones alone", () => {
+    const controller = showDock(["preview", "design"]);
+    const view = renderLayout();
+    act(() => view.layout.setRightCollapsed(true));
+    const hidden = vi.mocked(controller.setGroupVisible).mock.calls;
+    expect(hidden.map(([id]) => id).sort()).toEqual(
+      ["design", "layers", "renders", "slideshow", "variables"].sort(),
+    );
+    expect(hidden.every(([, visible]) => visible === false)).toBe(true);
+  });
 
-    harness.unmount();
+  it("expanding an already-showing right column does nothing to the tab", () => {
+    const controller = showDock(["design"]);
+    const view = renderLayout();
+    act(() => view.layout.setRightCollapsed(false));
+    expect(controller.activate).not.toHaveBeenCalled();
+  });
+
+  it("expanding a fully hidden right column brings Design back", () => {
+    const controller = showDock(["preview"]);
+    const view = renderLayout();
+    act(() => view.layout.setRightCollapsed(false));
+    expect(controller.activate).toHaveBeenCalledWith("design");
+  });
+
+  it("applies the URL's tab and collapse state once, when the dock attaches", () => {
+    useDockLayoutStore.setState({ controller: null, openPanels: new Set(PANEL_IDS) });
+    const view = renderLayout({ rightPanelTab: "variables", rightCollapsed: true });
+    const controller = fakeController();
+    act(() => useDockLayoutStore.getState().attach(controller));
+    expect(controller.activate).toHaveBeenCalledWith("variables");
+    expect(controller.setGroupVisible).toHaveBeenCalledWith("design", false);
+    const later = fakeController();
+    act(() => useDockLayoutStore.getState().attach(later));
+    expect(later.activate).not.toHaveBeenCalled();
+    expect(later.setGroupVisible).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it("keeps a URL's slideshow tab until the panel opens, then activates it once", () => {
+    const opened = new Set<PanelId>(PANEL_IDS.filter((id) => id !== "slideshow"));
+    useDockLayoutStore.setState({ controller: null, openPanels: opened });
+    const view = renderLayout({ rightPanelTab: "slideshow" });
+    const controller = fakeController();
+    act(() => useDockLayoutStore.getState().attach(controller));
+    expect(controller.activate).not.toHaveBeenCalled();
+    act(() => useDockLayoutStore.setState({ openPanels: new Set(PANEL_IDS) }));
+    expect(controller.activate).toHaveBeenCalledWith("slideshow");
+    view.unmount();
   });
 });

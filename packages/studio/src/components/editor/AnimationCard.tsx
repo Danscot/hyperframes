@@ -1,6 +1,7 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import { SUPPORTED_EASES, SUPPORTED_PROPS } from "@hyperframes/core/gsap-constants";
+import { trackStudioSegmentEaseEdit } from "../../telemetry/events";
 import { RESPONSIVE_GRID } from "./propertyPanelHelpers";
 import { MetricField, SelectField } from "./propertyPanelPrimitives";
 import { controlPointsForGsapEase } from "./studioMotion";
@@ -17,11 +18,17 @@ import {
   parseNumericOrString,
   BOOLEAN_PROPS,
 } from "./AnimationCardParts";
+import type { AnimationKeyframeTarget } from "../../hooks/gsapTweenSynth";
 
 interface AnimationCardProps extends GsapAnimationEditCallbacks {
   animation: GsapAnimation;
   defaultExpanded: boolean;
   flat?: boolean;
+  focusedSegment?: {
+    tweenPercentage: number;
+    collidingAnimationTargets?: AnimationKeyframeTarget[];
+  } | null;
+  onFocusSegmentConsumed?: () => void;
 }
 
 // fallow-ignore-next-line complexity
@@ -29,6 +36,8 @@ export const AnimationCard = memo(function AnimationCard({
   animation,
   defaultExpanded,
   flat,
+  focusedSegment,
+  onFocusSegmentConsumed,
   onUpdateProperty,
   onUpdateMeta,
   onDeleteAnimation,
@@ -42,6 +51,7 @@ export const AnimationCard = memo(function AnimationCard({
   onSetArcPath,
   onUpdateArcSegment,
   onUpdateKeyframeEase,
+  onUpdateSegmentEase,
   onSetAllKeyframeEases,
   onUnroll,
 }: AnimationCardProps) {
@@ -49,6 +59,29 @@ export const AnimationCard = memo(function AnimationCard({
   const [addingProp, setAddingProp] = useState(false);
   const [addingFromProp, setAddingFromProp] = useState(false);
   const [expandedKfPct, setExpandedKfPct] = useState<number | null>(null);
+  const [focusedCollidingAnimationTargets, setFocusedCollidingAnimationTargets] = useState<
+    AnimationKeyframeTarget[] | undefined
+  >();
+  const cardRef = useRef<HTMLDivElement>(null);
+  const pendingAutoScrollRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusedSegment) return;
+    setExpanded(true);
+    pendingAutoScrollRef.current = true;
+    setExpandedKfPct(focusedSegment.tweenPercentage);
+    setFocusedCollidingAnimationTargets(focusedSegment.collidingAnimationTargets);
+    onFocusSegmentConsumed?.();
+  }, [focusedSegment, onFocusSegmentConsumed]);
+
+  useEffect(() => {
+    if (!pendingAutoScrollRef.current || expandedKfPct === null) return;
+    const segment = cardRef.current?.querySelector<HTMLElement>(
+      `[data-ease-segment-pct="${expandedKfPct}"]`,
+    );
+    segment?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    pendingAutoScrollRef.current = false;
+  }, [expandedKfPct]);
 
   const usedProps = useMemo(
     () => new Set(Object.keys(animation.properties)),
@@ -139,7 +172,7 @@ export const AnimationCard = memo(function AnimationCard({
     return (
       <div className="border-b border-neutral-800 pb-2">
         <div className="flex items-center gap-2 py-1.5">
-          <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] font-medium text-neutral-400">
+          <span className="rounded-sm bg-neutral-800 px-1.5 py-0.5 text-[10px] font-medium text-neutral-400">
             Position
           </span>
           <span className="text-[11px] text-neutral-500">
@@ -153,6 +186,7 @@ export const AnimationCard = memo(function AnimationCard({
 
   return (
     <div
+      ref={cardRef}
       data-flat-effect-card={flat ? "true" : undefined}
       className={
         flat
@@ -163,10 +197,11 @@ export const AnimationCard = memo(function AnimationCard({
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center gap-2 py-1.5"
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-2 py-1.5 active:scale-[0.99]"
       >
         <span
-          className="rounded bg-panel-accent/10 px-1.5 py-0.5 text-[10px] font-semibold text-panel-accent"
+          className="rounded-sm bg-panel-accent/10 px-1.5 py-0.5 text-[10px] font-semibold text-panel-accent"
           title={METHOD_TOOLTIPS[animation.method]}
         >
           {methodLabel}
@@ -191,7 +226,7 @@ export const AnimationCard = memo(function AnimationCard({
           height="10"
           viewBox="0 0 10 10"
           fill="currentColor"
-          className={`flex-shrink-0 transition-transform ${flat ? "text-panel-text-5" : "text-neutral-500"} ${expanded ? "" : "-rotate-90"}`}
+          className={`shrink-0 transition-transform ${flat ? "text-panel-text-5" : "text-neutral-500"} ${expanded ? "" : "-rotate-90"}`}
         >
           <path d="M2 3l3 4 3-4z" />
         </svg>
@@ -227,7 +262,7 @@ export const AnimationCard = memo(function AnimationCard({
                   setCopied(true);
                   setTimeout(() => setCopied(false), 1500);
                 }}
-                className="flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
+                className="shrink-0 rounded-sm px-1.5 py-0.5 text-[9px] font-medium text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
                 title="Copy description to clipboard — paste into agent prompts"
               >
                 {copied ? "Copied" : "Copy"}
@@ -263,8 +298,23 @@ export const AnimationCard = memo(function AnimationCard({
                     keyframes={animation.keyframes.keyframes}
                     globalEase={animation.keyframes.easeEach ?? animation.ease ?? "none"}
                     expandedPct={expandedKfPct}
-                    onToggle={setExpandedKfPct}
-                    onEaseCommit={(pct, ease) => onUpdateKeyframeEase(animation.id, pct, ease)}
+                    collidingAnimationTargets={focusedCollidingAnimationTargets}
+                    onToggle={(pct) => {
+                      setExpandedKfPct(pct);
+                      setFocusedCollidingAnimationTargets(undefined);
+                    }}
+                    onEaseCommit={(pct, ease) => {
+                      if (
+                        focusedCollidingAnimationTargets &&
+                        focusedCollidingAnimationTargets.length > 1 &&
+                        onUpdateSegmentEase
+                      ) {
+                        onUpdateSegmentEase(focusedCollidingAnimationTargets, ease);
+                      } else {
+                        onUpdateKeyframeEase(animation.id, pct, ease);
+                      }
+                      trackStudioSegmentEaseEdit({ action: "commit", ease });
+                    }}
                     onApplyAll={
                       onSetAllKeyframeEases
                         ? (ease) => onSetAllKeyframeEases(animation.id, ease)
@@ -292,7 +342,6 @@ export const AnimationCard = memo(function AnimationCard({
                     />
                     <EaseCurveSection
                       ease={easeName}
-                      duration={animation.duration}
                       onCustomEaseCommit={(customEase) => {
                         const easeKey = animation.keyframes ? "easeEach" : "ease";
                         onUpdateMeta(animation.id, { [easeKey]: customEase });

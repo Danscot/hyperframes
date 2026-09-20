@@ -121,7 +121,7 @@ function FlatTextFieldEditor({
               track("select", "Weight");
               onSetTextFieldStyle(field.key, "font-weight", e.target.value);
             }}
-            className={`appearance-none bg-transparent text-right font-mono text-[11px] outline-none ${
+            className={`appearance-none bg-transparent text-right font-mono text-[11px] outline-hidden ${
               VALUE_TIER_VALUE_CLASS[resolveValueTier(field.inlineStyles["font-weight"], "400")]
             }`}
           >
@@ -138,7 +138,7 @@ function FlatTextFieldEditor({
             height="10"
             viewBox="0 0 10 10"
             fill="currentColor"
-            className="flex-shrink-0 text-panel-text-5"
+            className="shrink-0 text-panel-text-5"
           >
             <path d="M2 3l3 4 3-4z" />
           </svg>
@@ -257,6 +257,12 @@ export function FlatTextSection({
   const [activeFieldKey, setActiveFieldKey] = useState<string | null>(
     element.textFields[0]?.key ?? null,
   );
+  // Armed by the add handler so the newly added field mounts focused. State, not
+  // a ref cleared during render: Strict Mode renders twice, so the first pass
+  // would eat the marker and the second would mount the field unfocused. Nothing
+  // clears it on read either — `autoFocus` is a mount-only DOM prop and the
+  // editor is keyed on the field, so it can only fire once per added field.
+  const [autoFocusFieldKey, setAutoFocusFieldKey] = useState<string | null>(null);
 
   useEffect(() => {
     const nextFields = element.textFields;
@@ -271,6 +277,8 @@ export function FlatTextSection({
   const activeField = textFields.find((field) => field.key === activeFieldKey) ?? textFields[0];
   if (!activeField) return null;
 
+  const autoFocusActiveField = autoFocusFieldKey === activeField.key;
+
   if (textFields.length > 1) {
     return (
       <div className="space-y-2.5">
@@ -278,10 +286,15 @@ export function FlatTextSection({
           fields={textFields}
           activeFieldKey={activeField.key}
           styles={styles}
-          onSelect={setActiveFieldKey}
+          onSelect={(fieldKey) => {
+            setAutoFocusFieldKey(null);
+            setActiveFieldKey(fieldKey);
+          }}
           onAdd={() =>
             void Promise.resolve(onAddTextField(activeField.key)).then((nextKey) => {
-              if (nextKey) setActiveFieldKey(nextKey);
+              if (!nextKey) return;
+              setAutoFocusFieldKey(nextKey);
+              setActiveFieldKey(nextKey);
             })
           }
           onRemove={onRemoveTextField}
@@ -295,7 +308,7 @@ export function FlatTextSection({
           onSetText={onSetText}
           onSetTextFieldStyle={onSetTextFieldStyle}
           onPreviewTextFieldStyle={onPreviewTextFieldStyle}
-          autoFocus
+          autoFocus={autoFocusActiveField}
         />
       </div>
     );
@@ -316,7 +329,11 @@ export function FlatTextSection({
         type="button"
         onClick={() => {
           track("button", "Add text field");
-          void onAddTextField(activeField.key);
+          void Promise.resolve(onAddTextField(activeField.key)).then((nextKey) => {
+            if (!nextKey) return;
+            setAutoFocusFieldKey(nextKey);
+            setActiveFieldKey(nextKey);
+          });
         }}
         className="mt-0.5 flex items-center gap-[5px] text-[10px] text-panel-text-4 hover:text-panel-text-2"
       >
@@ -370,13 +387,13 @@ export function FlatTextLayerList({
               }`}
             >
               <span
-                className="h-3 w-3 flex-shrink-0 rounded-sm"
+                className="h-3 w-3 shrink-0 rounded-xs"
                 style={{ backgroundColor: getTextFieldColor(field, styles) }}
               />
               <span className="min-w-0 flex-1 truncate text-[11px] text-panel-text-1">
                 {formatTextFieldPreview(field.value) || `Text ${index + 1}`}
               </span>
-              <span className="flex-shrink-0 font-mono text-[9px] text-panel-text-4">
+              <span className="shrink-0 font-mono text-[9px] text-panel-text-4">
                 {field.tagName}
               </span>
               {fields.length > 1 && (
@@ -389,7 +406,7 @@ export function FlatTextLayerList({
                     track("button", "Remove text field");
                     onRemove(field.key);
                   }}
-                  className="flex-shrink-0 text-panel-text-4 hover:text-panel-text-1"
+                  className="shrink-0 text-panel-text-4 hover:text-panel-text-1"
                 >
                   <X size={10} />
                 </button>

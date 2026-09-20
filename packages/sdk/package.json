@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/sdk",
-  "version": "0.7.64",
+  "version": "0.8.56",
   "description": "Headless, framework-neutral HyperFrames composition editing engine",
   "repository": {
     "type": "git",
@@ -34,6 +34,11 @@
       "import": "./src/adapters/headless.ts",
       "types": "./src/adapters/headless.ts"
     },
+    "./adapters/iframe": {
+      "bun": "./src/adapters/iframe.ts",
+      "import": "./src/adapters/iframe.ts",
+      "types": "./src/adapters/iframe.ts"
+    },
     "./editing": {
       "bun": "./src/editing/affordances.ts",
       "import": "./src/editing/affordances.ts",
@@ -59,6 +64,10 @@
         "import": "./dist/adapters/headless.js",
         "types": "./dist/adapters/headless.d.ts"
       },
+      "./adapters/iframe": {
+        "import": "./dist/adapters/iframe.js",
+        "types": "./dist/adapters/iframe.d.ts"
+      },
       "./editing": {
         "import": "./dist/editing/affordances.js",
         "types": "./dist/editing/affordances.d.ts"
@@ -83,6 +92,6 @@
     "@types/node": "^25.0.10",
     "happy-dom": "^20.9.0",
     "typescript": "^5.0.0",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

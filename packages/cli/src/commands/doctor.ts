@@ -9,9 +9,14 @@ import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
 import { parseToolVersion, runEnvironmentChecks } from "../browser/preflight.js";
 import { KOKORO_MODULES, KOKORO_PIP, MUSICGEN_MODULES, MUSICGEN_PIP } from "../audio/providers.js";
-import { hasPythonModules } from "../tts/python.js";
+import { hasPythonModules, describeRejectedPythonOverride } from "../tts/python.js";
 import { VERSION } from "../version.js";
 import { getUpdateMeta, withMeta } from "../utils/updateCheck.js";
+import {
+  OPTIONAL_PACKAGES,
+  installedOptionalPackageVersion,
+  type OptionalPackage,
+} from "../utils/optionalPackages.js";
 import {
   getSystemMeta,
   getShmSizeMb,
@@ -258,11 +263,16 @@ async function checkWhisper(): Promise<CheckResult> {
   };
 }
 
+function notInstalledDetail(base: string): string {
+  const overrideRejection = describeRejectedPythonOverride();
+  return overrideRejection ? `${base}. ${overrideRejection}` : base;
+}
+
 function checkLocalVoice(): CheckResult {
   if (hasPythonModules(KOKORO_MODULES)) return { ok: true, detail: "Kokoro deps installed" };
   return {
     ok: false,
-    detail: "Not installed (optional \u2014 local voice fallback)",
+    detail: notInstalledDetail("Not installed (optional \u2014 local voice fallback)"),
     hint: KOKORO_PIP,
   };
 }
@@ -271,8 +281,17 @@ function checkLocalMusic(): CheckResult {
   if (hasPythonModules(MUSICGEN_MODULES)) return { ok: true, detail: "MusicGen deps installed" };
   return {
     ok: false,
-    detail: "Not installed (optional \u2014 local music fallback)",
+    detail: notInstalledDetail("Not installed (optional \u2014 local music fallback)"),
     hint: MUSICGEN_PIP,
+  };
+}
+
+/** Not a failure when missing: the package installs itself the first time a feature needs it. */
+export function checkOptionalPackage(name: OptionalPackage, cacheDir?: string): CheckResult {
+  const version = installedOptionalPackageVersion(name, cacheDir);
+  return {
+    ok: true,
+    detail: version ? `${version} installed` : "Not installed (installs on first use)",
   };
 }
 
@@ -349,6 +368,9 @@ export default defineCommand({
     checks.push({ name: "whisper-cpp", run: checkWhisper });
     checks.push({ name: "TTS (Kokoro)", run: checkLocalVoice });
     checks.push({ name: "BGM (MusicGen)", run: checkLocalMusic });
+    for (const name of Object.keys(OPTIONAL_PACKAGES) as OptionalPackage[]) {
+      checks.push({ name, run: () => checkOptionalPackage(name) });
+    }
 
     const outcomes: CheckOutcome[] = [];
     for (const check of checks) {

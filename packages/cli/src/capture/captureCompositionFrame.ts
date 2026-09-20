@@ -1,7 +1,16 @@
 import { spawn } from "node:child_process";
 import type { Browser, Page } from "puppeteer-core";
 import { c } from "../ui/colors.js";
+import {
+  assertWebGpuAdapterAvailable,
+  compositionRequiresWebGpu,
+  resolveCaptureBrowserGpuMode,
+  resolveLocalBrowserGpuMode,
+  type BrowserGpuMode,
+} from "../browser/gpuPolicy.js";
+import { windowsChromeCrashRemediation } from "../browser/windowsCrash.js";
 import { resolveCompositionViewportFromHtml } from "../utils/compositionViewport.js";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import { resolveDiagnosticNavigationTimeoutMs } from "../utils/renderArgs.js";
 
 const SHADER_TRANSITIONS_TIMEOUT_MS = 90_000;
@@ -16,6 +25,14 @@ export const AUDIT_SEEK_OPTIONS = {
   animationFrameSettle: "double",
   waitForFontsMs: 500,
   settleMs: 120,
+} as const;
+
+// Geometry-only seek for the dense content_overlap grid: getBoundingClientRect is valid synchronously after setTime, so drop all post-seek waits (rAF/font/sleep) that would multiply across the dense grid.
+export const DENSE_GEOMETRY_SEEK_OPTIONS = {
+  ...AUDIT_SEEK_OPTIONS,
+  animationFrameSettle: "none",
+  waitForFontsMs: 0,
+  settleMs: 0,
 } as const;
 
 export interface SeekCompositionTimelineOptions {
@@ -53,11 +70,12 @@ export interface SettledCompositionPage {
 }
 
 export interface OpenSettledCompositionPageOptions {
+  // Separate from the post-navigation render-ready budget. Diagnostic callers
+  // without their own navigation knob keep the historical 10-second minimum.
+  navigationTimeoutMs?: number;
   renderReadyTimeoutMs: number;
   renderReadyWarningSuffix: string;
-  // Screenshot paths take the engine's software-GPU default; validate/check
-  // thread the PRODUCER_BROWSER_GPU_MODE opt-in through here.
-  browserGpuMode?: "software" | "hardware";
+  browserGpuMode?: BrowserGpuMode;
   // Runs after the page exists but before page.goto, so console/pageerror/
   // request listeners can attach without missing load-time events.
   beforeNavigate?: (page: Page) => void | Promise<void>;
@@ -71,8 +89,8 @@ export interface FfmpegRunResult {
 
 export function resolveCliChromeGpuMode(
   envMode = process.env.PRODUCER_BROWSER_GPU_MODE,
-): "software" | "hardware" {
-  return envMode === "software" ? "software" : "hardware";
+): BrowserGpuMode {
+  return resolveLocalBrowserGpuMode(undefined, envMode);
 }
 
 function compositionRuntimeReadyInBrowser(): boolean {
@@ -152,21 +170,53 @@ export async function openSettledCompositionPage(
   options: OpenSettledCompositionPageOptions,
 ): Promise<SettledCompositionPage> {
   const viewport = resolveCompositionViewportFromHtml(html);
-  const { ensureBrowser } = await import("../browser/manager.js");
+  const { ensureBrowser, findSystemBrowser } = await import("../browser/manager.js");
   const browser = await ensureBrowser();
   const puppeteer = await import("puppeteer-core");
   const { buildChromeArgs } = await import("@hyperframes/engine");
+  const requestedGpuMode = options.browserGpuMode ?? resolveCliChromeGpuMode();
+  const requiresWebGpu = compositionRequiresWebGpu(html);
+  const launch = async (executablePath: string): Promise<Browser> => {
+    const resolvedGpuMode = await resolveCaptureBrowserGpuMode(requestedGpuMode, executablePath);
+    return puppeteer.default.launch({
+      headless: true,
+      executablePath,
+      args: buildChromeArgs(
+        { ...viewport, captureMode: "screenshot", requiresWebGpu },
+        { browserGpuMode: resolvedGpuMode },
+      ),
+    });
+  };
 
   let chromeBrowser: Browser | undefined;
   try {
-    chromeBrowser = await puppeteer.default.launch({
-      headless: true,
-      executablePath: browser.executablePath,
-      args: buildChromeArgs(
-        { ...viewport, captureMode: "screenshot" },
-        { browserGpuMode: options.browserGpuMode },
-      ),
-    });
+    try {
+      chromeBrowser = await launch(browser.executablePath);
+    } catch (launchError) {
+      const message = normalizeErrorMessage(launchError);
+      const remediation = windowsChromeCrashRemediation(message);
+      if (!remediation) throw launchError;
+
+      const systemBrowser =
+        browser.source === "cache" || browser.source === "download"
+          ? findSystemBrowser()
+          : undefined;
+      if (!systemBrowser || systemBrowser.executablePath === browser.executablePath) {
+        throw new Error(`${message}\n\n${remediation}`, { cause: launchError });
+      }
+
+      console.warn(
+        `[hyperframes] Managed chrome-headless-shell crashed at launch; retrying once with system Chrome at ${systemBrowser.executablePath}.`,
+      );
+      try {
+        chromeBrowser = await launch(systemBrowser.executablePath);
+      } catch (fallbackError) {
+        throw new Error(
+          `System Chrome fallback also failed: ${normalizeErrorMessage(fallbackError)}\n\n${remediation}`,
+          { cause: fallbackError },
+        );
+      }
+    }
 
     const page = await chromeBrowser.newPage();
     await installPageFunctionGuard(page);
@@ -174,8 +224,9 @@ export async function openSettledCompositionPage(
     await options.beforeNavigate?.(page);
     await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: resolveDiagnosticNavigationTimeoutMs(),
+      timeout: resolveDiagnosticNavigationTimeoutMs(process.env, options.navigationTimeoutMs),
     });
+    await assertWebGpuAdapterAvailable(page, requiresWebGpu);
     const renderReadyTimedOut = !(await waitForCompositionSettle(page, options));
     return { browser: chromeBrowser, page, renderReadyTimedOut };
   } catch (err) {
@@ -244,6 +295,13 @@ export async function seekCompositionTimeline(
     timeSeconds,
     options.fallbackToBridgeAndTimelines === true,
   );
+
+  await page.evaluate(async () => {
+    const waitForCompletion = Reflect.get(window, "__hfWaitForSeekCompletion");
+    if (typeof waitForCompletion === "function") {
+      await Reflect.apply(waitForCompletion, window, []);
+    }
+  });
 
   const animationFrameSettle = options.animationFrameSettle ?? "race";
   if (animationFrameSettle === "race") {
@@ -482,7 +540,7 @@ export async function runFfmpegOnce(
   timeoutMs: number,
 ): Promise<FfmpegRunResult> {
   return await new Promise((resolvePromise) => {
-    const ff = spawn(ffmpegPath, args);
+    const ff = spawn(ffmpegPath, args, { windowsHide: true });
     let stderr = "";
     let timedOut = false;
     const timer = setTimeout(() => {

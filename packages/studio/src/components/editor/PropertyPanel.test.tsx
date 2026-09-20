@@ -22,7 +22,7 @@ afterEach(() => {
   vi.resetModules();
 });
 
-function baseElement() {
+function baseElement(): NonNullable<PropertyPanelProps["element"]> {
   return {
     element: document.createElement("div"),
     id: "mono-label",
@@ -81,7 +81,7 @@ function nonTextElement() {
 // flat multi-field layer list (FlatTextLayerList + FlatTextFieldEditor) —
 // must not double-render the "Text" heading (FlatGroup's own heading; this
 // component never renders one of its own).
-function multiFieldTextElement() {
+function multiFieldTextElement(): NonNullable<PropertyPanelProps["element"]> {
   const base = baseElement();
   return {
     ...base,
@@ -177,6 +177,43 @@ function sixGroupElement() {
   };
 }
 
+/** An `<audio>` clip: placed on the timeline, but nothing a tween could move. */
+function audioClipElement() {
+  const element = document.createElement("audio");
+  return {
+    ...baseElement(),
+    element,
+    id: "vo-1",
+    selector: "#vo-1",
+    label: "Vo 1",
+    tagName: "audio",
+    textFields: [],
+    dataAttributes: { start: "1", duration: "3" },
+  };
+}
+
+/**
+ * A mixer bus: no clip range at all, and no box either.
+ *
+ * Carries a `data-start` on purpose. A real bus has none — its automation clock
+ * is composition time — but the timing gate has to refuse the TAG rather than
+ * merely fall out of a missing attribute, or something writing one would put
+ * Start/Duration back on a thing that has no range.
+ */
+function audioBusElement() {
+  const element = document.createElement("hf-audio-group");
+  return {
+    ...baseElement(),
+    element,
+    id: "voiceover",
+    selector: "#voiceover",
+    label: "Voiceover",
+    tagName: "hf-audio-group",
+    textFields: [],
+    dataAttributes: { start: "0", duration: "8" },
+  };
+}
+
 const INFERRED_TIMING_ANIMATION = {
   id: "a1",
   targetSelector: "#inferred-anim",
@@ -196,7 +233,7 @@ const INFERRED_TIMING_ANIMATION = {
 
 async function renderPanel(
   flatEnabled: boolean,
-  elementOverride: ReturnType<typeof baseElement> = baseElement(),
+  elementOverride: NonNullable<PropertyPanelProps["element"]> = baseElement(),
   propsOverride: Partial<PropertyPanelProps> = {},
   currentTime?: number,
 ) {
@@ -238,7 +275,11 @@ async function renderPanel(
 // renderPanel resetModules()+dynamic-imports PropertyPanel (needed for a fresh
 // flag read); transforming the full section graph uncached can exceed the 5s
 // default under heavy parallel full-suite load, so give these a wider margin.
-const RENDER_TIMEOUT_MS = 20_000;
+// 20s itself has now been observed timing out in CI's full-monorepo run (the
+// same suite passes in well under 2s standalone) — widened again rather than
+// re-tuned down to a number that will just need doing again next time CI adds
+// load.
+const RENDER_TIMEOUT_MS = 45_000;
 
 // Find the collapsed accordion row whose title matches and click it open.
 function openFlatGroup(host: HTMLElement, title: string) {
@@ -447,9 +488,8 @@ describe("PropertyPanel — Motion group (Plan 3b)", () => {
   it(
     "hides the effect list (showEffects off) when the GSAP edit handlers are absent",
     async () => {
-      // STUDIO_GSAP_PANEL_ENABLED defaults on, but none of the five required
-      // edit handlers are supplied here, so the effect-list half of the
-      // double-gate stays closed — only the Timing row shows.
+      // None of the five required edit handlers are supplied here, so the
+      // effect list stays closed — only the Timing row shows.
       const { host, root } = await renderPanel(true, animatedElement());
       openFlatGroup(host, "Motion");
       const openGroup = openGroupText(host);
@@ -533,12 +573,11 @@ describe("PropertyPanel — flat Layout/Motion timing agreement (whole-plan cohe
       if (!xRow) throw new Error("expected an X row");
       const gutter = xRow.querySelector('[data-flat-kf-gutter="true"]');
       if (!gutter) throw new Error("expected a keyframe gutter on the X row");
-      // The diamond button always carries a `title`; the two plain arrow
-      // buttons don't. At currentPct=0 (playhead on the 0% keyframe), the prev
-      // arrow is disabled (no earlier keyframe) and the next arrow seeks to
-      // the 50% keyframe — exactly the case the coherence bug affected.
+      // At currentPct=0 (playhead on the 0% keyframe) the prev arrow is
+      // disabled (no earlier keyframe) and the next arrow seeks to the 50%
+      // keyframe — exactly the case the coherence bug affected.
       const nextArrow = Array.from(gutter.querySelectorAll<HTMLButtonElement>("button")).find(
-        (b) => !b.title && !b.disabled,
+        (b) => b.title === "Next keyframe" && !b.disabled,
       );
       if (!nextArrow) throw new Error("expected an enabled next-keyframe arrow button");
       act(() => nextArrow.dispatchEvent(new MouseEvent("click", { bubbles: true })));
@@ -579,7 +618,9 @@ describe("PropertyPanel — flat Layout currentPct basis (currentPct follow-up f
       if (!xRow) throw new Error("expected an X row");
       const gutter = xRow.querySelector('[data-flat-kf-gutter="true"]');
       if (!gutter) throw new Error("expected a keyframe gutter on the X row");
-      const diamond = gutter.querySelector<HTMLButtonElement>("button[title]");
+      // The diamond is the only gutter button that reports a pressed state;
+      // the prev/next arrows carry titles too, so `button[title]` is ambiguous.
+      const diamond = gutter.querySelector<HTMLButtonElement>("button[aria-pressed]");
       if (!diamond) throw new Error("expected a keyframe diamond button");
       // KeyframeDiamond's title mapping: active -> "Remove ... keyframe",
       // inactive -> "Add ... keyframe", ghost -> "Convert ... to keyframes".
@@ -812,10 +853,10 @@ describe("PropertyPanel — Media group (Plan 4)", () => {
 // design_handoff scrollable-open-section: collapsed headers before/after the
 // open group render in normal document flow and never move (no sticky, no
 // stacking offsets) — only the open group's own body content scrolls, in a
-// dedicated region between the two fixed header stacks. Worked example: 6
-// groups [text, style, layout, motion, grade, media], motion open (index 3)
+// dedicated region between the two fixed header stacks. Worked example: 7
+// groups [text, style, layout, motion, grade, effects, media], motion open (index 3)
 // -> text/style/layout render as fixed collapsed headers before it, motion
-// renders as an open header + scrollable body, grade/media render as fixed
+// renders as an open header + scrollable body, grade/effects/media render as fixed
 // collapsed headers after it — in exactly that DOM order, nothing sticky.
 describe("PropertyPanel — fixed headers + scrollable open section (Plan 11)", () => {
   it(
@@ -839,13 +880,14 @@ describe("PropertyPanel — fixed headers + scrollable open section (Plan 11)", 
       });
       // Filter to just the group entries (drop any non-group nulls).
       const groupTitles = titles.filter((t): t is string => t !== null);
-      expect(groupTitles).toHaveLength(6);
+      expect(groupTitles).toHaveLength(7);
       expect(groupTitles[0]).toContain("Text");
       expect(groupTitles[1]).toContain("Style");
       expect(groupTitles[2]).toContain("Layout");
       expect(groupTitles[3]).toContain("Motion");
       expect(groupTitles[4]).toContain("Grade");
-      expect(groupTitles[5]).toContain("Media");
+      expect(groupTitles[5]).toContain("Effects");
+      expect(groupTitles[6]).toContain("Media");
 
       // The open group (Motion, index 3) is the one wrapped in
       // data-flat-group-open, sitting between the before/after collapsed
@@ -880,14 +922,15 @@ describe("PropertyPanel — fixed headers + scrollable open section (Plan 11)", 
       const collapsedRows = Array.from(
         host.querySelectorAll<HTMLButtonElement>('[data-flat-group-collapsed="true"]'),
       );
-      expect(collapsedRows).toHaveLength(6);
+      expect(collapsedRows).toHaveLength(7);
       const titlesInOrder = collapsedRows.map((el) => el.textContent ?? "");
       expect(titlesInOrder[0]).toContain("Text");
       expect(titlesInOrder[1]).toContain("Style");
       expect(titlesInOrder[2]).toContain("Layout");
       expect(titlesInOrder[3]).toContain("Motion");
       expect(titlesInOrder[4]).toContain("Grade");
-      expect(titlesInOrder[5]).toContain("Media");
+      expect(titlesInOrder[5]).toContain("Effects");
+      expect(titlesInOrder[6]).toContain("Media");
 
       const body = host.querySelector('[data-flat-panel-body="true"]');
       expect(body?.querySelector(".overflow-y-auto")).toBeNull();
@@ -941,6 +984,71 @@ describe("PropertyPanel — flat group entrance animation scoping (fix round)", 
       if (!openWrapper) throw new Error("expected the open-group wrapper");
       expect(openWrapper.querySelector(".hf-flat-group-enter")).not.toBeNull();
 
+      act(() => root.unmount());
+    },
+    RENDER_TIMEOUT_MS,
+  );
+});
+
+describe("PropertyPanel — Motion is for things that move", () => {
+  it.each([
+    ["a custom music tag", () => document.createElement("music")],
+    [
+      "an element with an audio source",
+      () => {
+        const element = document.createElement("div");
+        element.setAttribute("src", "voiceover.mp3");
+        return element;
+      },
+    ],
+  ])(
+    "recognizes %s through the shared audio predicate",
+    async (_label, makeElement) => {
+      const fixture = {
+        ...audioClipElement(),
+        element: makeElement(),
+        tagName: "div",
+      };
+      const { host, root } = await renderPanel(true, fixture);
+      const titles = Array.from(
+        host.querySelectorAll<HTMLElement>("[data-flat-group-collapsed], [data-flat-group-open]"),
+      ).map((node) => node.textContent ?? "");
+      expect(titles.some((title) => title.includes("Motion"))).toBe(false);
+      expect(titles.some((title) => title.includes("Timing"))).toBe(true);
+      act(() => root.unmount());
+    },
+    RENDER_TIMEOUT_MS,
+  );
+
+  it(
+    "calls the section Timing on an audio clip, and offers no tween editor",
+    async () => {
+      const { host, root } = await renderPanel(true, audioClipElement());
+      const titles = Array.from(
+        host.querySelectorAll<HTMLElement>("[data-flat-group-collapsed], [data-flat-group-open]"),
+      ).map((el) => el.textContent ?? "");
+      // The clip's placement survives — it is still a clip on a track.
+      expect(titles.some((t) => t.includes("Timing"))).toBe(true);
+      // "Motion" named the tween editor, which an <audio> element has no
+      // transform, opacity or box for. Showing it was the panel gating on
+      // handler presence rather than on the element.
+      expect(titles.some((t) => t.includes("Motion"))).toBe(false);
+      act(() => root.unmount());
+    },
+    RENDER_TIMEOUT_MS,
+  );
+
+  it(
+    "offers a bus neither — it has no clip range to edit",
+    async () => {
+      const { host, root } = await renderPanel(true, audioBusElement());
+      const titles = Array.from(
+        host.querySelectorAll<HTMLElement>("[data-flat-group-collapsed], [data-flat-group-open]"),
+      ).map((el) => el.textContent ?? "");
+      expect(titles.some((t) => t.includes("Motion"))).toBe(false);
+      expect(titles.some((t) => t.includes("Timing"))).toBe(false);
+      // It is still a mixer bus: the reason to select one at all.
+      expect(titles.some((t) => t.includes("Audio FX"))).toBe(true);
       act(() => root.unmount());
     },
     RENDER_TIMEOUT_MS,

@@ -1,7 +1,6 @@
 import { useCallback, useRef } from "react";
 import { liveTime, usePlayerStore } from "../player";
 import { pauseStudioPreviewPlayback } from "../utils/studioPreviewHelpers";
-import { STUDIO_PREVIEW_SELECTION_ENABLED } from "../components/editor/manualEditingAvailability";
 import { type DomEditSelection } from "../components/editor/domEditing";
 import type { ApplyDomSelectionOptions, ResolveDomSelectionOptions } from "./useDomSelection";
 import { trackStudioEvent } from "../utils/studioTelemetry";
@@ -87,7 +86,7 @@ export function usePreviewInteraction({
   const handlePreviewCanvasMouseDown = useCallback(
     // fallow-ignore-next-line complexity
     async (e: React.MouseEvent<HTMLDivElement>, options?: PreviewMouseDownOptions) => {
-      if (!STUDIO_PREVIEW_SELECTION_ENABLED || captionEditMode || compositionLoading) return;
+      if (captionEditMode || compositionLoading) return;
 
       // Manual double-click detection (see DOUBLE_CLICK_MS): the first click
       // re-renders the overlay so `e.detail` never reaches 2 on the canvas.
@@ -102,10 +101,10 @@ export function usePreviewInteraction({
       const wasPlaying = usePlayerStore.getState().isPlaying;
       pausePreviewPlayback();
       // A click that resolves to nothing (dead-zone / deselect) shouldn't leave
-      // playback paused — pausing before sampling only exists to keep the hit
-      // target stable while resolving; resume if nothing was selected.
+      // playback paused; the pause only keeps the hit target stable while resolving.
+      // Resume through requestPlayback so adapter, rAF loop and flag move together.
       const resumeIfNothingSelected = () => {
-        if (wasPlaying) usePlayerStore.getState().setIsPlaying(true);
+        if (wasPlaying) usePlayerStore.getState().requestPlayback(true);
       };
 
       // Double-click a group → drill into it and select the child under the
@@ -236,7 +235,7 @@ export function usePreviewInteraction({
   const handlePreviewCanvasPointerMove = useCallback(
     // fallow-ignore-next-line complexity
     async (e: React.PointerEvent<HTMLDivElement>, options?: { preferClipAncestor?: boolean }) => {
-      if (!STUDIO_PREVIEW_SELECTION_ENABLED || captionEditMode || compositionLoading) {
+      if (captionEditMode || compositionLoading) {
         updateDomEditHoverSelection(null);
         return null;
       }

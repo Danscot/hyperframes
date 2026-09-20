@@ -55,6 +55,11 @@ const fullObservability: NonNullable<RenderPerfSummary["observability"]> = {
     protocolTimeoutMs: 300_000,
     pageNavigationTimeoutMs: 60_000,
     playerReadyTimeoutMs: 45_000,
+    adaptersUsed: ["gsap"],
+    audioCount: 2,
+    imageCount: 3,
+    rootBodyMismatch: true,
+    rootBodyDeltaPxBucket: "11-50",
   },
   extraction: {
     videoCount: 6,
@@ -211,6 +216,15 @@ describe("studioRenderTelemetry", () => {
       expect(p.observabilityExtractCacheMisses).toBe(6);
       expect(p.observabilityInitDurationMs).toBe(1234);
       expect(p.observabilityInitTweenCount).toBe(42);
+      // capture.audioCount / imageCount / rootBodyMismatch / adaptersUsed are the
+      // only source for these on a studio render, since no drawElement resolves here.
+      // events.ts's trackRenderComplete falls back to captureXxx precisely because
+      // this path only ever supplies these, never the direct field.
+      expect(p.captureAdaptersUsed).toEqual(["gsap"]);
+      expect(p.captureAudioCount).toBe(2);
+      expect(p.captureImageCount).toBe(3);
+      expect(p.captureRootBodyMismatch).toBe(true);
+      expect(p.captureRootBodyDeltaPxBucket).toBe("11-50");
     });
 
     it("omits all perf-derived fields when perfSummary is undefined", () => {
@@ -310,6 +324,31 @@ describe("studioRenderTelemetry", () => {
       expect(p.capturePageNavigationTimeoutMs).toBe(60_000);
       expect(p.observabilityExtractTotalFrames).toBe(167_400);
       expect(p.observabilityExtractVfrPreflightCount).toBe(6);
+    });
+  });
+
+  // The browser profile's opt-out is invisible to the CLI's own policy, so
+  // without an explicit signal these fired for an opted-out user — attributed
+  // to the install id, which is worse than attributing them correctly.
+  describe("browser telemetry opt-out", () => {
+    it("emits nothing for a render whose browser opted out", () => {
+      emitStudioRenderComplete({ ...opts, telemetryOptOut: true }, 5000, fullPerf);
+      emitStudioRenderError(
+        { ...opts, telemetryOptOut: true },
+        1200,
+        "encode",
+        new Error("boom"),
+        undefined,
+      );
+      expect(trackRenderComplete).not.toHaveBeenCalled();
+      expect(trackRenderError).not.toHaveBeenCalled();
+    });
+
+    // An older client sends no flag at all. That is not consent withdrawn, and
+    // treating it as such would silently drop every pre-upgrade render.
+    it.each([undefined, false])("still emits when telemetryOptOut is %s", (flag) => {
+      emitStudioRenderComplete({ ...opts, telemetryOptOut: flag }, 5000, fullPerf);
+      expect(trackRenderComplete).toHaveBeenCalledTimes(1);
     });
   });
 });

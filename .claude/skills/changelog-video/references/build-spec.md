@@ -76,16 +76,23 @@ otherwise) and must stay flat 2D (no 3D ancestors).
   y ∈ [288, 944].
 - Outro (≤3.5s): kicker FULL DIGEST, "See what shipped." ~96px, green rule,
   mono URL chip, tag line. Fade all + chrome ~0.5s before end.
-- Caption rail per `script-voice.md` (top: 1002).
+- Caption rail per `script-voice.md` (top: 990, font-size: 32px, height: 52). Mandatory — populate the master-skeleton's `LINES` array from `captions.json` before render; see SKILL.md step 5.
 
 ## Seams + internal life (doctrine mechanics)
 
 - `ledger.json`: every ordinary seam `cut-the-curve LEFT` (x, dir −1), exit
-  and entry selectors = the slide wrappers. Outro entry `travel: 8`.
+  and entry selectors = the inner `.swrap` wrappers (`#w-*`), NEVER the `#s-*`
+  clip element — `gsap_animates_clip_element` is an error-severity lint rule and
+  every stamped seam writes `autoAlpha`. Outro entry `travel: 8`.
 - `seam-stamp.mjs --ledger ledger.json --write index.html` owns ALL wrapper
   entries/exits — author none yourself. Title (film open) authors its own
-  entry only.
-- Slides: CSS `opacity: 0` base; `data-start` = exactly the cut time.
+  entry only, and that entry MUST pass `immediateRender: false`: the stamped
+  zero-duration `tl.set(autoAlpha: 0)` at the title's cut renders at BUILD time,
+  so an entry without the flag captures 0 as its start and tweens 0 → 0. The
+  symptom is `exit-visible … op 0.00` with `exit-vector` PASSING — moving but
+  invisible. Neither a CSS opacity base nor a longer clip window fixes it.
+- Slides: the `.swrap` carries the CSS `opacity: 0` base, not the `.slide` clip
+  element; `data-start` = exactly the cut time.
 - Each scene's shell (chip, headline, mock chrome, initial state) is
   COMPOSED at local t=0 — the wrapper flies it in. Internal reveals start
   ≥0.4s after the cut and end ≥0.45s before the next cut (stamped exits
@@ -102,8 +109,8 @@ otherwise) and must stay flat 2D (no 3D ancestors).
 ## Lint/check gotchas (all hit before, all pre-solved)
 
 - Mock containers with intentional stacking: `data-layout-allow-overlap` on
-  the slide root; elements a playhead/line crosses:
-  `data-layout-allow-occlusion`.
+  each text block that deliberately participates, never on the slide root;
+  elements a playhead/line crosses: `data-layout-allow-occlusion`.
 - Dim text: `rgba(245,246,244,.66)` minimum (contrast gate).
 - Audio: every `<audio>` carries an `id`. BGM: the house track ships at
   `<SKILL_DIR>/assets/bgm.mp3` (159s instrumental) — copy it to the project

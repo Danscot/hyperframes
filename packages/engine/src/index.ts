@@ -53,6 +53,7 @@ export {
   scaleProtocolTimeoutForComposition,
   shouldClampToScreenshotForConcreteGpu,
   applyConcreteGpuScreenshotClamp,
+  explainDrawElementDisabled,
   resolveExtractCacheDir,
   defaultExtractCacheDir,
   EXTRACT_CACHE_DIR_DISABLED_ALIASES,
@@ -66,12 +67,14 @@ export {
   normalizeVp9CpuUsed,
 } from "./services/vp9Options.js";
 export {
+  getCgroupMemoryLimitMb,
   getSystemTotalMb,
   isLowMemorySystem,
   LOW_MEMORY_TOTAL_MB_THRESHOLD,
 } from "./services/systemMemory.js";
 
 // ── Browser management ─────────────────────────────────────────────────────────
+export { chromeMajorCeiling } from "./services/chromeHostCeiling.js";
 export {
   acquireBrowser,
   releaseBrowser,
@@ -79,6 +82,9 @@ export {
   resolveHeadlessShellPath,
   resolveBrowserGpuMode,
   buildChromeArgs,
+  compositionRequiresWebGpu,
+  assertWebGpuAdapterAvailable,
+  WebGpuUnavailableError,
   ENABLE_BROWSER_POOL,
   BrowserLeasePool,
   type BuildChromeArgsOptions,
@@ -119,11 +125,13 @@ export {
   getCapturePerfSummary,
   percentileOf,
   prepareCaptureSessionForReuse,
+  deriveBeginFrameProbeTimeTicks,
   type CaptureSession,
   isTransientBrowserError,
   isMemoryExhaustionError,
   type BeforeCaptureHook,
   type DiscardWarmupInnerCapture,
+  type StaticVerificationOutcome,
 } from "./services/frameCapture.js";
 export {
   CaptureFailure,
@@ -132,6 +140,10 @@ export {
   type CaptureFailureKind,
   type CaptureWorkerDiagnostic,
 } from "./services/captureFailure.js";
+export {
+  createChromeMemorySampler,
+  type ChromeMemoryStats,
+} from "./services/chromeMemorySampler.js";
 
 // ── Screenshot (BeginFrame) ─────────────────────────────────────────────────────
 export {
@@ -154,13 +166,20 @@ export {
 export {
   buildEncoderArgs,
   encodeFramesFromDir,
+  buildConcatArgs,
+  concatVideoFiles,
   encodeFramesChunkedConcat,
   muxVideoWithAudio,
   applyFaststart,
+  packageHls,
   detectGpuEncoder,
   ENCODER_PRESETS,
   getEncoderPreset,
+  HLS_MASTER_PLAYLIST,
+  HLS_VIDEO_PLAYLIST,
+  HLS_AUDIO_PLAYLIST,
   type GpuEncoder,
+  type PackageHlsOptions,
 } from "./services/chunkEncoder.js";
 export type { EncoderOptions, EncodeResult, MuxResult } from "./services/chunkEncoder.types.js";
 
@@ -179,27 +198,60 @@ export {
   parseImageElements,
   extractVideoFramesRange,
   extractAllVideoFrames,
+  resolveTimelineExtractionWindow,
+  resolveVideoExtractionWindow,
+  resolveFinalFrameExtractionWindow,
+  resolveVideoExtractionDuration,
+  resolvePlayableVideoDuration,
+  extractionFrameCountForDuration,
   resolveProjectRelativeSrc,
   getFrameAtTime,
   createFrameLookupTable,
   FrameLookupTable,
   analyzeClipMediaFit,
+  classifyVideoExtractionError,
+  isVideoSourceExtractionError,
+  runVideoExtractionWithRetry,
+  safeVideoExtractionSourceIdentity,
+  VideoSourceExtractionError,
   type VideoElement,
   type ImageElement,
   type ExtractedFrames,
   type ExtractionOptions,
   type ExtractionResult,
   type ExtractionPhaseBreakdown,
+  type TimelineExtractionWindow,
+  type VideoExtractionFailure,
+  type VideoExtractionFailureKind,
+  type VideoExtractionFailureGroupDetails,
+  type VideoExtractionFailureRetry,
+  type VideoExtractionFailureStatusClass,
+  type SafeVideoExtractionSourceIdentity,
   type VideoFrameFormat,
   VIDEO_FRAME_FORMATS,
   isVideoFrameFormat,
 } from "./services/videoFrameExtractor.js";
 
+export {
+  resolveReferencedStart,
+  resolveReferencedDuration,
+  type RefResolverEl,
+  type RefResolverDoc,
+} from "./services/referenceResolver.js";
+
 export { createVideoFrameInjector } from "./services/videoFrameInjector.js";
 
-export { parseAudioElements, processCompositionAudio } from "./services/audioMixer.js";
+export {
+  MIXED_AUDIO_FILENAME,
+  parseAudioElements,
+  processCompositionAudio,
+} from "./services/audioMixer.js";
+export { cloneCaptureWarning, cloneCaptureWarnings } from "./services/captureWarning.js";
 export type {
   AudioElement,
+  AudioFailureReason,
+  AudioFailureStage,
+  AudioProcessingFailure,
   AudioTrack,
   AudioVolumeKeyframe,
   MixResult,
@@ -208,6 +260,9 @@ export type {
 // ── Parallel rendering ─────────────────────────────────────────────────────────
 export {
   calculateOptimalWorkers,
+  computeWorkerSizing,
+  selectVerifySampleIndicesForTask,
+  verifyDiskDrawElementSamples,
   distributeFrames,
   distributeFramesInterleaved,
   executeParallelCapture,
@@ -215,6 +270,8 @@ export {
   getSystemResources,
   type WorkerTask,
   type WorkerResult,
+  type WorkerSizing,
+  type WorkerSizingBound,
   type ParallelProgress,
 } from "./services/parallelCoordinator.js";
 
@@ -227,6 +284,8 @@ export {
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 export { quantizeTimeToFrame, MEDIA_VISUAL_STYLE_PROPERTIES } from "@hyperframes/core";
+export { frameFileExtension } from "./services/frameCapture.js";
+export type { MotionBlurOptions, MotionBlurBlendSpace } from "./services/motionBlur.js";
 
 export {
   assertSwiftShader,
@@ -240,17 +299,41 @@ export { readWebGlVendorInfoFromCanvas } from "./utils/readWebGlVendorInfoFromCa
 export {
   extractMediaMetadata,
   extractVideoMetadata,
+  extractFinalVideoFrameTimestamp,
   extractAudioMetadata,
+  probeMediaProfile,
   analyzeKeyframeIntervals,
   type VideoMetadata,
   type AudioMetadata,
+  type MediaProbeProfile,
   type KeyframeAnalysis,
 } from "./utils/ffprobe.js";
 
-export { assertPublicHttpsUrl, downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
+export {
+  NOT_MEDIA_PAYLOAD,
+  NotMediaPayloadError,
+  assertMediaPayload,
+  fingerprintElementId,
+  isNotMediaPayload,
+} from "./utils/notMediaPayload.js";
+
+export {
+  assertPublicHttpsUrl,
+  isBlockedNetworkHost,
+  downloadToTemp,
+  fetchPublicHttpsText,
+  isHttpUrl,
+  safeDownloadUrlIdentity,
+  writeUrlDownloadTelemetry,
+  type SafeDownloadUrlIdentity,
+  type UrlDownloadOptions,
+  type UrlDownloadTelemetry,
+  type PublicHttpsTextOptions,
+} from "./utils/urlDownloader.js";
 export {
   runFfmpeg,
   formatFfmpegError,
+  isExternalFfmpegInterruption,
   type RunFfmpegOptions,
   type RunFfmpegResult,
 } from "./utils/runFfmpeg.js";
@@ -269,6 +352,10 @@ export {
 } from "./utils/ffmpegBinaries.js";
 
 export { trackChildProcess, killTrackedProcesses } from "./utils/processTracker.js";
+
+// drawElement self-verify comparison — shared by the streaming drain
+// (producer) and the parallel disk-path verify (parallelCoordinator).
+export { psnrDb, resolveDeVerifyMinDb } from "./utils/psnr.js";
 
 export {
   decodePng,
@@ -331,10 +418,30 @@ export {
   detectTransfer,
   getHdrEncoderColorParams,
   analyzeCompositionHdr,
+  findHdrAutoPromotion,
+  formatHdrAutoPromotionWarning,
+  sanitizeHdrAutoPromotionAsset,
   DEFAULT_HDR10_MASTERING,
+  HDR_AUTO_PROMOTION_PIPELINE,
   type HdrTransfer,
   type HdrEncoderColorParams,
+  type HdrAutoPromotion,
   type CompositionHdrInfo,
   type HdrMasteringMetadata,
 } from "./utils/hdr.js";
 export type { VideoColorSpace } from "./utils/ffprobe.js";
+export {
+  renderProvenanceArgs,
+  appendRenderProvenanceArgs,
+  readRenderProvenance,
+  PROVENANCE_RENDERER_TAG,
+  PROVENANCE_VERSION_TAG,
+  PROVENANCE_RENDERER_NAME,
+  PROVENANCE_VERSION,
+  type RenderProvenance,
+} from "./utils/renderProvenance.js";
+
+export {
+  DrawElementCaptureError,
+  isDrawElementCaptureError,
+} from "./services/drawElementCaptureError.js";

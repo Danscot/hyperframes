@@ -2,7 +2,7 @@
  * Low-level helpers for building and identifying TimelineElement objects.
  *
  * Covers: duration reading, media-element metadata extraction, selector/key/
- * identity builders, DOM node lookup, and implicit layer detection. These are
+ * identity builders, and DOM node lookup. These are
  * intentionally dependency-free (no store, no hooks) so they can be used in
  * both the React hook and test environments.
  */
@@ -11,6 +11,7 @@ import type { TimelineElement } from "../store/playerStore";
 import type { ClipManifestClip } from "./playbackTypes";
 import { isFinitePositive } from "./playbackAdapter";
 import { getSourceScopedSelectorIndex } from "../../utils/sourceScopedSelectorIndex";
+import { HF_AUDIO_GROUP_TAG } from "@hyperframes/core/audio-groups";
 
 // ---------------------------------------------------------------------------
 // Layer-reveal lift transparency
@@ -81,6 +82,8 @@ function normalizePlaybackRate(raw: number): number {
 }
 
 export function isTimelineIgnoredElement(el: Element): boolean {
+  // An `<hf-audio-group>` is a mixer bus with no timing of its own, drawn as a group row, never a clip.
+  if (el.tagName.toLowerCase() === HF_AUDIO_GROUP_TAG) return true;
   return Boolean(
     el.closest(
       [
@@ -214,37 +217,6 @@ export function getTimelineElementDisplayLabel(input: {
   return tag ? `${tag} clip` : "Timeline clip";
 }
 
-const IMPLICIT_TIMELINE_LAYER_SKIP_TAGS = new Set([
-  "base",
-  "link",
-  "meta",
-  "noscript",
-  "script",
-  "style",
-  "template",
-]);
-
-function humanizeTimelineIdentifier(value: string): string {
-  return value
-    .trim()
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase());
-}
-
-export function getImplicitTimelineLayerLabel(el: HTMLElement): string {
-  const explicitLabel =
-    el.getAttribute("data-timeline-label") ??
-    el.getAttribute("data-label") ??
-    el.getAttribute("aria-label");
-  if (explicitLabel?.trim()) return explicitLabel.trim();
-  if (el.id.trim()) return humanizeTimelineIdentifier(el.id);
-  const classes = el.className.split(/\s+/).filter(Boolean);
-  const className = classes.find((value) => value !== "clip") ?? classes[0];
-  if (className) return humanizeTimelineIdentifier(className);
-  return getTimelineElementDisplayLabel({ tag: el.tagName });
-}
-
 // ---------------------------------------------------------------------------
 // Selector / identity / key builders
 // ---------------------------------------------------------------------------
@@ -298,6 +270,20 @@ export function buildTimelineElementKey(params: {
   return `${scope}:${params.id}:${params.fallbackIndex}`;
 }
 
+/**
+ * Inverse of {@link buildTimelineElementKey} for the `sourceFile#domId` form.
+ * A key with no `#` is a bare dom id and carries no source file of its own, so
+ * the caller supplies the scope it wants to look that id up in.
+ */
+export function splitTimelineElementKey(key: string): {
+  sourceFile: string | null;
+  domId: string;
+} {
+  const hashIndex = key.lastIndexOf("#");
+  if (hashIndex < 0) return { sourceFile: null, domId: key };
+  return { sourceFile: key.slice(0, hashIndex), domId: key.slice(hashIndex + 1) };
+}
+
 export function buildTimelineElementIdentity(params: {
   preferredId?: string | null;
   label: string;
@@ -333,6 +319,24 @@ export function getTimelineElementIdentity(element: { key?: string | null; id: s
 }
 
 /**
+ * The id space the RUNTIME matches on — a bare DOM id, never a store key.
+ *
+ * Studio addresses rows by `buildTimelineElementKey`'s composite
+ * `<sourceFile>#<domId>`, but everything audio in `@hyperframes/core` keys off
+ * the live document: `resolveAudioGroups` collects `member.id`,
+ * `resolveCarveSourceIds` goes through `getElementById`. Anything crossing into
+ * that space — a group membership list, a carve source — has to be
+ * converted here first; a composite key silently matches nothing.
+ *
+ * `null` for a row with no DOM id at all (selector-addressed elements): such an
+ * element cannot be grouped, because `resolveAudioGroups` skips
+ * members without an `id` and would build a group that is half there.
+ */
+export function runtimeAudioId(element: { domId?: string | null }): string | null {
+  return element.domId || null;
+}
+
+/**
  * Timeline store key for a z-reorder entry built OUTSIDE the timeline
  * expansion (canvas context menu / LayersPanel), so the reorder commit can
  * update the store's zIndex synchronously. Matches buildTimelineElementKey's
@@ -351,6 +355,14 @@ export function deriveTimelineStoreKey(params: {
   return buildTimelineElementKey({ id: "", fallbackIndex: 0, ...params });
 }
 
+/**
+ * {@link deriveTimelineStoreKey} for a caller that already has a DOM id in
+ * hand (e.g. one it just minted), so the undefined branch never applies.
+ */
+export function deriveTimelineStoreKeyForDomId(domId: string, sourceFile?: string): string {
+  return deriveTimelineStoreKey({ domId, sourceFile })!;
+}
+
 // ---------------------------------------------------------------------------
 // DOM node querying
 // ---------------------------------------------------------------------------
@@ -366,25 +378,30 @@ function numbersNearlyEqual(a: number, b: number): boolean {
   return Math.abs(a - b) < 0.001;
 }
 
+const MANIFEST_CLIP_ATTRS: ReadonlyArray<[string, (clip: ClipManifestClip) => number]> = [
+  ["data-start", (clip) => clip.start],
+  ["data-duration", (clip) => clip.duration],
+  ["data-track-index", (clip) => clip.track],
+];
+
+function nodeMatchesClipTag(node: Element, clip: ClipManifestClip): boolean {
+  return !clip.tagName || node.tagName.toLowerCase() === clip.tagName.toLowerCase();
+}
+
 function nodeMatchesManifestClip(node: Element, clip: ClipManifestClip): boolean {
-  const tagName = clip.tagName?.toLowerCase();
-  if (tagName && node.tagName.toLowerCase() !== tagName) return false;
-
-  const start = Number.parseFloat(node.getAttribute("data-start") ?? "");
-  if (Number.isFinite(start) && !numbersNearlyEqual(start, clip.start)) return false;
-
-  const duration = Number.parseFloat(node.getAttribute("data-duration") ?? "");
-  if (Number.isFinite(duration) && !numbersNearlyEqual(duration, clip.duration)) return false;
-
-  const track = Number.parseInt(node.getAttribute("data-track-index") ?? "", 10);
-  if (Number.isFinite(track) && track !== clip.track) return false;
-
-  return true;
+  if (!nodeMatchesClipTag(node, clip)) return false;
+  // An attribute only constrains the match when it parses to a finite number:
+  // missing or garbled reads as "unknown", not "mismatch".
+  return MANIFEST_CLIP_ATTRS.every(([attr, expected]) => {
+    const actual = Number.parseFloat(node.getAttribute(attr) ?? "");
+    return !Number.isFinite(actual) || numbersNearlyEqual(actual, expected(clip));
+  });
 }
 
 function findTimelineDomNode(doc: Document, id: string): Element | null {
   return (
     doc.getElementById(id) ??
+    doc.querySelector(`[data-hf-id="${CSS.escape(id)}"]`) ??
     doc.querySelector(`[data-composition-id="${CSS.escape(id)}"]`) ??
     doc.querySelector(`.${CSS.escape(id)}`) ??
     null
@@ -396,27 +413,28 @@ export function findTimelineDomNodeForClip(
   clip: ClipManifestClip,
   fallbackIndex: number,
   usedNodes = new Set<Element>(),
+  getCandidates = () => getTimelineDomNodes(doc),
 ): Element | null {
   const byIdentity = clip.id ? findTimelineDomNode(doc, clip.id) : null;
-  if (byIdentity && !usedNodes.has(byIdentity)) return byIdentity;
+  if (byIdentity && !usedNodes.has(byIdentity) && nodeMatchesClipTag(byIdentity, clip))
+    return byIdentity;
 
-  const candidates = getTimelineDomNodes(doc).filter((node) => !usedNodes.has(node));
+  const candidates = getCandidates().filter((node) => !usedNodes.has(node));
   const exact = candidates.find((node) => nodeMatchesManifestClip(node, clip));
   if (exact) return exact;
 
-  return candidates[fallbackIndex] ?? null;
+  const positional = candidates[fallbackIndex];
+  return positional && nodeMatchesClipTag(positional, clip) ? positional : null;
 }
 
-// ---------------------------------------------------------------------------
-// Implicit layer detection
-// ---------------------------------------------------------------------------
-
-export function isImplicitTimelineLayerCandidate(root: Element, el: Element): el is HTMLElement {
-  if (!isHtmlElement(el)) return false;
-  if (isTimelineIgnoredElement(el)) return false;
-  if (el.parentElement !== root) return false;
-  const tagName = el.tagName.toLowerCase();
-  if (IMPLICIT_TIMELINE_LAYER_SKIP_TAGS.has(tagName)) return false;
-  if (el.hasAttribute("data-start") || el.hasAttribute("data-track-index")) return false;
-  return Boolean(getTimelineElementSelector(el));
+/** One synchronous hydration pass: snapshot only on a miss, never across reloads. */
+export function createTimelineDomNodeResolver(doc: Document) {
+  let candidates: Element[] | undefined;
+  const usedNodes = new Set<Element>();
+  const getCandidates = () => (candidates ??= getTimelineDomNodes(doc));
+  return (clip: ClipManifestClip, index: number): Element | null => {
+    const node = findTimelineDomNodeForClip(doc, clip, index, usedNodes, getCandidates);
+    if (node) usedNodes.add(node);
+    return node;
+  };
 }

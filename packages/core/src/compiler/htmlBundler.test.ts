@@ -1,10 +1,13 @@
 // @vitest-environment node
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseHTML } from "linkedom";
-import { describe, it, expect, vi } from "vitest";
-import { bundleToSingleHtml } from "./htmlBundler";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { bundleToSingleHtml, emitRootCompositionVariableStyles } from "./htmlBundler";
+import { ensureExternalScriptTag } from "./externalScripts";
+import { resetUnknownEnumWarnings } from "../runtime/getVariables";
+import { sanitizeCssValue } from "../runtime/applyVariableBindings";
 import { getHyperframeRuntimeScript } from "../generated/runtime-inline";
 
 function makeTempProject(files: Record<string, string>): string {
@@ -15,6 +18,16 @@ function makeTempProject(files: Record<string, string>): string {
     writeFileSync(full, content, "utf-8");
   }
   return dir;
+}
+
+/**
+ * The data URL a correctly-resolved asset must inline to. Asserting on the
+ * asset's CONTENT, not on the rewritten path string, is what proves rebasing
+ * resolved to the right file: resolving from the wrong base directory finds no
+ * file at all, so nothing is inlined and the assertion fails.
+ */
+function inlinedAs(mime: string, content: string): string {
+  return `data:${mime};base64,${Buffer.from(content, "utf-8").toString("base64")}`;
 }
 
 function makeColorGradingProject(lutSrc: string, files: Record<string, string> = {}): string {
@@ -49,6 +62,17 @@ function tryCreateSymlink(target: string, path: string, type: "dir" | "file"): b
   } catch {
     return false;
   }
+}
+
+function makeSymlinkProject(
+  projectFiles: Record<string, string>,
+  secretCss: string,
+): { dir: string; outsideDir: string } {
+  const outsideDir = mkdtempSync(join(tmpdir(), "hf-outside-"));
+  writeFileSync(join(outsideDir, "secret.css"), secretCss);
+  const dir = makeTempProject(projectFiles);
+  symlinkSync(join(outsideDir, "secret.css"), join(dir, "evil.css"));
+  return { dir, outsideDir };
 }
 
 describe("bundleToSingleHtml", () => {
@@ -1108,6 +1132,17 @@ describe("bundleToSingleHtml", () => {
     expect(lutSrc).toBe("assets/luts/identity.cube");
   });
 
+  it("inlineAssets: false also keeps a LUT path external, without inlineColorGradingLuts", async () => {
+    const dir = makeColorGradingProject("assets/luts/identity.cube", {
+      "assets/luts/identity.cube": "LUT_3D_SIZE 2",
+    });
+
+    const bundled = await bundleToSingleHtml(dir, { inlineAssets: false });
+    const lutSrc = readBundledColorGradingLutSrc(bundled);
+
+    expect(lutSrc).toBe("assets/luts/identity.cube");
+  });
+
   it("warns when a render bundle cannot inline a referenced color grading LUT", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -1197,7 +1232,7 @@ describe("bundleToSingleHtml", () => {
 
     const bundled = await bundleToSingleHtml(dir);
 
-    expect(bundled).toContain("url('styles/assets/fonts/brand.woff2')");
+    expect(bundled).toContain(`url('${inlinedAs("font/woff2", "fake-font-data")}')`);
     expect(bundled).not.toContain("url('assets/fonts/brand.woff2')");
     expect(bundled).not.toContain("@import");
   });
@@ -1216,7 +1251,7 @@ describe("bundleToSingleHtml", () => {
 
     const bundled = await bundleToSingleHtml(dir);
 
-    expect(bundled).toContain("url('theme/images/grain.png')");
+    expect(bundled).toContain(`url('${inlinedAs("image/png", "fake-image-data")}')`);
     expect(bundled).not.toContain("url('./images/grain.png')");
   });
 
@@ -1235,7 +1270,7 @@ describe("bundleToSingleHtml", () => {
 
     const bundled = await bundleToSingleHtml(dir);
 
-    expect(bundled).toContain("url('assets/bg.png')");
+    expect(bundled).toContain(`url('${inlinedAs("image/png", "fake-image")}')`);
     expect(bundled).not.toContain("url('../../assets/bg.png')");
   });
 
@@ -1259,7 +1294,7 @@ describe("bundleToSingleHtml", () => {
 
     expect(bundled).toContain("url('https://cdn.example.com/font.woff2')");
     expect(bundled).toContain("url('data:image/svg+xml,<svg/>')");
-    expect(bundled).toContain("url('styles/img/bg.png')");
+    expect(bundled).toContain(`url('${inlinedAs("image/png", "fake")}')`);
   });
 
   it("preserves url() query strings and hash fragments during rebasing", async () => {
@@ -1276,7 +1311,103 @@ describe("bundleToSingleHtml", () => {
 
     const bundled = await bundleToSingleHtml(dir);
 
-    expect(bundled).toContain("url('styles/sprite.png?v=2#section')");
+    // The query/hash suffix rides along onto the inlined data URL.
+    expect(bundled).toContain(`url('${inlinedAs("image/png", "fake-sprite")}?v=2#section')`);
+  });
+
+  it("inlines fonts, images and scripts so no relative asset reference survives", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><head>
+  <style>
+    @font-face { font-family: "Brand"; src: url('assets/fonts/brand.woff2') format('woff2'); }
+    .hero { background: url('assets/hero.jpg'); }
+  </style>
+</head><body>
+  <div data-composition-id="root" data-width="320" data-height="180">
+    <img id="logo" src="assets/logo.png" srcset="assets/logo2x.webp 2x">
+    <video id="clip" poster="assets/poster.gif"></video>
+  </div>
+  <script src="assets/app.js"></script>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines.root = {}</script>
+</body></html>`,
+      "assets/fonts/brand.woff2": "font-bytes",
+      "assets/hero.jpg": "hero-bytes",
+      "assets/logo.png": "logo-bytes",
+      "assets/logo2x.webp": "logo2x-bytes",
+      "assets/poster.gif": "poster-bytes",
+      "assets/app.js": "window.__APP_LOADED__ = true;",
+    });
+
+    const bundled = await bundleToSingleHtml(dir);
+
+    // Each asset arrives as its own bytes, which is what proves its path
+    // resolved to the right file rather than merely being rewritten.
+    expect(bundled).toContain(inlinedAs("font/woff2", "font-bytes"));
+    expect(bundled).toContain(inlinedAs("image/jpeg", "hero-bytes"));
+    expect(bundled).toContain(inlinedAs("image/png", "logo-bytes"));
+    expect(bundled).toContain(inlinedAs("image/webp", "logo2x-bytes"));
+    expect(bundled).toContain(inlinedAs("image/gif", "poster-bytes"));
+    // A local classic script is folded in as source, not as a data: URL.
+    expect(bundled).toContain("window.__APP_LOADED__ = true;");
+
+    // Nothing still points into the sibling assets/ directory that a consumer
+    // storing this bundle as a lone file will not have.
+    expect(bundled).not.toMatch(/["'(]assets\//);
+  });
+
+  it("keeps every asset's literal relative src when inlineAssets is false", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><head>
+  <style>
+    @font-face { font-family: "Brand"; src: url('assets/fonts/brand.woff2') format('woff2'); }
+    .hero { background: url('assets/hero.jpg'); }
+  </style>
+</head><body>
+  <div data-composition-id="root" data-width="320" data-height="180">
+    <img id="avatar" src="assets/avatar-01.png" srcset="assets/avatar-01@2x.png 2x">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines.root = {}</script>
+</body></html>`,
+      "assets/fonts/brand.woff2": "font-bytes",
+      "assets/hero.jpg": "hero-bytes",
+      "assets/avatar-01.png": "avatar-bytes",
+      "assets/avatar-01@2x.png": "avatar-2x-bytes",
+    });
+
+    const bundled = await bundleToSingleHtml(dir, { inlineAssets: false });
+
+    // The composition's own script can read `img.getAttribute("src")` back and
+    // still find its authored path — this is what a same-origin asset route
+    // (a sibling preview endpoint) needs to serve the real bytes.
+    expect(bundled).toContain('src="assets/avatar-01.png"');
+    expect(bundled).toContain("assets/avatar-01@2x.png 2x");
+    expect(bundled).toContain("url('assets/fonts/brand.woff2')");
+    expect(bundled).toContain("url('assets/hero.jpg')");
+    expect(bundled).not.toContain("data:image/png");
+    expect(bundled).not.toContain("data:font/woff2");
+  });
+
+  it("leaves an oversized asset relative and warns rather than inlining it", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><body>
+  <div data-composition-id="root" data-width="320" data-height="180">
+    <img id="big" src="assets/huge.png">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines.root = {}</script>
+</body></html>`,
+      "assets/huge.png": "x".repeat(2 * 1024 * 1024 + 1),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const bundled = await bundleToSingleHtml(dir);
+
+    expect(bundled).toContain('src="assets/huge.png"');
+    expect(bundled).not.toContain("data:image/png");
+    expect(warn.mock.calls.flat().join(" ")).toContain("may not be self-contained");
+    warn.mockRestore();
   });
 
   it("deduplicates diamond @import (same file imported by two parents)", async () => {
@@ -1344,5 +1475,417 @@ describe("bundleToSingleHtml", () => {
       "html,body,*{text-rendering:geometricPrecision}",
     );
     expect(styleEls[0]?.parentElement?.tagName.toLowerCase()).toBe("head");
+  });
+
+  // Regression: cli-feedback field cluster (crons 61-68, n=25+, cross-OS,
+  // versions 0.7.56-0.7.64). Reporter L3 cite (ts=1784519869):
+  // "bundleToSingleHtml compiles data-duration into data-end, then validates
+  // the compiled HTML and reports its own generated data-end as deprecated.
+  // Raw-source lint passes with 0 errors and 0 warnings." The end-to-end
+  // guarantee: source authored with only data-duration must round-trip through
+  // bundle + StaticGuard without producing a StaticGuard warning on the
+  // compiler's own consistent data-end. Facet-(a)/(e) fix.
+  it("does not emit a StaticGuard warning for source-authored data-duration on media", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html>
+<head><title>t</title></head>
+<body>
+  <div data-composition-id="root" data-width="1920" data-height="1080" data-start="0" data-duration="18">
+    <audio id="bgm" src="bgm.mp3" data-start="0" data-duration="18"></audio>
+    <audio id="narration" src="narr.mp3" data-start="5" data-duration="10"></audio>
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines.root = { duration: () => 18, seek() {}, pause() {} };</script>
+</body></html>`,
+      "bgm.mp3": "",
+      "narr.mp3": "",
+    });
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const bundled = await bundleToSingleHtml(dir);
+      // Sanity: the compiler MUST have emitted data-end for both audio elements,
+      // so the linter is actually seeing the compiled shape (not the raw source).
+      expect(bundled).toContain('id="bgm"');
+      expect(bundled).toMatch(/id="bgm"[^>]*data-end="18"|data-end="18"[^>]*id="bgm"/);
+      expect(bundled).toMatch(/id="narration"[^>]*data-end="15"|data-end="15"[^>]*id="narration"/);
+
+      const staticGuardWarnings = warnSpy.mock.calls
+        .map((call) => String(call[0] ?? ""))
+        .filter((line) => line.includes("[StaticGuard]"));
+      expect(staticGuardWarnings).toEqual([]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  describe("symlink path traversal (security: F-005)", () => {
+    it("does not inline CSS from a symlink pointing outside projectDir", async () => {
+      const { dir, outsideDir } = makeSymlinkProject(
+        {
+          "index.html": `<!doctype html><html><head>
+<link rel="stylesheet" href="evil.css"></head>
+<body><div data-composition-id="root" data-width="320" data-height="180"></div></body></html>`,
+        },
+        ".outside-secret { color: red; }",
+      );
+      try {
+        expect(await bundleToSingleHtml(dir)).not.toContain("outside-secret");
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not inline CSS via @import through a symlink pointing outside projectDir", async () => {
+      const { dir, outsideDir } = makeSymlinkProject(
+        {
+          "index.html": `<!doctype html><html><head>
+<link rel="stylesheet" href="main.css"></head>
+<body><div data-composition-id="root" data-width="320" data-height="180"></div></body></html>`,
+          "main.css": "@import './evil.css';",
+        },
+        ".import-secret { color: blue; }",
+      );
+      try {
+        expect(await bundleToSingleHtml(dir)).not.toContain("import-secret");
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+/**
+ * A sub-composition given a value outside a declared enum's `options` falls
+ * back silently. The runtime guard in getVariables.ts cannot see it: the
+ * bundler bakes the per-instance values into `window.__hfVariablesByComp` at
+ * compile time and the sub-comp's scoped `getVariables` shim only reads that
+ * table. Compile time is therefore the only place the defect is observable on
+ * this path, so the same warning is emitted here.
+ */
+describe("bundleToSingleHtml unknown enum values", () => {
+  let warnings: string[];
+
+  beforeEach(() => {
+    resetUnknownEnumWarnings();
+    warnings = [];
+    vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetUnknownEnumWarnings();
+  });
+
+  const enumWarnings = () => warnings.filter((w) => w.includes("runtime_unknown_enum_value"));
+
+  const ACCENT_ENUM =
+    '[{"id":"accent","type":"enum","label":"Accent","default":"green","options":["green","blue","violet"]}]';
+
+  function makeSubCompProject(variableValues: string, declaration = ACCENT_ENUM): string {
+    return makeTempProject({
+      "index.html": `<!doctype html>
+<html><head></head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <div
+      data-composition-id="card"
+      data-composition-src="compositions/card.html"
+      data-variable-values='${variableValues}'></div>
+  </div>
+  <script>window.__timelines={};</script>
+</body></html>`,
+      "compositions/card.html": `<!doctype html>
+<html data-composition-variables='${declaration}'>
+  <body>
+    <div data-composition-id="card" data-width="1920" data-height="1080"></div>
+  </body>
+</html>`,
+    });
+  }
+
+  it("warns when a sub-composition instance value is not a declared option", async () => {
+    await bundleToSingleHtml(makeSubCompProject('{"accent":"orange"}'));
+
+    expect(enumWarnings()).toEqual([
+      '[hyperframes] runtime_unknown_enum_value: card variable "accent" got "orange", ' +
+        "which is not a declared option (green, blue, violet). " +
+        'Rendering "green" instead.',
+    ]);
+  });
+
+  it("is silent when the instance value is a declared option", async () => {
+    await bundleToSingleHtml(makeSubCompProject('{"accent":"violet"}'));
+
+    expect(enumWarnings()).toEqual([]);
+  });
+
+  it("never inspects a variable declared without options", async () => {
+    const declaration = '[{"id":"accent","type":"string","label":"Accent","default":"green"}]';
+    await bundleToSingleHtml(makeSubCompProject('{"accent":"orange"}', declaration));
+
+    expect(enumWarnings()).toEqual([]);
+  });
+
+  it("is silent for a declared enum absent from the instance values", async () => {
+    await bundleToSingleHtml(makeSubCompProject('{"unrelated":"whatever"}'));
+
+    expect(enumWarnings()).toEqual([]);
+  });
+
+  it("passes the unknown value through to the bundle unrewritten", async () => {
+    const bundled = await bundleToSingleHtml(makeSubCompProject('{"accent":"orange"}'));
+
+    expect(bundled).toContain("window.__hfVariablesByComp = Object.assign({}, ");
+    expect(bundled).toContain('{ "card": { "accent": "orange" } }');
+    expect(bundled).toMatch(/\[data-composition-id="card"\]\s*\{[^}]*--accent:\s*orange/);
+    expect(bundled).not.toContain("--accent: green");
+  });
+
+  it("warns once for the same composition, variable and value across bundles", async () => {
+    const dir = makeSubCompProject('{"accent":"orange"}');
+    await bundleToSingleHtml(dir);
+    await bundleToSingleHtml(dir);
+
+    expect(enumWarnings()).toHaveLength(1);
+  });
+
+  it("warns for a <template>-mounted composition too", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><head></head><body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080">
+    <div data-composition-id="card" data-variable-values='{"accent":"orange"}'></div>
+  </div>
+  <template id="card-template">
+    <div data-composition-id="card" data-width="1920" data-height="1080"
+      data-composition-variables='${ACCENT_ENUM}'></div>
+  </template>
+  <script>window.__timelines={};</script>
+</body></html>`,
+    });
+
+    await bundleToSingleHtml(dir);
+
+    expect(enumWarnings()).toEqual([
+      '[hyperframes] runtime_unknown_enum_value: card variable "accent" got "orange", ' +
+        "which is not a declared option (green, blue, violet). " +
+        'Rendering "green" instead.',
+    ]);
+  });
+});
+
+/**
+ * Composition variable values are emitted as CSS declarations inside a `<style>`
+ * element. `<style>` is a RAW TEXT element: HTML serialization does not escape its
+ * content and the tokenizer closes it at the first `</style`. An unescaped value could
+ * therefore close the element and have the remainder parsed as markup.
+ */
+describe("emitRootCompositionVariableStyles — <style> breakout", () => {
+  /**
+   * The payload leads with a benign `<` before its `</style`, so escaping or
+   * stripping only the first match does not pass: that pins the `/g` flag rather
+   * than merely "something ran". A lone `<` in a value (`a < b`) is the common case.
+   */
+  const BREAKOUT = "x<y</style><script>window.__pwned=1</script><style>";
+
+  /** Emit into a document, serialize it the way the compilers do, then re-parse. */
+  function scriptsAfterRoundTrip(
+    variablesByComp: Record<string, Record<string, unknown>>,
+    body = "x",
+  ) {
+    const { document } = parseHTML(`<!doctype html><html><head></head><body>${body}</body></html>`);
+    emitRootCompositionVariableStyles(document, variablesByComp);
+    const { document: reparsed } = parseHTML(document.toString());
+    return {
+      scripts: [...reparsed.querySelectorAll("script")].map((s) => s.textContent ?? ""),
+      css: [...reparsed.querySelectorAll("style")].map((s) => s.textContent ?? "").join("\n"),
+      reparsed,
+    };
+  }
+
+  it("does not let a variable VALUE close the style element", () => {
+    const { scripts } = scriptsAfterRoundTrip({ "comp-a": { brand: BREAKOUT } });
+    expect(scripts).toEqual([]);
+  });
+
+  it("does not let a COMP ID close the style element through the generated selector", () => {
+    // The comp id reaches the stylesheet as an attribute selector, which is escaped
+    // for selector-string syntax but says nothing about element termination.
+    const { scripts, css } = scriptsAfterRoundTrip(
+      { [`comp-a${BREAKOUT}`]: { brand: "#fff" } },
+      '<div data-composition-id="comp-a"></div>',
+    );
+    expect(scripts).toEqual([]);
+    expect(css).not.toContain("</style");
+  });
+
+  it("strips the characters that smuggle a sibling rule, matching the runtime", () => {
+    // `sanitizeCssValue` is the runtime contract for a scalar folded into
+    // `background: var(--x)`; the compile path has to reach the same result, or a
+    // rendered MP4 diverges from the preview it was approved from.
+    const smuggle = "red; } body { background-image: url(//evil?data=1) } x { y:z";
+    const { css } = scriptsAfterRoundTrip({ "comp-a": { brand: smuggle } });
+
+    expect(css).not.toContain("body {");
+    // One rule, one declaration: with no `;{}` left in the value there is nothing to
+    // close the declaration with, so no sibling rule can be opened.
+    expect(css.match(/\}/g) ?? []).toHaveLength(1);
+    expect(css).toContain(`--brand: ${sanitizeCssValue(smuggle)};`);
+  });
+
+  it("strips '<' from a value the way the runtime does", () => {
+    const { css, scripts } = scriptsAfterRoundTrip({ "comp-a": { brand: "a<b" } });
+    expect(scripts).toEqual([]);
+    expect(css).not.toContain("a<b");
+    expect(css).toContain("ab");
+  });
+
+  it("leaves values without '<' untouched", () => {
+    const { css } = scriptsAfterRoundTrip({ "comp-a": { brand: "#ff0066" } });
+    expect(css).toContain("#ff0066");
+  });
+});
+
+describe("nested script integrity", () => {
+  it("preserves and deduplicates a nested pin even when the root already loads that URL", async () => {
+    const src = "https://cdn.example.com/pinned.js";
+    const dir = makeTempProject({
+      "index.html": `<html><head><script src="${src}"></script></head><body><div data-composition-id="root" data-width="320" data-height="180" data-duration="1"><div data-composition-id="child" data-composition-src="child.html"></div></div></body></html>`,
+      "child.html": `<html><head><script src="${src}" integrity="sha384-YQ==" crossorigin="anonymous"></script></head><body><div data-composition-id="child" data-width="320" data-height="180" data-duration="1">Child</div></body></html>`,
+    });
+    try {
+      const bundled = await bundleToSingleHtml(dir);
+      const { document } = parseHTML(bundled);
+      const scripts = [...document.querySelectorAll("script[src]")].filter(
+        (el) => el.getAttribute("src") === src,
+      );
+      expect(scripts).toHaveLength(1);
+      expect(scripts[0]?.getAttribute("integrity")).toBe("sha384-YQ==");
+      expect(scripts[0]?.getAttribute("crossorigin")).toBe("anonymous");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+it("preserves every duplicate script pin and rejects conflicting requirements", () => {
+  const { document } = parseHTML(
+    '<html><body><script src="https://cdn.example.com/a.js"></script><script src="https://cdn.example.com/a.js"></script></body></html>',
+  );
+  const src = "https://cdn.example.com/a.js";
+  ensureExternalScriptTag(document, src, { integrity: "sha384-YQ==", crossorigin: "anonymous" });
+  ensureExternalScriptTag(document, src);
+  for (const el of document.querySelectorAll("script")) {
+    expect(el.getAttribute("integrity")).toBe("sha384-YQ==");
+    expect(el.getAttribute("crossorigin")).toBe("anonymous");
+  }
+  expect(() => ensureExternalScriptTag(document, src, { integrity: "sha384-Yg==" })).toThrow(
+    "Conflicting script integrity",
+  );
+});
+
+it("keeps protected local scripts external when hoisting an inline template", async () => {
+  const dir = makeTempProject({
+    "index.html": `<html><body><template id="child-template"><div data-composition-id="child" data-width="320" data-height="180"><script src="local.js" integrity="sha384-YQ==" crossorigin="anonymous"></script></div></template><div data-composition-id="root" data-width="320" data-height="180" data-duration="1"><div data-composition-id="child" data-start="0" data-duration="1"></div></div></body></html>`,
+    "local.js": "window.localPinWitness = true;",
+  });
+  try {
+    const bundled = await bundleToSingleHtml(dir);
+    const { document } = parseHTML(bundled);
+    const script = document.querySelector('script[src="local.js"]');
+    expect(script?.getAttribute("integrity")).toBe("sha384-YQ==");
+    expect(script?.getAttribute("crossorigin")).toBe("anonymous");
+    expect(bundled).not.toContain("window.localPinWitness = true;");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it.each(["root", "sibling", "template"])(
+  "does not inline local bytes before a later %s integrity requirement",
+  async (placement) => {
+    const unpinned = '<script src="local.js"></script>';
+    const pinned =
+      '<script src="./local.js" integrity="sHa384-YQ==" crossorigin="anonymous"></script>';
+    const rootScript = placement === "root" ? unpinned : "";
+    const first =
+      placement === "sibling"
+        ? '<div data-composition-id="first" data-composition-src="first.html"></div>'
+        : "";
+    const templates =
+      placement === "template"
+        ? `<template id="first-template"><div data-composition-id="first">${unpinned}</div></template><template id="child-template"><div data-composition-id="child">${pinned}</div></template>`
+        : "";
+    const children =
+      placement === "template"
+        ? '<div data-composition-id="first" data-start="0" data-duration="1"></div><div data-composition-id="child" data-start="0" data-duration="1"></div>'
+        : `${first}<div data-composition-id="child" data-composition-src="child.html"></div>`;
+    const dir = makeTempProject({
+      "index.html": `<html><head>${rootScript}</head><body>${templates}<div data-composition-id="root" data-width="320" data-height="180" data-duration="1">${children}</div></body></html>`,
+      "first.html": `<html><head>${unpinned}</head><body><div data-composition-id="first" data-width="320" data-height="180" data-duration="1">First</div></body></html>`,
+      "child.html": `<html><head>${pinned}</head><body><div data-composition-id="child" data-width="320" data-height="180" data-duration="1">Child</div></body></html>`,
+      "local.js": "window.alteredLocalBytes = true;",
+    });
+    try {
+      const bundled = await bundleToSingleHtml(dir);
+      expect(bundled).not.toContain("window.alteredLocalBytes = true;");
+      const { document } = parseHTML(bundled);
+      const local = [...document.querySelectorAll("script[src]")].filter((el) =>
+        /local\.js$/.test(el.getAttribute("src") || ""),
+      );
+      expect(local.length).toBeGreaterThan(0);
+      for (const el of local) expect(el.getAttribute("integrity")).toBe("sha384-YQ==");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+describe("bundleToSingleHtml script order", () => {
+  it("keeps an inline script before the src script that follows it, and one after it after", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><body>
+  <div data-composition-id="root" data-width="320" data-height="180"></div>
+  <script>window.MARK_BEFORE = 1;</script>
+  <script src="https://cdn.example.com/needs-before.js"></script>
+  <script>window.MARK_AFTER = 1;</script>
+</body></html>`,
+    });
+    try {
+      const bundled = await bundleToSingleHtml(dir);
+      const before = bundled.indexOf("MARK_BEFORE");
+      const lib = bundled.indexOf("cdn.example.com/needs-before.js");
+      const after = bundled.indexOf("MARK_AFTER");
+      expect(before).toBeGreaterThan(-1);
+      expect(before).toBeLessThan(lib);
+      expect(lib).toBeLessThan(after);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still merges adjacent inline scripts into one at the end of the body", async () => {
+    const dir = makeTempProject({
+      "index.html": `<!doctype html>
+<html><body>
+  <script>window.MARK_ONE = 1;</script>
+  <div data-composition-id="root" data-width="320" data-height="180"></div>
+  <script>window.MARK_TWO = 1;</script>
+</body></html>`,
+    });
+    try {
+      const bundled = await bundleToSingleHtml(dir);
+      const { document } = parseHTML(bundled);
+      const merged = [...document.querySelectorAll("body script")].filter((el) =>
+        (el.textContent || "").includes("MARK_ONE"),
+      );
+      expect(merged).toHaveLength(1);
+      expect(merged[0]!.textContent).toContain("MARK_TWO");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

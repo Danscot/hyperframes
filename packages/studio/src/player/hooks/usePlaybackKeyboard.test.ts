@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+// fallow-ignore-file code-duplication
 
 import React, { act, useEffect } from "react";
 import { createRoot } from "react-dom/client";
@@ -171,6 +172,39 @@ describe("usePlaybackKeyboard — keyboard layout independence (#834)", () => {
 
     expect(spies.play).toHaveBeenCalledTimes(1);
   });
+
+  it("'A' does not seek to the in-point while the razor tool is armed, so it's free for the razor's own return-to-select binding", () => {
+    const { dispatch, spies } = setupHook();
+    usePlayerStore.setState({ inPoint: 1.5, activeTool: "razor" });
+
+    act(() => {
+      dispatch(keydown({ code: "KeyA", key: "a" }));
+    });
+
+    expect(spies.seek).not.toHaveBeenCalled();
+  });
+
+  it("'A' still seeks to the in-point when the razor tool isn't armed", () => {
+    const { dispatch, spies } = setupHook();
+    usePlayerStore.setState({ inPoint: 1.5, activeTool: "select" });
+
+    act(() => {
+      dispatch(keydown({ code: "KeyA", key: "a" }));
+    });
+
+    expect(spies.seek).toHaveBeenCalledWith(1.5, { keepPlaying: true });
+  });
+
+  it("Shift+A still seeks to the in-point while the razor is armed, since only plain A exits the razor", () => {
+    const { dispatch, spies } = setupHook();
+    usePlayerStore.setState({ inPoint: 1.5, activeTool: "razor" });
+
+    act(() => {
+      dispatch(keydown({ code: "KeyA", key: "a", shiftKey: true }));
+    });
+
+    expect(spies.seek).toHaveBeenCalledWith(1.5, { keepPlaying: true });
+  });
 });
 
 describe("usePlaybackKeyboard — mute & loop shortcuts (#905)", () => {
@@ -189,7 +223,7 @@ describe("usePlaybackKeyboard — mute & loop shortcuts (#905)", () => {
     expect(usePlayerStore.getState().audioMuted).toBe(false);
   });
 
-  it("M does NOT toggle audioMuted above 1x playback (matches button gating)", () => {
+  it("M toggles audioMuted above 1x playback too", () => {
     const { dispatch } = setupHook();
     usePlayerStore.setState({ playbackRate: 2, audioMuted: false });
 
@@ -197,7 +231,7 @@ describe("usePlaybackKeyboard — mute & loop shortcuts (#905)", () => {
       dispatch(keydown({ code: "KeyM", key: "m" }));
     });
 
-    expect(usePlayerStore.getState().audioMuted).toBe(false);
+    expect(usePlayerStore.getState().audioMuted).toBe(true);
   });
 
   it("Shift+L toggles loopEnabled without starting forward shuttle", () => {

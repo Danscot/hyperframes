@@ -28,7 +28,7 @@ const execFileRunner: FfprobeRunner = (command, args, options) =>
     execFile(
       command,
       args,
-      { timeout: options?.timeout, maxBuffer: options?.maxBuffer },
+      { timeout: options?.timeout, maxBuffer: options?.maxBuffer, windowsHide: true },
       (error, stdout, stderr) => {
         if (error && error.code === "ENOENT") {
           resolvePromise({ status: null, stdout: "", stderr: "", error });
@@ -202,6 +202,7 @@ export async function probeMediaMetadata(
       "stream=codec_type,codec_name,profile,pix_fmt,color_space,color_transfer,color_primaries,bits_per_raw_sample:stream_disposition=attached_pic",
       "-of",
       "json",
+      "--",
       filePath,
     ],
     { timeout: 15_000, maxBuffer: 1024 * 1024 },

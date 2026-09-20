@@ -1,4 +1,6 @@
 import type { TimelineElement } from "../store/playerStore";
+import { INSERT_BOUNDARY_BAND } from "./timelineLayout";
+import { isMainTrackElement } from "./timelineZones";
 
 /**
  * Keep a landing track inside the dragged clip's kind-zone: visual clips stay in
@@ -139,28 +141,44 @@ export function resolveZoneDropPlacement(input: {
   return { track: placement.track, insertRow: null };
 }
 
-/**
- * Fallback half-width (fraction of a track height) of the insert band straddling
- * a lane boundary — used only when the caller passes no explicit band. Production
- * threads the geometry-exact `INSERT_BOUNDARY_BAND` (timelineLayout.ts, = the clip
- * inset `CLIP_Y / TRACK_H`) so the band matches the rendered inter-clip gutter and
- * NEVER reaches into a clip body. Kept in sync with that constant; do not widen it
- * back toward the old 0.32 (which armed an insert across ~64% of every row — the
- * misfire that turned a plain horizontal drag into a phantom track insert).
- */
-const INSERT_BAND = 3 / 48;
+function landsOnMainTrack(landingTrack: number, isAudio: boolean): boolean {
+  return isMainTrackElement({
+    id: "",
+    tag: isAudio ? "audio" : "video",
+    start: 0,
+    duration: 0,
+    track: landingTrack,
+  });
+}
+
+/** An existing clip newly landing on an empty main track commits at start=0.
+ *  No-op once the main track holds another clip, off the main track, or for
+ *  a clip already resident there. `others` excludes the landing clip itself. */
+export function resolveMainTrackDropStart(
+  others: readonly TimelineElement[],
+  originTrack: number,
+  landingTrack: number,
+  isAudio: boolean,
+  desiredStart: number,
+): number {
+  if (originTrack === landingTrack || !landsOnMainTrack(landingTrack, isAudio)) {
+    return desiredStart;
+  }
+  return others.some(isMainTrackElement) ? desiredStart : 0;
+}
 
 /**
  * Decide whether a vertical drag is inserting a new track at a lane boundary.
  * `rowFloat` is the pointer's position in track-height units from the top of the
  * first lane (0 = top of lane 0). Returns the boundary row to insert at
  * (0 = above the top lane, `trackCount` = below the bottom), or null when the
- * pointer is over a lane's middle band (a normal move/target).
+ * pointer is over a lane's middle band (a normal move/target). The default band
+ * preserves collapsed-row behavior; production passes the concrete row's band.
  */
 export function resolveInsertRow(
   rowFloat: number,
   trackCount: number,
-  band: number = INSERT_BAND,
+  band: number = INSERT_BOUNDARY_BAND,
 ): number | null {
   if (trackCount === 0) return 0;
   if (rowFloat <= 0) return 0;
