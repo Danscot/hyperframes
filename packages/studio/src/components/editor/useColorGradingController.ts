@@ -1,4 +1,6 @@
+import { mediaMetadataUrl } from "../../utils/studioHelpers";
 import { useLivePreviewIframe } from "../../player/store/previewIframeStore";
+import { onPreviewContentReplaced } from "../../player/sceneSwap";
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   HF_COLOR_GRADING_ATTR,
@@ -27,6 +29,8 @@ import {
   type ColorGradingPresetPreviews,
   type ColorGradingPreviewOptions,
 } from "./useColorGradingPreviews";
+import { studioApiFetch } from "../../utils/studioApiFetch";
+import { authoredSrcPath } from "../../player/components/thumbnailUtils";
 
 export type { ColorGradingPresetPreviews, ColorGradingPreviewOptions };
 
@@ -94,7 +98,7 @@ function resolveProjectAssetPath(
   const sourceDir = sourceFile.includes("/")
     ? sourceFile.slice(0, sourceFile.lastIndexOf("/"))
     : "";
-  const parts = `${sourceDir}/${trimmed}`.split("/");
+  const parts = `${sourceDir}/${authoredSrcPath(trimmed)}`.split("/");
   const normalized: string[] = [];
   for (const part of parts) {
     if (!part || part === ".") continue;
@@ -282,18 +286,13 @@ export function useColorGradingController({
   useEffect(() => {
     setMediaMetadata(null);
     if (!selectedAssetPath) return;
-    const cacheKey = `${projectId}:${selectedAssetPath}`;
+    const cacheKey = mediaMetadataUrl(projectId, selectedAssetPath);
     if (MEDIA_METADATA_CACHE.has(cacheKey)) {
       setMediaMetadata(MEDIA_METADATA_CACHE.get(cacheKey) ?? null);
       return;
     }
     const controller = new AbortController();
-    fetch(
-      `/api/projects/${encodeURIComponent(projectId)}/media/metadata?path=${encodeURIComponent(
-        selectedAssetPath,
-      )}`,
-      { signal: controller.signal },
-    )
+    studioApiFetch(cacheKey, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) return { ok: false as const };
         const data: MediaMetadataResponse | null = await response.json();
@@ -353,7 +352,7 @@ export function useColorGradingController({
         const reverted = confirmedGradingRef.current;
         latestGradingRef.current = reverted;
         setGrading(reverted);
-        setRuntimeStatus({ state: "unavailable", message: "Save failed — reverted" });
+        setRuntimeStatus({ state: "unavailable", message: "Save failed, changes reverted" });
       };
       // The callback is the primary result signal; the rejection path supports
       // other setAttributeLive implementations.
@@ -449,11 +448,11 @@ export function useColorGradingController({
       if (!acceptStudioRuntimeMessage(data)) return;
       refreshAndReplay();
     };
-    iframe.addEventListener("load", refreshAndReplay);
     window.addEventListener("message", onMessage);
     const timer = window.setTimeout(refreshAndReplay, 80);
+    const stopReplay = onPreviewContentReplaced(iframe, refreshAndReplay);
     return () => {
-      iframe.removeEventListener("load", refreshAndReplay);
+      stopReplay();
       window.removeEventListener("message", onMessage);
       window.clearTimeout(timer);
     };

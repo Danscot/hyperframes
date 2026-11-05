@@ -1,3 +1,5 @@
+const ERROR_PULSES_BEFORE_IDLE = 3;
+
 export function SidebarLintButton({
   onLint,
   linting,
@@ -15,7 +17,7 @@ export function SidebarLintButton({
         type="button"
         onClick={onLint}
         disabled={linting}
-        className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-medium text-neutral-500 enabled:hover:text-amber-300 enabled:hover:bg-neutral-800 enabled:active:scale-[0.98] transition-colors disabled:opacity-40"
+        className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-medium text-neutral-500 enabled:hover:text-warning-ink enabled:hover:bg-neutral-800 enabled:active:scale-[0.98] transition-colors disabled:opacity-40"
       >
         <svg
           width="12"
@@ -31,11 +33,13 @@ export function SidebarLintButton({
         {linting ? "Linting…" : "Lint"}
         {!linting && findingCount != null && findingCount > 0 && (
           <span
+            key={findingCount}
             data-lint-badge={hasError ? "error" : "warning"}
+            style={hasError ? { animationIterationCount: ERROR_PULSES_BEFORE_IDLE } : undefined}
             className={
               hasError
-                ? "ml-1 min-w-[16px] rounded-full bg-panel-danger/25 px-1 text-[9px] font-bold text-panel-danger animate-pulse motion-reduce:animate-none"
-                : "ml-1 min-w-[16px] rounded-full bg-amber-500/20 px-1 text-[9px] font-bold text-amber-400"
+                ? "ml-1 min-w-[16px] rounded-full bg-danger px-1 text-[9px] font-bold text-on-danger animate-pulse motion-reduce:animate-none"
+                : "ml-1 min-w-[16px] rounded-full bg-amber-500/20 px-1 text-[9px] font-bold text-warning-ink"
             }
           >
             {findingCount}

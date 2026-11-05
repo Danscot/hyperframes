@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { CliRuntimeError } from "../utils/commandResult.js";
 
 const trackEvent = vi.fn();
 const flush = vi.fn(() => Promise.resolve());
@@ -35,6 +36,7 @@ const {
   trackCliError,
   trackFigmaImport,
   trackRenderFeedback,
+  trackFeedbackComment,
   trackRenderPreflightRejected,
   trackAuthLoginStarted,
   trackAuthLoginCompleted,
@@ -116,9 +118,15 @@ describe("trackCheckReport", () => {
       motionWarnings: 8,
       contrastErrors: 9,
       contrastWarnings: 10,
+      craftWarnings: 16,
       launchSettleMs: 11,
+      renderReadyTimedOut: true,
       seekLoopMs: 12,
       contrastMs: 13,
+      gridMs: 17,
+      craftMs: 18,
+      overlapMs: 19,
+      durationSec: 20,
       gridPoints: 14,
       contrastPoints: 15,
       ok: false,
@@ -142,9 +150,15 @@ describe("trackCheckReport", () => {
       motion_warnings: 8,
       contrast_errors: 9,
       contrast_warnings: 10,
+      craft_warnings: 16,
       launch_settle_ms: 11,
+      render_ready_timed_out: true,
       seek_loop_ms: 12,
       contrast_ms: 13,
+      grid_ms: 17,
+      craft_ms: 18,
+      overlap_ms: 19,
+      composition_s: 20,
       grid_points: 14,
       contrast_points: 15,
       ok: false,
@@ -170,9 +184,15 @@ describe("trackCheckReport", () => {
       motionWarnings: 0,
       contrastErrors: 0,
       contrastWarnings: 0,
+      craftWarnings: 0,
       launchSettleMs: 0,
+      renderReadyTimedOut: false,
       seekLoopMs: 0,
       contrastMs: 0,
+      gridMs: 0,
+      craftMs: 0,
+      overlapMs: 0,
+      durationSec: 0,
       gridPoints: 0,
       contrastPoints: 0,
       ok: true,
@@ -396,6 +416,35 @@ describe("render telemetry events", () => {
     expect(props.browser_version_major).toBe(118);
   });
 
+  it("carries machine CPU use on render_complete and render_error", () => {
+    const cpu = {
+      cpuBusyAvgPct: 57,
+      cpuBusyPeakPct: 90,
+      cpuCoresBusyPeak: 2,
+      loadAvgStart: 1.23,
+      loadAvgEnd: 3.46,
+    };
+    trackRenderComplete({
+      durationMs: 1,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      ...cpu,
+    });
+    trackRenderError({ fps: 30, quality: "draft", docker: false, ...cpu });
+    for (const [, props] of trackEvent.mock.calls) {
+      expect(props).toMatchObject({
+        cpu_busy_avg_pct: 57,
+        cpu_busy_peak_pct: 90,
+        cpu_cores_busy_peak: 2,
+        load_avg_start: 1.23,
+        load_avg_end: 3.46,
+      });
+    }
+    expect(trackEvent).toHaveBeenCalledTimes(2);
+  });
+
   it("carries the browser install path facts on both render events, never the path", () => {
     const browserInstall = {
       build: "152.0.7928.2",
@@ -586,6 +635,48 @@ describe("render telemetry events", () => {
     expect(props.audio_group_count).toBe(0);
     expect(props.color_grading_count).toBe(0);
     expect(props.has_lut).toBe(false);
+  });
+
+  it("carries the vfx chain scan's node count, capture class, and def types", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      vfxHostCount: 2,
+      vfxCapture: "self",
+      vfxTypes: "displacement-map,wave-warp",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.vfx_host_count).toBe(2);
+    expect(props.vfx_capture).toBe("self");
+    expect(props.vfx_types).toBe("displacement-map,wave-warp");
+  });
+
+  it("reports a zero node count and empty types rather than dropping the properties", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      vfxHostCount: 0,
+      vfxTypes: "",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.vfx_host_count).toBe(0);
+    expect(props.vfx_types).toBe("");
+    // No vfx-chain host means chainCapture never ran — undefined, not "none".
+    expect(props.vfx_capture).toBeUndefined();
+  });
+
+  it("omits the vfx fields entirely when the caller never resolved them", () => {
+    trackRenderComplete({ durationMs: 1000, fps: 30, quality: "high", docker: false, gpu: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.vfx_host_count).toBeUndefined();
+    expect(props.vfx_capture).toBeUndefined();
+    expect(props.vfx_types).toBeUndefined();
   });
 
   // emitStudioRenderComplete never resolves perfSummary.drawElement, only the
@@ -909,6 +1000,22 @@ describe("render telemetry events", () => {
     );
   });
 
+  it("reports render_complete de_router_breaker_off when the install's breaker held the router off", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "standard",
+      docker: false,
+      gpu: false,
+      deRouterBreakerOff: true,
+    });
+    expect(trackEvent).toHaveBeenCalledWith(
+      "render_complete",
+      expect.objectContaining({ de_router_breaker_off: true }),
+      undefined,
+    );
+  });
+
   it("emits render_preflight_rejected with the low-cardinality issue kind", () => {
     trackRenderPreflightRejected({ kind: "aspect-mismatch" });
     expect(trackEvent).toHaveBeenCalledWith("render_preflight_rejected", {
@@ -943,6 +1050,10 @@ describe("render telemetry events", () => {
       stageCaptureSetupMs: 1860,
       stageCaptureFrameMs: 3240,
       captureAvgMs: 27,
+      captureSeekAvgMs: 6,
+      captureBeforeCaptureAvgMs: 2,
+      captureScreenshotAvgMs: 15,
+      encoderWaitAvgMs: 4,
     });
 
     expect(trackEvent).toHaveBeenCalledWith(
@@ -952,6 +1063,10 @@ describe("render telemetry events", () => {
         stage_capture_setup_ms: 1860,
         stage_capture_frame_ms: 3240,
         capture_avg_ms: 27,
+        capture_seek_avg_ms: 6,
+        capture_before_capture_avg_ms: 2,
+        capture_screenshot_avg_ms: 15,
+        encoder_wait_avg_ms: 4,
       }),
       undefined,
     );
@@ -1026,6 +1141,17 @@ describe("render telemetry events", () => {
   });
 });
 
+describe("trackFeedbackComment", () => {
+  it("is its own event with no rating, so it never counts in the rating metric", () => {
+    trackEvent.mockClear();
+    trackFeedbackComment({ comment: "MISSING FEATURE: trim", feedbackId: "f1" });
+
+    const [name, props] = trackEvent.mock.calls[0] as [string, Record<string, unknown>];
+    expect(name).toBe("cli_feedback_comment");
+    expect(props).toEqual({ comment: "MISSING FEATURE: trim", feedback_id: "f1" });
+  });
+});
+
 describe("trackRenderFeedback", () => {
   beforeEach(() => {
     trackEvent.mockClear();
@@ -1087,6 +1213,25 @@ describe("trackCliError", () => {
 });
 
 describe("trackCommandFailure", () => {
+  it("reports an extra-positional usage error by count, never the arguments", async () => {
+    const { resolveExtraPositionals } = await import("../utils/reject-extra-positionals.js");
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmd = { args: { dir: { type: "positional" } } } as Parameters<
+      typeof resolveExtraPositionals
+    >[0];
+    let thrown: unknown;
+    try {
+      resolveExtraPositionals(cmd, "render", { _: ["./p", "Jane", "555-0100"] });
+    } catch (error) {
+      thrown = error;
+    }
+    quiet.mockRestore();
+    trackCommandFailure("render", thrown);
+    const payload = JSON.stringify(trackEvent.mock.calls.at(-1));
+    expect(payload).toContain("2 unexpected extra arguments for hyperframes render");
+    expect(payload).not.toMatch(/Jane|555-0100/);
+  });
+
   beforeEach(() => {
     trackEvent.mockClear();
   });
@@ -1105,6 +1250,39 @@ describe("trackCommandFailure", () => {
         // stack_trace is asserted (redacted) in the trackCliError suite; the
         // raw err.stack no longer matches once paths are stripped.
       }),
+    );
+  });
+
+  it("reports the same error once, however many places report it", () => {
+    const err = new Error("not a project");
+    trackCommandFailure("info", err);
+    trackCommandFailure("info", err);
+
+    expect(trackEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the failure a CliRuntimeError carries, through every wrapper, once", () => {
+    const cause = new Error("not a project");
+    const inner = new CliRuntimeError("Command failed", { exitCode: 1, cause });
+    trackCommandFailure("figma:asset", inner);
+    trackCommandFailure("figma", new CliRuntimeError("x", { exitCode: 1, cause: inner }));
+
+    expect(trackEvent).toHaveBeenCalledTimes(1);
+    expect(trackEvent).toHaveBeenCalledWith(
+      "cli_error",
+      expect.objectContaining({ error_message: "not a project" }),
+    );
+  });
+
+  it("takes a caller's error name and endpoint", () => {
+    trackCommandFailure("figma:asset", new Error("No token"), {
+      error_name: "NO_TOKEN",
+      endpoint: "images",
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "cli_error",
+      expect.objectContaining({ error_name: "NO_TOKEN", endpoint: "images" }),
     );
   });
 
@@ -1225,11 +1403,14 @@ describe("auth login telemetry events", () => {
   });
 
   it("identifyUser emits a $identify alias linking the anon install to the identity", () => {
-    identifyUser("alice@example.com");
+    identifyUser("user-id-1", { email: "alice@example.com", heygen_username: "alice" });
     expect(trackEvent).toHaveBeenCalledWith(
       "$identify",
-      { $anon_distinct_id: "anon-test-123" },
-      "alice@example.com",
+      {
+        $anon_distinct_id: "anon-test-123",
+        $set: { email: "alice@example.com", heygen_username: "alice" },
+      },
+      "user-id-1",
     );
   });
 

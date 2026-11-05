@@ -13,7 +13,7 @@ import { useMemo, useState } from "react";
 import type { Composition, CompositionVariable } from "@hyperframes/sdk";
 import type { DomEditSelection } from "../editor/domEditingTypes";
 
-import { VARIABLES_INPUT_CLASS } from "./VariablesValueControls";
+import { variableDefaultText, VARIABLES_INPUT_CLASS } from "./VariablesValueControls";
 
 // <source> is deliberately excluded: rewriting a <source> child's src after
 // the parent media element ran resource selection is a spec no-op.
@@ -215,12 +215,12 @@ export function VariablesBindElement({
             className={`${VARIABLES_INPUT_CLASS} font-mono`}
           />
           {existingDecl && (
-            <p className="text-[9px] leading-snug text-amber-400/90">
+            <p className="text-[9px] leading-snug text-warning-ink">
               "{trimmedId}" already exists. This element will use its current value
               {existingDecl.default !== undefined && (
-                <span className="font-mono"> ({String(existingDecl.default)})</span>
+                <span className="font-mono"> ({variableDefaultText(existingDecl)})</span>
               )}
-              , not the element's own — binding won't change "{trimmedId}".
+              , not the element's own, so binding won't change "{trimmedId}".
             </p>
           )}
           <div className="flex items-center justify-end gap-2">

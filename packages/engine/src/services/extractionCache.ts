@@ -34,16 +34,17 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import {
+  createReadStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { renameWithRetry } from "@hyperframes/core/rename-retry";
 import { join } from "node:path";
 import type { VideoMetadata } from "../utils/ffprobe.js";
 import { FRAME_FILENAME_PREFIX, framePathsFromDirectory } from "./extractedFrameIndex.js";
@@ -58,16 +59,10 @@ export const COMPLETE_SENTINEL = ".hf-complete";
 export const GC_MARKER = ".hf-last-gc";
 
 /**
- * Current schema version. Bump when the cache-contents invariant changes.
- * v2 -> v3: one-pass VFR extraction (-fps_mode cfr) replaces the two-pass
- * VFR-to-CFR re-encode, changing frame contents for VFR sources under
- * identical key tuples. Without the bump, warm v2 entries (two-pass frames)
- * would keep being served across the deploy boundary.
- * v3 -> v4: the target fps identity is the exact FFmpeg argument instead of
- * a JavaScript number. This invalidates entries created after rational NTSC
- * rates had already been rounded to a decimal.
+ * Current schema version. Bump it whenever extraction writes different frames for the same key,
+ * or warm entries keep serving the old frames across a deploy. Each bump's commit says why.
  */
-export const SCHEMA_PREFIX = "hfcache-v4-";
+export const SCHEMA_PREFIX = "hfcache-v8-";
 
 /** Truncated hex chars of SHA-256 used for the entry directory name. */
 const KEY_HEX_CHARS = 16;
@@ -94,6 +89,8 @@ export interface CacheKeyInput {
   format: CacheFrameFormat;
   /** Optional source transform applied during extraction. */
   transform?: string;
+  /** SHA-256 of the source bytes, in place of path and mtime (downloaded media gets new ones each render). */
+  contentSha256?: string;
 }
 
 export interface CacheEntry {
@@ -116,6 +113,19 @@ export interface CachePublishResult {
   published: boolean;
 }
 
+export async function readContentSha256(
+  path: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  try {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(path, { signal })) hash.update(chunk);
+    return hash.digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read `(mtimeMs, size)` for a path. Returns `null` if the file is missing —
  * callers should skip the cache path for that entry so the extractor surfaces
@@ -134,18 +144,13 @@ export function readKeyStat(videoPath: string): { mtimeMs: number; size: number 
 
 function canonicalKeyBlob(input: CacheKeyInput): string {
   const durationForKey = Number.isFinite(input.duration) ? input.duration : -1;
-  const blob: {
-    p: string;
-    m: number;
-    s: number;
-    ms: number;
-    d: number;
-    f: string;
-    fmt: CacheFrameFormat;
-    t?: string;
-  } = {
-    p: input.videoPath,
-    m: input.mtimeMs,
+  // Identity first, so keys of path-keyed entries stay byte-identical.
+  const identity: Record<string, string | number> =
+    input.contentSha256 !== undefined
+      ? { c: input.contentSha256 }
+      : { p: input.videoPath, m: input.mtimeMs };
+  const blob: Record<string, string | number> = {
+    ...identity,
     s: input.size,
     ms: input.mediaStart,
     d: durationForKey,
@@ -241,7 +246,7 @@ function isTargetExistsRenameError(err: unknown): boolean {
  * winner is always correct. Returns null when no winner is present.
  */
 function adoptPublishedWinner(entry: CacheEntry, partialDir: string): CachePublishResult | null {
-  if (!existsSync(join(entry.dir, COMPLETE_SENTINEL))) return null;
+  if (!existsSync(join(entry.dir, COMPLETE_SENTINEL)) || !hasFrameFiles(entry.dir)) return null;
   removeDir(partialDir);
   return { dir: entry.dir, published: true };
 }
@@ -254,7 +259,7 @@ export function publishCacheEntry(entry: CacheEntry, partialDir: string): CacheP
   }
 
   try {
-    renameSync(partialDir, entry.dir);
+    renameWithRetry(partialDir, entry.dir);
     return { dir: entry.dir, published: true };
   } catch (err) {
     if (!isTargetExistsRenameError(err)) return { dir: partialDir, published: false };
@@ -270,7 +275,7 @@ export function publishCacheEntry(entry: CacheEntry, partialDir: string): CacheP
   }
 
   try {
-    renameSync(partialDir, entry.dir);
+    renameWithRetry(partialDir, entry.dir);
     return { dir: entry.dir, published: true };
   } catch {
     // TOCTOU: a concurrent writer can publish between the winner check, the
@@ -342,7 +347,7 @@ function isPartialChild(name: string): boolean {
   return name.includes(".partial-");
 }
 
-function directorySizeBytes(path: string): number {
+export function directorySizeBytes(path: string): number {
   try {
     const stat = lstatSync(path);
     if (!stat.isDirectory()) return stat.size;
@@ -400,11 +405,12 @@ function collectGcEntry(
   now: number,
   minAgeMs: number,
   stats: GcStats,
+  remove: (dir: string) => void,
 ): GcEntry | null {
   try {
     const dirStat = statSync(dir);
     if (isPartialChild(name) && now - dirStat.mtimeMs >= minAgeMs) {
-      removeDir(dir);
+      remove(dir);
       stats.agedPartialsRemoved += 1;
       return null;
     }
@@ -451,16 +457,21 @@ export function gcSweepDue(rootDir: string, maxAgeMs: number): boolean {
   }
 }
 
-export function gcExtractionCache(
-  rootDir: string,
-  opts: { maxBytes: number; minAgeMs: number },
-): GcStats {
-  const stats: GcStats = { evictedEntries: 0, evictedBytes: 0, agedPartialsRemoved: 0 };
+function markGcSweep(rootDir: string): void {
   try {
     writeFileSync(join(rootDir, GC_MARKER), "", "utf-8");
   } catch {
     // Unwritable root: the sweep below will no-op on the same root anyway.
   }
+}
+
+export function gcExtractionCache(
+  rootDir: string,
+  opts: { maxBytes: number; minAgeMs: number; dryRun?: boolean },
+): GcStats {
+  const stats: GcStats = { evictedEntries: 0, evictedBytes: 0, agedPartialsRemoved: 0 };
+  const remove = opts.dryRun ? () => {} : removeDir;
+  if (!opts.dryRun) markGcSweep(rootDir);
   try {
     const now = Date.now();
     const entries: GcEntry[] = [];
@@ -472,6 +483,7 @@ export function gcExtractionCache(
         now,
         opts.minAgeMs,
         stats,
+        remove,
       );
       if (entry) entries.push(entry);
     }
@@ -483,7 +495,7 @@ export function gcExtractionCache(
     for (const entry of entries) {
       // ponytail: age-based liveness guard, not a lock; a render longer than minAge with a full cache could lose entries mid-read - acceptable, next render re-extracts.
       if (entry.ageMs < opts.minAgeMs) continue;
-      removeDir(entry.dir);
+      remove(entry.dir);
       stats.evictedEntries += 1;
       stats.evictedBytes += entry.size;
       totalBytes -= entry.size;

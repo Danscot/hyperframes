@@ -1,4 +1,5 @@
 name: regression
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Checks (catalog_publish={0})', inputs.catalog_publish) || '' }}
 
 permissions:
   contents: read
@@ -11,50 +12,87 @@ env:
 # Graphite can update a branch and its PR base separately for the same head
 # SHA. Keep only the newest expensive regression run for each PR/ref.
 concurrency:
-  group: regression-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: regression-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  # A body or title edit queues behind running checks instead of cancelling them.
+  cancel-in-progress: ${{ github.event.action != 'edited' || github.event.changes.base != null }}
 
 on:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      catalog_publish:
+        description: "Run required checks for a generated catalog publication."
+        type: boolean
+        default: false
   pull_request:
     # Re-run when Graphite changes only the PR base for the same head SHA.
     types: [opened, synchronize, reopened, edited]
   push:
     branches:
       - main
+  schedule:
+    # Daily at 06:17 UTC: the full suite, including fixtures too slow for every PR.
+    - cron: "17 6 * * *"
 
 jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 8
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.catalog_publish)) && 'true' || steps.edit.outputs.passed == 'true' && 'false' || steps.release.outputs.release_only == 'true' && 'false' || steps.filter.outputs.code }}
       matrix: ${{ steps.shards.outputs.matrix }}
     steps:
       # Force git-based change detection instead of the pull_request REST API.
       # The API path can fail the whole workflow on transient listFiles
       # timeouts before any regression shard even starts.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        timeout-minutes: 3
+      - name: Fetch the history the diffs read
+        timeout-minutes: 2
+        uses: ./.github/actions/fetch-history
+      - name: Check whether this commit already passed before a title or body edit
+        id: edit
+        uses: ./.github/actions/edit-already-passed
+      # HEAD is the PR merge ref; its first parent is the current base tip, unlike the payload's
+      # base.sha, which goes stale and would count the base's newer commits as the PR's changes.
+      - name: Find the pull request's current base
+        id: base
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse --verify -q HEAD^2 > /dev/null || { echo "::error::HEAD is not the pull request merge commit"; exit 1; }
+          sha="$(git rev-parse --verify HEAD^1)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Find a release-only diff
+        id: release
+        uses: ./.github/actions/release-only-diff
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
+        if: github.event_name != 'schedule' && steps.edit.outputs.passed != 'true'
         with:
           token: ""
+          base: ${{ steps.base.outputs.sha }}
           filters: |
             code:
               - "packages/core/**"
               - "packages/producer/**"
               - "packages/engine/**"
               - "Dockerfile*"
+              - ".github/workflows/regression.yml"
       # Bin-pack the shard matrix from recorded per-fixture timings rather than
       # a hand-written list. Fails if any fixture on disk is neither scheduled
       # nor explicitly excluded, so a new fixture cannot silently never run.
       - name: Plan regression shards
         id: shards
+        env:
+          NIGHTLY: ${{ github.event_name == 'schedule' && '--nightly' || '' }}
         run: |
-          echo "matrix=$(node packages/producer/scripts/plan-regression-shards.mjs)" >> "$GITHUB_OUTPUT"
-          node packages/producer/scripts/plan-regression-shards.mjs --pretty
+          echo "matrix=$(node packages/producer/scripts/plan-regression-shards.mjs $NIGHTLY)" >> "$GITHUB_OUTPUT"
+          node packages/producer/scripts/plan-regression-shards.mjs $NIGHTLY --pretty
 
   preflight:
     name: Preflight (lint + format)
@@ -63,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/preflight
 
   regression-shards:
@@ -79,7 +117,7 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     steps:
       - name: Checkout (with LFS)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
 
@@ -99,6 +137,12 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # Docker Hub rate-limits anonymous pulls from shared runners; pull through Google's mirror.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - name: Build test Docker image (cached)
         # Normal duration is ~3 min; a bun install that errors and hangs
@@ -112,10 +156,9 @@ jobs:
           load: true
           tags: hyperframes-producer:test
           cache-from: type=gha,scope=regression-test-image
-          # PR matrices can fan out across many stacked branches at once. Let
-          # them consume the shared cache, but keep a single writer on main so
-          # concurrent exports cannot exhaust the Actions cache service.
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=regression-test-image' || '' }}
+          # One writer: the first shard of a main push. Every shard rebuilds the same layers with
+          # different digests, so each export added ~1.3 GB and evicted the rest of the 10 GB cache.
+          cache-to: ${{ github.event_name == 'push' && strategy.job-index == 0 && 'type=gha,mode=max,scope=regression-test-image' || '' }}
 
       - name: "Run regression shard: ${{ matrix.shard }} (${{ matrix.mode }})"
         run: |
@@ -123,6 +166,7 @@ jobs:
           echo "Mode:  ${{ matrix.mode }}"
           echo "Args:  ${{ matrix.args }}"
           docker run --rm \
+            -e HYPERFRAMES_NO_TELEMETRY=1 \
             --security-opt seccomp=unconfined \
             --shm-size=4g \
             -v ${{ github.workspace }}/packages/producer/tests:/app/packages/producer/tests \
@@ -145,12 +189,23 @@ jobs:
     if: always()
     steps:
       - name: Check results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          SHARDS_RESULT: ${{ needs.regression-shards.result }}
         run: |
-          if [ "${{ needs.changes.outputs.code }}" != "true" ]; then
-            echo "No code changes — skipping regression (auto-pass)"
-            exit 0
-          fi
-          if [ "${{ needs.regression-shards.result }}" != "success" ]; then
-            echo "One or more regression shards failed"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::Change detection did not succeed."
             exit 1
           fi
+          case "$CODE_CHANGED" in
+            false) echo "No regression code changes." ;;
+            true)
+              if [ "$SHARDS_RESULT" != "success" ]; then
+                echo "::error::Regression shards did not succeed."
+                exit 1
+              fi
+              echo "All regression shards succeeded."
+              ;;
+            *) echo "::error::Change detection returned no valid decision."; exit 1 ;;
+          esac

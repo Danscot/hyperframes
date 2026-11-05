@@ -1,20 +1,36 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mockTelemetry } from "./cliDispatchTestUtils.js";
 
 const originalArgv = [...process.argv];
 const originalExitCode = process.exitCode;
 
-afterEach(() => {
+// The first import of the CLI's module graph is slow on a cold Windows runner; pay it here, not in a test.
+beforeAll(async () => {
+  await Promise.all([
+    import("citty"),
+    import("@hyperframes/core/figma"),
+    import("./telemetry/client.js"),
+    import("./utils/command-failure-tracking.js"),
+    import("./utils/project.js"),
+    import("./utils/render-success-state.js"),
+  ]);
+}, 120_000);
+
+afterEach(async () => {
   process.argv = [...originalArgv];
   process.exitCode = originalExitCode;
-  vi.doUnmock("./commands/init.js");
-  vi.doUnmock("./telemetry/events.js");
-  vi.doUnmock("./telemetry/index.js");
+  // The CLI starts background imports it never awaits; one still loading when the registry resets
+  // splits a module in two, and the next test's error class no longer matches its own.
+  await vi.dynamicImportSettled();
+  for (const path of MOCKED_MODULES) vi.doUnmock(path);
   vi.resetModules();
 });
 
 describe("CLI lifecycle", () => {
-  it("queues a command failure before finalizing telemetry", async () => {
+  it("queues a command failure before exit, without waiting on a network flush", async () => {
     let resolveEvents!: (events: {
       trackCommandFailure: (command: string, error: unknown) => void;
     }) => void;
@@ -37,10 +53,9 @@ describe("CLI lifecycle", () => {
       },
     }));
     vi.doMock("./telemetry/index.js", () => ({
-      flush: async () => {
-        order.push("flush");
-      },
-      flushSync: vi.fn(),
+      // Never settles: a finalize that awaited it would hang this test.
+      flush: () => new Promise<void>(() => {}),
+      flushSync: () => order.push("flushSync"),
       incrementCommandCount: vi.fn(),
       showTelemetryNotice: vi.fn(),
       shouldTrack: () => false,
@@ -65,8 +80,95 @@ describe("CLI lifecycle", () => {
       },
     });
     await execution;
+    process.emit("exit", 0);
 
-    expect(order).toEqual(["cli_error", "flush"]);
+    expect(order).toEqual(["cli_error", "flushSync"]);
+  });
+
+  describe("reports each failure once, by its real error", () => {
+    const dirs: string[] = [];
+    afterEach(() => {
+      for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    });
+    const outsideProject = () => {
+      const dir = mkdtempSync(join(tmpdir(), "hf-cli-once-"));
+      dirs.push(dir);
+      return dir;
+    };
+
+    it("when the failure reaches the top-level handler", async () => {
+      const dir = outsideProject();
+      mockInitCommand(async () => {
+        const { resolveProject } = await import("./utils/project.js");
+        resolveProject(dir);
+      });
+      const sent = await runCli(["init", "--json"]);
+
+      expect(sent).toEqual([expect.objectContaining({ error_name: "InvalidProjectError" })]);
+    });
+
+    it("when the command catches the failure itself", async () => {
+      const sent = await runCli(["lint", outsideProject(), "--json"]);
+
+      expect(sent).toEqual([
+        expect.objectContaining({ error_name: "InvalidProjectError", command: "lint" }),
+      ]);
+    });
+
+    it("when the command rethrows the failure as its own", async () => {
+      const sent = await runCli([
+        "normalize-audio",
+        outsideProject(),
+        "--reference",
+        "a",
+        "--target",
+        "b",
+        "--json",
+      ]);
+
+      expect(sent).toEqual([expect.objectContaining({ error_name: "InvalidProjectError" })]);
+    });
+
+    it("when a figma command reports its error code", async () => {
+      mockInitCommand(async () => {
+        const { withFigmaErrors } = await import("./commands/figma/cliError.js");
+        const { FigmaClientError } = await import("@hyperframes/core/figma");
+        await withFigmaErrors("figma:asset", async () => {
+          throw new FigmaClientError("NO_TOKEN", "No Figma token");
+        });
+      });
+      const sent = await runCli(["init", "--json"]);
+
+      expect(sent).toEqual([
+        expect.objectContaining({ error_name: "NO_TOKEN", command: "figma:asset" }),
+      ]);
+    });
+  });
+
+  it("runs `open` for a bare project folder, and keeps `render` a command", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-cli-shortcut-"));
+    const run = vi.fn();
+    try {
+      for (const [name, argv] of [
+        ["open", [dir]],
+        ["open", ["--verbose", dir]],
+        ["render", ["render"]],
+      ] as const) {
+        vi.doMock(`./commands/${name}.js`, () => ({
+          default: { meta: { name }, args: { dir: { type: "positional", required: false } }, run },
+        }));
+        mockTelemetry();
+        process.argv = ["node", "cli.ts", ...argv];
+        await import("./cli.js");
+        await vi.dynamicImportSettled();
+        vi.doUnmock(`./commands/${name}.js`);
+        vi.resetModules();
+      }
+      expect(run.mock.calls.map(([ctx]) => ctx.rawArgs)).toEqual([[dir], [dir], []]);
+      expect(process.argv.slice(2)).toEqual(["render"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("hands queued events to flushSync even after finalizeCli has run", async () => {
@@ -195,6 +297,53 @@ describe("CLI lifecycle", () => {
     }
   });
 
+  it("keeps exit 0 when a late rejection follows a command that already delivered", async () => {
+    // check and snapshot close Chrome after printing; on Windows that teardown can reject.
+    const trackCommandResult = vi.fn();
+    const priorListeners = process.listeners("unhandledRejection");
+    process.removeAllListeners("unhandledRejection");
+    try {
+      mockInitCommand(() => {});
+      mockTelemetry({ trackCommandResult });
+
+      process.argv = ["node", "cli.ts", "init", "--json"];
+      await import("./cli.js");
+      expect(process.exitCode).toBe(0);
+
+      process.emit("unhandledRejection", new Error("late browser teardown"), Promise.resolve());
+
+      expect(process.exitCode).toBe(0);
+      expect(trackCommandResult).toHaveBeenCalledWith(
+        expect.objectContaining({ success: true, exitCode: 0 }),
+      );
+    } finally {
+      process.removeAllListeners("unhandledRejection");
+      for (const listener of priorListeners) process.on("unhandledRejection", listener);
+    }
+  });
+
+  it("exits 0 when a late uncaught exception follows a command that already delivered", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const priorListeners = process.listeners("uncaughtException");
+    process.removeAllListeners("uncaughtException");
+    try {
+      mockInitCommand(() => {});
+      mockTelemetry({ trackCommandResult: vi.fn() });
+
+      process.argv = ["node", "cli.ts", "init", "--json"];
+      await import("./cli.js");
+      exitSpy.mockClear();
+
+      process.emit("uncaughtException", new Error("late child teardown"));
+
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      process.removeAllListeners("uncaughtException");
+      for (const listener of priorListeners) process.on("uncaughtException", listener);
+      exitSpy.mockRestore();
+    }
+  });
+
   it("still exits non-zero when a command throws and no render ever validated", async () => {
     // The guard on the sanitizer above: it must key off a validated artifact,
     // not merely off the command having finished. Without this, every caught
@@ -217,7 +366,7 @@ describe("CLI lifecycle", () => {
     }
   });
 
-  it("still scores an EPIPE before the artifact is validated as a failure", async () => {
+  it("exits 1 and scores a failure when the pipe closes before the run delivered", async () => {
     const trackCommandResult = vi.fn();
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
     try {
@@ -227,15 +376,101 @@ describe("CLI lifecycle", () => {
       process.argv = ["node", "cli.ts", "init", "--json"];
       await import("./cli.js");
 
-      expect(exitSpy).toHaveBeenCalledWith(0);
+      // `hyperframes render … | head -1` on a refused render exited 0 (CLI 0.9.11)
+      expect(exitSpy).toHaveBeenCalledWith(1);
       expect(trackCommandResult).toHaveBeenCalledWith(expect.objectContaining({ success: false }));
     } finally {
       exitSpy.mockRestore();
     }
   });
+
+  it("starts the background checks in a child and reads only the caches itself", async () => {
+    const launchBackgroundChecks = vi.fn();
+    const checkForUpdate = vi.fn();
+    mockInitCommand(vi.fn());
+    mockTelemetry();
+    vi.doMock("./utils/autoUpdate.js", () => ({
+      reportCompletedUpdate: vi.fn(),
+      scheduleBackgroundInstall: vi.fn(),
+    }));
+    vi.doMock("./utils/updateCheck.js", () => ({
+      cachedUpdateCheck: () => ({ current: "1.0.0", latest: "1.0.0", updateAvailable: false }),
+      checkForUpdate,
+      printUpdateNotice: vi.fn(),
+      printStalePinNotice: vi.fn(),
+    }));
+    vi.doMock("./utils/skillsUpdateCheck.js", () => ({ printSkillsUpdateNotice: vi.fn() }));
+    vi.doMock("./utils/backgroundChecks.js", () => ({ launchBackgroundChecks }));
+
+    process.argv = ["node", "cli.ts", "init"];
+    await import("./cli.js");
+
+    await vi.waitFor(() => expect(launchBackgroundChecks).toHaveBeenCalledTimes(1));
+    expect(checkForUpdate).not.toHaveBeenCalled();
+  });
 });
 
-function mockInitCommand(run: () => void): void {
+describe("stale-skills notice under --json", () => {
+  it("prints on a --json run while the self-update notices stay off", async () => {
+    const printSkillsUpdateNotice = vi.fn();
+    const printUpdateNotice = vi.fn();
+    mockInitCommand(vi.fn());
+    mockTelemetry();
+    vi.doMock("./utils/autoUpdate.js", () => ({
+      reportCompletedUpdate: vi.fn(),
+      scheduleBackgroundInstall: vi.fn(),
+    }));
+    vi.doMock("./utils/updateCheck.js", () => ({
+      cachedUpdateCheck: () => ({ current: "1.0.0", latest: "1.0.0", updateAvailable: false }),
+      printUpdateNotice,
+      printStalePinNotice: vi.fn(),
+    }));
+    vi.doMock("./utils/skillsUpdateCheck.js", () => ({ printSkillsUpdateNotice }));
+    vi.doMock("./utils/backgroundChecks.js", () => ({ launchBackgroundChecks: vi.fn() }));
+
+    process.argv = ["node", "cli.ts", "init", "--json"];
+    await import("./cli.js");
+
+    await vi.waitFor(() => expect(printSkillsUpdateNotice).toHaveBeenCalledTimes(1));
+    expect(printUpdateNotice).not.toHaveBeenCalled();
+  });
+});
+
+const MOCKED_MODULES = [
+  "./commands/init.js",
+  "./telemetry/events.js",
+  "./telemetry/index.js",
+  "./telemetry/client.js",
+  "./utils/autoUpdate.js",
+  "./utils/updateCheck.js",
+  "./utils/skillsUpdateCheck.js",
+  "./utils/backgroundChecks.js",
+];
+
+/** Runs the CLI with the real failure reporting and returns the cli_error events it sent. */
+async function runCli(args: string[]): Promise<Record<string, unknown>[]> {
+  const sent: Record<string, unknown>[] = [];
+  mockTelemetry();
+  vi.doUnmock("./telemetry/events.js");
+  vi.doMock("./telemetry/client.js", async () => ({
+    ...(await vi.importActual<typeof import("./telemetry/client.js")>("./telemetry/client.js")),
+    trackEvent: (event: string, props: Record<string, unknown>) => {
+      if (event === "cli_error") sent.push(props);
+    },
+  }));
+  const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  try {
+    process.argv = ["node", "cli.ts", ...args];
+    await import("./cli.js");
+  } finally {
+    errorSpy.mockRestore();
+    logSpy.mockRestore();
+  }
+  return sent;
+}
+
+function mockInitCommand(run: () => void | Promise<void>): void {
   vi.doMock("./commands/init.js", () => ({
     default: {
       meta: { name: "init" },

@@ -1,4 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { readFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // CI exports HYPERFRAMES_NO_TELEMETRY=1 (and users may set DO_NOT_TRACK), which
 // makes shouldTrack() short-circuit — and it caches that decision for the module's
@@ -7,8 +10,15 @@ vi.stubEnv("HYPERFRAMES_NO_TELEMETRY", "");
 vi.stubEnv("DO_NOT_TRACK", "");
 
 // Pin config so the queue never touches disk and telemetry is enabled.
+const configRead = vi.hoisted(() => ({ failOnce: false }));
 vi.mock("./config.js", () => ({
-  readConfig: () => ({ anonymousId: "anon-test-123", telemetryEnabled: true }),
+  readConfig: () => {
+    if (configRead.failOnce) {
+      configRead.failOnce = false;
+      throw new Error("EACCES");
+    }
+    return { anonymousId: "anon-test-123", telemetryEnabled: true };
+  },
   writeConfig: () => {},
   getIdentityPersistence: () => "durable",
   getIdentityWriteOutcome: () => undefined,
@@ -17,6 +27,14 @@ vi.mock("./config.js", () => ({
 // shouldTrack() short-circuits in dev mode — force production behavior.
 vi.mock("../utils/env.js", () => ({
   isDevMode: () => false,
+}));
+
+const dns = vi.hoisted(() => ({ answers: true, probes: 0 }));
+vi.mock("../utils/hostAnswers.js", () => ({
+  hostAnswers: async () => {
+    dns.probes++;
+    return dns.answers;
+  },
 }));
 
 // Canary enrolment is registry-driven and will change as rollouts ramp; stub
@@ -30,6 +48,9 @@ vi.mock("./canary.js", () => ({
   canaryEventProperties: () => canaryProps(),
 }));
 
+const signedIn = vi.hoisted(() => ({ username: undefined as string | undefined }));
+vi.mock("./signedInUser.js", () => ({ signedInHeygenUsername: () => signedIn.username }));
+
 // Intercept the exit-time child process so flushSync delivery is assertable.
 const spawnMock = vi.fn(() => ({ unref: vi.fn() }));
 vi.mock("node:child_process", () => ({
@@ -39,7 +60,7 @@ vi.mock("node:child_process", () => ({
 const { trackEvent, flush, flushSync } = await import("./client.js");
 const system = await import("./system.js");
 
-type Batch = { uuid: string; event: string }[];
+type Batch = { uuid: string; event: string; properties: Record<string, unknown> }[];
 
 function sentBatch(fetchMock: ReturnType<typeof vi.fn>, call = 0): Batch {
   const init = fetchMock.mock.calls[call]?.[1] as { body: string } | undefined;
@@ -67,6 +88,7 @@ describe("telemetry queue delivery", () => {
     );
     await flush();
     vi.unstubAllGlobals();
+    dns.probes = 0;
   });
 
   it("delivers harness context alongside a recognized agent without leaking marker values", async () => {
@@ -88,6 +110,44 @@ describe("telemetry queue delivery", () => {
     } finally {
       meta.mockRestore();
     }
+  });
+
+  it("tags every event, feedback and catalog misses included, with the launching app", async () => {
+    const meta = vi.spyOn(system, "getSystemMeta").mockReturnValue({
+      ...system.getSystemMeta(),
+      client: "example-app/1.2.3/stable",
+    });
+    try {
+      const fetchMock = vi.fn(() => Promise.resolve(new Response("")));
+      vi.stubGlobal("fetch", fetchMock);
+      const { trackRenderFeedback, trackCatalogSearchMiss } = await import("./events.js");
+      trackEvent("cli_command", { command: "lint" });
+      trackRenderFeedback({ rating: 9 });
+      trackCatalogSearchMiss({ query: "confetti" });
+      await flush();
+      expect(sentBatch(fetchMock).map((e) => [e.event, e.properties.client])).toEqual([
+        ["cli_command", "example-app/1.2.3/stable"],
+        ["cli_render_feedback", "example-app/1.2.3/stable"],
+        ["cli_catalog_search_miss", "example-app/1.2.3/stable"],
+      ]);
+    } finally {
+      meta.mockRestore();
+    }
+  });
+
+  it("keeps events queued for the exit-time send when DNS does not answer", async () => {
+    dns.answers = false;
+    const fetchMock = vi.fn(() => Promise.resolve(new Response("")));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      trackEvent("render_complete", { quality: "draft" });
+      await flush();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      dns.answers = true;
+    }
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("forgets events only after the request completes, and stamps each with a uuid", async () => {
@@ -132,6 +192,76 @@ describe("telemetry queue delivery", () => {
     expect(succeeding).toHaveBeenCalledTimes(1);
   });
 
+  it("sends each event once when two flushes overlap", async () => {
+    const pending: Array<(r: Response) => void> = [];
+    const gated = vi.fn(() => new Promise<Response>((res) => pending.push(res)));
+    vi.stubGlobal("fetch", gated);
+
+    trackEvent("render_complete", { quality: "draft" });
+    const eager = flush();
+    const final = flush();
+    await vi.waitFor(() => expect(gated).toHaveBeenCalled());
+    for (const res of pending.splice(0)) res(new Response(""));
+    await Promise.all([eager, final]);
+    expect(gated).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["the send failed", () => {}, 1],
+    ["DNS did not answer", () => (dns.answers = false), 0],
+  ])("leaves the batch to the exit-time send when, ahead of it, %s", async (_, arrange, sends) => {
+    const fetchMock = vi.fn(() => Promise.reject(new Error("offline")));
+    vi.stubGlobal("fetch", fetchMock);
+    trackEvent("render_complete", { quality: "draft" });
+    arrange();
+    try {
+      await Promise.all([flush(), flush()]);
+    } finally {
+      dns.answers = true;
+    }
+    // One attempt, whichever way it failed.
+    expect(dns.probes).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(sends);
+    // Still queued: the next send carries it.
+    const succeeding = vi.fn(() => Promise.resolve(new Response("")));
+    vi.stubGlobal("fetch", succeeding);
+    await flush();
+    expect(sentBatch(succeeding).map((e) => e.event)).toEqual(["render_complete"]);
+  });
+
+  it("still sends from a flush queued behind one that had nothing to send", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response("")));
+    vi.stubGlobal("fetch", fetchMock);
+    const empty = flush();
+    trackEvent("render_complete", { quality: "draft" });
+    await Promise.all([empty, flush()]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the reply it never reads, so a stalled body cannot hold the process", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream({ cancel });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response(body))),
+    );
+    trackEvent("render_complete", { quality: "draft" });
+    await flush();
+    expect(cancel).toHaveBeenCalled();
+  });
+
+  it("still sends from a flush queued behind one that threw", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response("")));
+    vi.stubGlobal("fetch", fetchMock);
+    trackEvent("render_complete", { quality: "draft" });
+    configRead.failOnce = true;
+    const first = flush();
+    const second = flush();
+    await expect(first).rejects.toThrow("EACCES");
+    await second;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("does not drop events queued while a flush is in flight", async () => {
     let resolveFetch: (r: Response) => void = () => {};
     const gated = vi.fn(() => new Promise<Response>((res) => (resolveFetch = res)));
@@ -140,6 +270,7 @@ describe("telemetry queue delivery", () => {
     trackEvent("render_complete", { quality: "draft" });
     const inFlight = flush();
     trackEvent("cli_command_result", { command: "render" });
+    await vi.waitFor(() => expect(gated).toHaveBeenCalled());
     resolveFetch(new Response(""));
     await inFlight;
 
@@ -152,29 +283,74 @@ describe("telemetry queue delivery", () => {
     expect(batch[0]?.event).toBe("cli_command_result");
   });
 
-  it("flushSync hands the queue to a detached child that carries the payload", async () => {
+  it("flushSync hands the queue to a detached child that reads the payload from a file", async () => {
     spawnMock.mockClear();
     trackEvent("render_complete", { quality: "draft" });
     flushSync();
 
-    // The child was spawned detached with the batch inlined into its -e script.
     expect(spawnMock).toHaveBeenCalledTimes(1);
     const [execPath, args, opts] = spawnMock.mock.calls[0] as unknown as [
       string,
       string[],
-      { detached: boolean },
+      Record<string, unknown>,
     ];
     expect(execPath).toBe(process.execPath);
     expect(args[0]).toBe("-e");
-    expect(args[1]).toContain("render_complete");
-    expect(args[1]).toMatch(/[0-9a-f-]{36}/); // event uuid rides along
-    expect(opts.detached).toBe(true);
+    const body = readFileSync(args[2] as string, "utf8");
+    expect(body).toContain("render_complete");
+    expect(body).toMatch(/[0-9a-f-]{36}/); // event uuid rides along
+    expect(opts).toMatchObject({ detached: true, windowsHide: true });
+    unlinkSync(args[2] as string);
 
     // Queue handed to the child — nothing left for a regular flush.
     const fetchMock = vi.fn(() => Promise.resolve(new Response("")));
     vi.stubGlobal("fetch", fetchMock);
     await flush();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("flushSync keeps a batch over the Windows 32,767-char command-line limit off the command line", () => {
+    spawnMock.mockClear();
+    for (let i = 0; i < 40; i += 1) trackEvent("render_observation", { note: "x".repeat(1_000) });
+    flushSync();
+
+    const [, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+    const body = readFileSync(args[2] as string, "utf8");
+    unlinkSync(args[2] as string);
+    expect(body.length).toBeGreaterThan(32_767);
+    expect(args.join(" ").length).toBeLessThan(32_767);
+  });
+
+  it("flushSync stays silent when the child cannot be started", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    spawnMock.mockImplementationOnce(() => {
+      throw new Error("spawn failed");
+    });
+    trackEvent("render_complete", { quality: "draft" });
+    expect(() => flushSync()).not.toThrow();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("flushSync stays silent when the scratch folder cannot be written", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const missing = join(tmpdir(), `hf-no-such-scratch-${process.pid}`);
+    const names = ["TMPDIR", "TEMP", "TMP"];
+    const before = names.map((name) => process.env[name]);
+    for (const name of names) vi.stubEnv(name, missing);
+    spawnMock.mockClear();
+    trackEvent("render_complete", { quality: "draft" });
+    try {
+      expect(() => flushSync()).not.toThrow();
+    } finally {
+      names.forEach((name, i) => vi.stubEnv(name, before[i]));
+    }
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    warn.mockRestore();
+    error.mockRestore();
   });
 });
 
@@ -208,5 +384,42 @@ describe("canary cohort on every event", () => {
     expect(Object.keys(eventProps(fetchMock)).some((k) => k.startsWith("$feature/canary-"))).toBe(
       false,
     );
+  });
+});
+
+describe("signed-in HeyGen account on every event", () => {
+  const firstEvent = (fetchMock: ReturnType<typeof vi.fn>) => {
+    const init = fetchMock.mock.calls[0]?.[1] as { body: string };
+    return (
+      JSON.parse(init.body) as {
+        batch: Array<{ distinct_id: string; properties: Record<string, unknown> }>;
+      }
+    ).batch[0]!;
+  };
+
+  it("keys signed-in events on the account id and carries heygen_username", async () => {
+    signedIn.username = "alice";
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
+    vi.stubGlobal("fetch", fetchMock);
+
+    trackEvent("cli_command", { command: "render" });
+    await flush();
+
+    const event = firstEvent(fetchMock);
+    expect(event.distinct_id).toBe("2bd806c9-7f0e-50af-9a1f-c3328fa763a9");
+    expect(event.properties.heygen_username).toBe("alice");
+  });
+
+  it("goes back to the install id once signed out", async () => {
+    signedIn.username = undefined;
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
+    vi.stubGlobal("fetch", fetchMock);
+
+    trackEvent("cli_command", { command: "render" });
+    await flush();
+
+    const event = firstEvent(fetchMock);
+    expect(event.distinct_id).not.toBe("2bd806c9-7f0e-50af-9a1f-c3328fa763a9");
+    expect(event.properties.heygen_username).toBeUndefined();
   });
 });

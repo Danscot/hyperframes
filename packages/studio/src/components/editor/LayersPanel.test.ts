@@ -9,6 +9,7 @@ import type { DomEditLayerItem } from "./domEditingTypes";
 import { createRafThrottle, LayersPanel, sortLayersByZIndex } from "./LayersPanel";
 import { isLayerDraggable } from "./useLayerDrag";
 import { liveTime } from "../../player";
+import { announcePreviewDocumentLoaded, sceneSwapFor } from "../../player/sceneSwap";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -20,12 +21,12 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../contexts/StudioContext", () => ({
-  useStudioShellContext: () => ({
+  useStudioShellContextOptional: () => ({
     previewIframeRef: mocks.previewIframeRef,
     activeCompPath: "index.html",
     showToast: mocks.showToast,
   }),
-  useStudioPlaybackContext: () => ({
+  useStudioPlaybackContextOptional: () => ({
     refreshKey: 0,
     compositionLoading: true,
     timelineElements: [],
@@ -283,13 +284,51 @@ describe("LayersPanel preview promotion", () => {
     mocks.collect.mockClear();
 
     act(() => {
-      a.dispatchEvent(new Event("load"));
+      announcePreviewDocumentLoaded(a);
     });
     expect(mocks.collect).not.toHaveBeenCalled();
 
     act(() => {
-      b.dispatchEvent(new Event("load"));
+      announcePreviewDocumentLoaded(b);
     });
     expect(collectedRootIds()).toEqual(["b"]);
+  });
+  it("recollects layers when edited scenes are swapped into the live document", async () => {
+    const a = makeIframe("a");
+    Object.defineProperty(a, "contentWindow", { value: { __hfSwapScenes: async () => {} } });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<html></html>"));
+    mocks.previewIframeRef.current = a;
+    usePreviewIframeStore.setState({ iframe: a });
+    act(() => root.render(createElement(LayersPanel)));
+    mocks.collect.mockClear();
+
+    await act(() => sceneSwapFor(a)!("/preview", () => true));
+    expect(collectedRootIds()).toEqual(["a"]);
+    fetchSpy.mockRestore();
+  });
+
+  it("a row press starts no text selection, so dragging a row leaves no letters highlighted", () => {
+    const doc = new Window().document;
+    doc.body.innerHTML = `<div data-composition-id="a"><div id="back"></div><div id="front"></div></div>`;
+    const iframe = document.createElement("iframe");
+    Object.defineProperty(iframe, "contentDocument", { value: doc });
+    const item = (id: string) =>
+      ({
+        key: id,
+        element: doc.getElementById(id),
+        label: id,
+        depth: 0,
+        childCount: 0,
+        id,
+      }) as unknown as DomEditLayerItem;
+    mocks.collect.mockReset().mockReturnValue([item("back"), item("front")]);
+    mocks.previewIframeRef.current = iframe;
+    usePreviewIframeStore.setState({ iframe });
+    act(() => root.render(createElement(LayersPanel)));
+    act(() => void announcePreviewDocumentLoaded(iframe));
+
+    const rows = [...host.querySelectorAll("[data-layer-index]")];
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.closest(".select-none"))).toBe(true);
   });
 });

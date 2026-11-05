@@ -423,7 +423,7 @@ export function ColorGradingControls({
                   void actions
                     .importLut(files, onImportAssets, () => track("button", "Import LUT"))
                     .catch(() =>
-                      setLutImportError("LUT import failed — check the .cube file and try again."),
+                      setLutImportError("LUT import failed. Check the .cube file and try again."),
                     )
                     .finally(() => setLutImporting(false));
                   event.currentTarget.value = "";
@@ -431,7 +431,7 @@ export function ColorGradingControls({
               />
             </div>
             {lutImportError && (
-              <div className="text-[10px] text-red-400" role="alert">
+              <div className="text-[10px] text-danger-ink" role="alert">
                 {lutImportError}
               </div>
             )}

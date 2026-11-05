@@ -1,5 +1,7 @@
 import type { CanvasResolution } from "@hyperframes/parsers";
 import type { RegistryItem } from "@hyperframes/core";
+import type { BundleOptions } from "@hyperframes/core/compiler";
+import type { ProjectHistory } from "./history/projectHistory.js";
 
 /** Resolved info about a single project. */
 export interface ResolvedProject {
@@ -17,6 +19,7 @@ export interface RenderJobState {
   stage?: string;
   outputPath: string;
   error?: string;
+  audioLoweredDb?: number;
   /**
    * Optional abort hook set by the adapter. The cancel route calls this to
    * stop an in-flight render; adapters that can't abort may omit it (the
@@ -106,16 +109,28 @@ export interface StudioApiAdapter {
   /** Resolve a project ID (or session ID) to its directory. Returns null if not found. */
   resolveProject(id: string): Promise<ResolvedProject | null> | ResolvedProject | null;
 
-  /** Bundle a project directory into a single HTML string. Returns null if unavailable. */
-  bundle(projectDir: string): Promise<string | null>;
+  /**
+   * Optional: the project's current history. A history refuses every call once its folder is replaced (a
+   * deleted `.hyperframes`, a new project there), so keep them in `historyCache`, which reopens. Else routes 404.
+   */
+  history?: (project: ResolvedProject) => Promise<ProjectHistory | null> | ProjectHistory | null;
 
-  /** Optional: cached signature for project files that should invalidate preview frame caches. */
-  getProjectSignature?: (projectDir: string) => string;
+  /** Bundle a project directory into a single HTML string, forwarding `options` over the host's own. */
+  bundle(
+    projectDir: string,
+    options?: Pick<BundleOptions, "stampHfIds" | "onRead">,
+  ): Promise<string | null>;
+
+  /** Optional: a cached `createProjectSignature(dir)`; preview caching checks builds against it. */
+  getProjectSignature?: (projectDir: string) => string | Promise<string>;
+  invalidateProjectSignature?: (projectDir: string) => void;
+
+  loadSharp?: () => Promise<typeof import("sharp").default>;
 
   /** Lint a single HTML string. */
   lint(
     html: string,
-    opts?: { filePath?: string; isSubComposition?: boolean },
+    opts?: { filePath?: string; isSubComposition?: boolean; compSrcPath?: string },
   ): Promise<LintResult> | LintResult;
 
   /**
@@ -127,6 +142,8 @@ export interface StudioApiAdapter {
 
   /** URL to the hyperframe runtime JS (injected into preview HTML). */
   runtimeUrl: string;
+
+  gsapLocalRoot?: `/${string}`;
 
   /**
    * Optional: post-process preview HTML before Studio augments it.
@@ -148,7 +165,7 @@ export interface StudioApiAdapter {
   startRender(opts: {
     project: ResolvedProject;
     outputPath: string;
-    format: "mp4" | "webm" | "mov";
+    format: "mp4" | "webm" | "mov" | "gif";
     /**
      * Frame rate as an exact rational. The HTTP layer (POST
      * `/projects/:id/render`) accepts either a JSON number (integer fps,
@@ -158,6 +175,15 @@ export interface StudioApiAdapter {
      */
     fps: import("@hyperframes/core").Fps;
     quality: string;
+    gifLoop?: number;
+    crf?: number;
+    videoBitrate?: string;
+    keyframeIntervalSeconds?: number;
+    maxBitrate?: string;
+    bufferSize?: string;
+    videoFrameFormat?: "auto" | "jpg" | "png";
+    hdrMode?: "auto" | "force-hdr" | "force-sdr";
+    proresProfile?: "4444" | "hq" | "422" | "lt" | "proxy";
     jobId: string;
     /**
      * The triggering browser profile has telemetry disabled (localStorage
@@ -166,6 +192,7 @@ export interface StudioApiAdapter {
      * for a user who had opted out, under the CLI's own policy.
      */
     telemetryOptOut?: boolean;
+    pageMotionBlur?: "off";
     /**
      * Optional output resolution preset. See `resolveDeviceScaleFactor` in
      * the producer for the integer-scale + aspect + HDR constraints.
@@ -179,6 +206,7 @@ export interface StudioApiAdapter {
      * the same channel `hyperframes render --variables` uses.
      */
     variables?: Record<string, unknown>;
+    useGpu?: boolean;
     /**
      * Telemetry id of the browser user who triggered the render. Lets the
      * adapter attribute the server-emitted render_complete/render_error to

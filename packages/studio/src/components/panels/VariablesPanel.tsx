@@ -5,7 +5,6 @@ import type {
   VariableUsageReport,
   VariableValidationIssue,
 } from "@hyperframes/sdk";
-import type { EditHistoryKind } from "../../utils/editHistory";
 import type { PublishSdkSession } from "../../utils/sdkCutover";
 import { useStudioPlaybackContext, useStudioShellContext } from "../../contexts/StudioContext";
 import { useDomEditContext } from "../../contexts/DomEditContext";
@@ -37,7 +36,6 @@ export interface StudioEditPersistenceProps {
   reloadPreview: () => void;
   recordEdit: (entry: {
     label: string;
-    kind: EditHistoryKind;
     files: Record<string, { before: string; after: string }>;
   }) => Promise<void>;
 }
@@ -58,9 +56,9 @@ function formatIssue(issue: VariableValidationIssue): string {
 function ValidationStrip({ issues }: { issues: VariableValidationIssue[] }) {
   if (issues.length === 0) return null;
   return (
-    <div className="space-y-1 rounded-lg border border-red-900/60 bg-red-950/30 p-2">
+    <div className="space-y-1 rounded-lg border border-danger/40 bg-danger/15 p-2">
       {issues.map((issue) => (
-        <p key={`${issue.kind}:${issue.variableId}`} className="text-[10px] text-red-300">
+        <p key={`${issue.kind}:${issue.variableId}`} className="text-[10px] text-danger-ink">
           {formatIssue(issue)}
         </p>
       ))}
@@ -101,7 +99,7 @@ function VariableRow({
         </span>
         {unused && (
           <span
-            className="rounded-sm bg-amber-900/40 px-1 py-px text-[8px] text-amber-400"
+            className="rounded-sm bg-amber-500/15 px-1 py-px text-[8px] text-warning-ink"
             title="No script reads this variable"
           >
             unused
@@ -177,9 +175,7 @@ function PreviewModeHeader({
         <span className="text-[11px] font-semibold text-neutral-200">Variables</span>
         <span
           className={`rounded-full px-2 py-0.5 text-[9px] font-medium ${
-            hasOverrides
-              ? "bg-studio-accent/20 text-studio-accent"
-              : "bg-neutral-800 text-neutral-500"
+            hasOverrides ? "bg-studio-accent/20 text-accent-ink" : "bg-neutral-800 text-neutral-500"
           }`}
         >
           {hasOverrides ? `Previewing ${overrideCount} custom` : "Previewing defaults"}
@@ -239,7 +235,7 @@ function HandoffFooter({
 
 const EMPTY_STATE = (
   <p className="text-[10px] leading-relaxed text-neutral-500">
-    No variables declared. Variables make parts of this composition dynamic — declare them here (or
+    No variables declared. Variables make parts of this composition dynamic. Declare them here (or
     in <code className="font-mono">data-composition-variables</code>), read them with{" "}
     <code className="font-mono">getVariables()</code>, and pass values at render time with{" "}
     <code className="font-mono">--variables</code>.
@@ -256,7 +252,7 @@ export const VariablesPanel = memo(function VariablesPanel({
 }: VariablesPanelProps) {
   const { activeCompPath, showToast } = useStudioShellContext();
   const { refreshKey } = useStudioPlaybackContext();
-  const { readProjectFile, writeProjectFile, fileTree, compositions } = useFileManagerContext();
+  const { readProjectFile, writeProjectFile, compositions } = useFileManagerContext();
   const { domEditSelection } = useDomEditContext();
   // Master view (no activeCompPath) targets the real main composition, not a
   // hardcoded index.html — used for both the persist write target and the
@@ -441,7 +437,7 @@ export const VariablesPanel = memo(function VariablesPanel({
       const wanted = action.declaration(id).type;
       if (existing && existing.type !== wanted) {
         showToast(
-          `"${id}" is already a ${existing.type} variable — pick another id for this ${wanted} binding`,
+          `"${id}" is already a ${existing.type} variable. Pick another id for this ${wanted} binding`,
           "error",
         );
         return;
@@ -512,7 +508,7 @@ export const VariablesPanel = memo(function VariablesPanel({
         />
         {usage?.scanIncomplete && (
           <p className="text-[9px] text-neutral-600">
-            Scripts access variables dynamically — usage info may be incomplete.
+            Scripts access variables dynamically, so usage info may be incomplete.
           </p>
         )}
         {declarations.length > 0 && (
@@ -539,8 +535,8 @@ export const VariablesPanel = memo(function VariablesPanel({
           </button>
         )}
         <VariablesOtherCompositions
-          fileTree={fileTree}
-          excludePath={activeCompPath ?? "index.html"}
+          compositionPaths={compositions}
+          excludePath={effectiveCompPath}
           refreshKey={`${refreshKey}:${revision}`}
           readProjectFile={readProjectFile}
           writeProjectFile={writeProjectFile}

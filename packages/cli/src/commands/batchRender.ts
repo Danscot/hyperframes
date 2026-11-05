@@ -1,5 +1,7 @@
 import { failCommand } from "../utils/commandResult.js";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
+import { makeOutputFolder } from "../utils/outputFolder.js";
+import { readJsonFileText } from "../utils/jsonFlag.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { c } from "../ui/colors.js";
 import { errorBox } from "../ui/format.js";
@@ -241,7 +243,7 @@ function reportBatchVariableIssues(
 
 export function prepareBatchRender(options: PrepareBatchRenderOptions): PreparedBatchRender {
   const batchPath = resolve(options.batchPath);
-  const read = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+  const read = options.readFile ?? readJsonFileText;
   let raw: string;
   try {
     raw = read(batchPath);
@@ -262,6 +264,13 @@ export function prepareBatchRender(options: PrepareBatchRenderOptions): Prepared
     commonOutputDirectory(rows.map((row) => row.outputPath)),
     "manifest.json",
   );
+  if (manifestPath === batchPath) {
+    throw new BatchRenderInputError(
+      "Batch manifest collision",
+      `The generated manifest would overwrite the batch input: ${batchPath}.`,
+      "Use a separate output directory in --output, such as renders/{index}.mp4.",
+    );
+  }
   checkOutputCollisions(rows, manifestPath);
 
   const variableIssueCount = validateBatchVariables(
@@ -311,7 +320,7 @@ function summarizeManifest(manifest: BatchManifest): void {
 
 function writeManifest(manifest: BatchManifest): void {
   summarizeManifest(manifest);
-  mkdirSync(dirname(manifest.manifestPath), { recursive: true });
+  makeOutputFolder(dirname(manifest.manifestPath));
   writeFileSync(manifest.manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
 }
 
@@ -333,7 +342,7 @@ async function renderBatchRow(
   }
 
   try {
-    mkdirSync(dirname(row.outputPath), { recursive: true });
+    makeOutputFolder(dirname(row.outputPath));
     const result = await options.renderOne(row);
     manifestRow.status = "completed";
     manifestRow.durationMs = result.durationMs ?? null;
@@ -434,8 +443,6 @@ export async function runBatchRender(options: RunBatchRenderOptions): Promise<Ba
   return manifest;
 }
 
-// Called through render.ts's lazy batch module; static reachability cannot see it.
-// fallow-ignore-next-line unused-export
 export function exitBatchRenderInputError(error: unknown): never {
   if (error instanceof BatchRenderInputError) {
     errorBox(error.title, error.message, error.hint);

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import type { ProjectDir } from "../utils/project.js";
+import { MAX_OPEN_MEDIA_RANGE_BYTES } from "@hyperframes/studio-server";
 
 // `registerCompositionRoute` reaches these two studio-server helpers via a
 // module, since both files sit at the same depth under packages/cli/src/.
@@ -152,6 +153,90 @@ async function buildApp(project: ProjectDir, autoProxy: boolean): Promise<Hono> 
 }
 
 describe("registerCompositionRoute", () => {
+  it("lets a browser revalidate the composition and its assets instead of refetching them", async () => {
+    const project = tmpProject();
+    writeFileSync(join(project.dir, "index.html"), "<html><head></head><body></body></html>");
+    writeFileSync(join(project.dir, "clip.mp4"), Buffer.from("0123456789", "utf-8"));
+    const app = await buildApp(project, false);
+
+    const etags: Record<string, string> = {};
+    for (const path of ["/composition/index.html", "/composition/clip.mp4"]) {
+      const first = await app.request(path);
+      etags[path] = first.headers.get("ETag") ?? "";
+      expect(etags[path]).not.toBe("");
+      expect(first.headers.get("Cache-Control")).toBe("no-cache");
+      const again = await app.request(path, { headers: { "If-None-Match": etags[path] } });
+      expect(again.status).toBe(304);
+    }
+
+    writeFileSync(join(project.dir, "clip.mp4"), Buffer.from("0123456789abc", "utf-8"));
+    const edited = await app.request("/composition/clip.mp4", {
+      headers: { "If-None-Match": etags["/composition/clip.mp4"] ?? "" },
+    });
+    expect(edited.status).toBe(200);
+  });
+
+  it("serves an edited stylesheet even when its size and mtime did not change", async () => {
+    const project = tmpProject();
+    const css = join(project.dir, "style.css");
+    const pinned = new Date("2026-01-01T00:00:00Z");
+    writeFileSync(css, "a{color:red}");
+    utimesSync(css, pinned, pinned);
+    const app = await buildApp(project, false);
+    const etag = (await app.request("/composition/style.css")).headers.get("ETag") ?? "";
+
+    writeFileSync(css, "a{color:tan}");
+    utimesSync(css, pinned, pinned);
+    const edited = await app.request("/composition/style.css", {
+      headers: { "If-None-Match": etag },
+    });
+
+    expect(edited.status).toBe(200);
+    expect(await edited.text()).toBe("a{color:tan}");
+  });
+
+  it("serves an edited SVG fresh and still answers a Range request on text", async () => {
+    const project = tmpProject();
+    const svg = join(project.dir, "logo.svg");
+    const pinned = new Date("2026-01-01T00:00:00Z");
+    writeFileSync(svg, "<svg>a</svg>");
+    utimesSync(svg, pinned, pinned);
+    const app = await buildApp(project, false);
+    const etag = (await app.request("/composition/logo.svg")).headers.get("ETag") ?? "";
+
+    writeFileSync(svg, "<svg>b</svg>");
+    utimesSync(svg, pinned, pinned);
+    const edited = await app.request("/composition/logo.svg", {
+      headers: { "If-None-Match": etag },
+    });
+    expect(edited.status).toBe(200);
+    expect(await edited.text()).toBe("<svg>b</svg>");
+
+    const ranged = await app.request("/composition/logo.svg", { headers: { Range: "bytes=0-3" } });
+    expect(ranged.status).toBe(206);
+    expect(await ranged.text()).toBe("<svg");
+  });
+
+  it("serves a same-size, same-mtime JSON edit fresh, labelled UTF-8", async () => {
+    const project = tmpProject();
+    const data = join(project.dir, "data.json");
+    const pinned = new Date("2026-01-01T00:00:00Z");
+    writeFileSync(data, '{"value":1}');
+    utimesSync(data, pinned, pinned);
+    const app = await buildApp(project, false);
+    const first = await app.request("/composition/data.json");
+    expect(first.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
+    const etag = first.headers.get("ETag") ?? "";
+
+    writeFileSync(data, '{"value":2}');
+    utimesSync(data, pinned, pinned);
+    const edited = await app.request("/composition/data.json", {
+      headers: { "If-None-Match": etag },
+    });
+    expect(edited.status).toBe(200);
+    expect(await edited.text()).toBe('{"value":2}');
+  });
+
   it("answers a Range request on a plain asset with 206 + the requested byte slice", async () => {
     const project = tmpProject();
     writeFileSync(join(project.dir, "clip.mp4"), Buffer.from("0123456789", "utf-8"));
@@ -163,6 +248,22 @@ describe("registerCompositionRoute", () => {
     expect(res.headers.get("accept-ranges")).toBe("bytes");
     expect(res.headers.get("content-range")).toBe("bytes 2-5/10");
     expect(await res.text()).toBe("2345");
+  });
+
+  it("answers an open-ended media range with a bounded piece, not the rest of the file", async () => {
+    // Served to EOF, each <video> holds one of the browser's six connections (#6029).
+    const project = tmpProject();
+    const size = 8 * 1024 * 1024;
+    writeFileSync(join(project.dir, "clip.mp4"), Buffer.alloc(size, 0x61));
+    const app = await buildApp(project, false);
+
+    const res = await app.request("/composition/clip.mp4", { headers: { Range: "bytes=0-" } });
+
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe(
+      `bytes 0-${MAX_OPEN_MEDIA_RANGE_BYTES - 1}/${size}`,
+    );
+    expect((await res.arrayBuffer()).byteLength).toBe(MAX_OPEN_MEDIA_RANGE_BYTES);
   });
 
   it("serves the resolved proxy's bytes for ?hf-proxy=h264 on a hostile asset", async () => {

@@ -46,7 +46,7 @@ function RemoveButton({ onClick, title }: { onClick: () => void; title: string }
     <button
       type="button"
       onClick={onClick}
-      className="relative shrink-0 rounded-sm p-1.5 text-neutral-600 transition-colors hover:bg-neutral-800 hover:text-red-400 active:scale-[0.95]"
+      className="relative shrink-0 rounded-sm p-1.5 text-neutral-600 transition-colors hover:bg-neutral-800 hover:text-danger-ink active:scale-[0.95]"
       title={title}
       aria-label={title}
     >
@@ -93,7 +93,7 @@ export function PropertyRow({
             onClick={() => onCommit(isVisible ? "hidden" : "visible")}
             className="shrink-0 rounded-full transition-colors duration-200 relative"
             style={{ width: 28, height: 16, background: isVisible ? P.accent : P.borderInput }}
-            title={isVisible ? "Visible — click to hide" : "Hidden — click to show"}
+            title={isVisible ? "Visible: click to hide" : "Hidden: click to show"}
           >
             <span
               className="absolute top-[2px] left-0 rounded-full transition-transform duration-200"

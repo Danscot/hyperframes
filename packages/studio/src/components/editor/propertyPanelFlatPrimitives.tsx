@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTrackDesignInput } from "../../contexts/DesignPanelInputContext";
 import { RotateCcw } from "../../icons/SystemIcons";
 import { CommitField } from "./propertyPanelPrimitives";
+import { FlatSliderReadout } from "./propertyPanelFlatSliderReadout";
 import {
   VALUE_TIER_LABEL_CLASS,
   VALUE_TIER_VALUE_CLASS,
@@ -71,7 +72,7 @@ export function FlatRow({
           <button
             type="button"
             data-flat-row-reset="true"
-            title="Remove — fall back to default"
+            title="Remove and fall back to default"
             onClick={() => {
               track("button", `Reset ${label}`);
               onReset();
@@ -278,6 +279,7 @@ export function FlatSlider({
   centerTick,
   onReset,
   onCommit,
+  onCommitText,
 }: {
   label: string;
   value: number;
@@ -290,6 +292,8 @@ export function FlatSlider({
   centerTick?: boolean;
   onReset?: () => void;
   onCommit: (nextValue: number) => void;
+  /** Typed readout: return false to refuse the text, keep the field open, and mark it invalid. */
+  onCommitText?: (text: string) => boolean | void;
 }) {
   const track = useTrackDesignInput();
   // `draft` gives the knob instant, drag-local visual feedback. `onCommit` is
@@ -533,26 +537,26 @@ export function FlatSlider({
         <div
           data-flat-slider-knob="true"
           className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full ${
-            tier === "explicitCustom" ? "h-2 w-2 bg-white" : "h-[7px] w-[7px] bg-panel-text-4"
+            tier === "explicitCustom" ? "h-2 w-2 bg-text-0" : "h-[7px] w-[7px] bg-panel-text-4"
           }`}
           style={{ left: `${clampedPct}%` }}
         />
       </div>
-      <span
-        data-flat-slider-value="true"
-        className={`w-11 shrink-0 text-right font-mono text-[10px] ${
-          tier === "explicitCustom" ? "text-panel-text-0" : "text-panel-text-3"
-        }`}
-      >
-        {displayValue}
-      </span>
+      <FlatSliderReadout
+        label={label}
+        displayValue={displayValue}
+        tier={tier}
+        disabled={disabled}
+        onCommitText={onCommitText}
+        onCommitted={() => track("input", label)}
+      />
       {(centerTick || onReset) && (
         <span data-flat-slider-reset-slot="true" className="w-3.5 shrink-0">
           {tier === "explicitCustom" && onReset && (
             <button
               type="button"
               data-flat-slider-reset="true"
-              title="Remove — fall back to default"
+              title="Remove and fall back to default"
               disabled={disabled}
               onClick={() => {
                 track("button", `Reset ${label}`);

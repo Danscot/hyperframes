@@ -13,6 +13,7 @@ import {
   resolveExtractCacheDir,
   defaultExtractCacheDir,
   EXTRACT_CACHE_DIR_DISABLED_ALIASES,
+  validateEngineConfigSnapshot,
 } from "./config.js";
 import type { EngineConfig } from "./config.js";
 import { isLowMemorySystem } from "./services/systemMemory.js";
@@ -83,6 +84,12 @@ describe("resolveConfig", () => {
     const config = resolveConfig();
     expect(config.disableGpu).toBe(true);
     expect(config.enableBrowserPool).toBe(true);
+  });
+
+  it("keeps software WebGPU off unless PRODUCER_ALLOW_SOFTWARE_WEBGPU opts in", () => {
+    expect(resolveConfig().allowSoftwareWebGpu).toBe(false);
+    setEnv("PRODUCER_ALLOW_SOFTWARE_WEBGPU", "true");
+    expect(resolveConfig().allowSoftwareWebGpu).toBe(true);
   });
 
   it("lets env vars opt out of default streaming encode", () => {
@@ -988,5 +995,17 @@ describe("resolveExtractCacheDir", () => {
     // both engine.resolveConfig() and doctor's checkFramesCache() would break
     // silently if the signature drifted to require an env argument.
     expect(() => resolveExtractCacheDir()).not.toThrow();
+  });
+});
+
+describe("validateEngineConfigSnapshot fps", () => {
+  it("accepts every distributed fps, including 25", () => {
+    for (const fps of [24, 25, 30, 60] as const) {
+      expect(() => validateEngineConfigSnapshot({ ...resolveConfig(), fps })).not.toThrow();
+    }
+  });
+
+  it("rejects an fps outside the distributed set", () => {
+    expect(() => validateEngineConfigSnapshot({ ...resolveConfig(), fps: 50 })).toThrow(/fps/);
   });
 });

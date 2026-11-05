@@ -21,10 +21,10 @@
  * chain the color-grading runtime uses: `__hfVariablesByComp[compId]` for
  * inlined sub-compositions, then the top-level merged `getVariables()`.
  *
- * Applied at init AND re-applied after the composition loader inlines
- * external / template sub-compositions (their DOM and per-instance scoped
- * values don't exist at init). Idempotent: re-applying writes the same
- * values.
+ * Text is bound before composition scripts run; all of it at init and after
+ * the composition loader inlines external / template sub-compositions (their
+ * DOM and per-instance scoped values don't exist at init). Idempotent:
+ * re-applying writes the same values.
  */
 
 import { readVariablesForElement } from "./variableScope";
@@ -33,6 +33,7 @@ import {
   isSafeMediaUrl,
 } from "@hyperframes/parsers/composition";
 import { isHtmlElement } from "./domRealm";
+import { unproxiedSrc } from "./proxySrc";
 
 // data-var-src only rebinds media `src` on media elements. A user-controlled
 // variable value assigned to a src is an XSS surface on tags whose src executes
@@ -131,16 +132,9 @@ function findTopRoot(doc: Document): Element | null {
   );
 }
 
-function applyCssCustomProperties(doc: Document, cache: ScopeValuesCache): void {
-  // Top-level root plus every inlined sub-composition root; custom props
-  // inherit, so descendants of each root see its scope's values.
-  const roots = new Set<Element>();
-  const topRoot = findTopRoot(doc);
-  if (topRoot) roots.add(topRoot);
-  for (const el of Array.from(doc.querySelectorAll("[data-composition-id]"))) {
-    roots.add(el);
-  }
-  for (const root of roots) {
+// Custom props inherit, so each composition root carries its own scope's values.
+function applyCssCustomProperties(roots: Iterable<Element>, cache: ScopeValuesCache): void {
+  for (const root of new Set(roots)) {
     const values = valuesForElement(root, cache);
     for (const [id, value] of Object.entries(values)) {
       const css = cssValueFor(value);
@@ -151,34 +145,66 @@ function applyCssCustomProperties(doc: Document, cache: ScopeValuesCache): void 
   }
 }
 
-export function applyVariableBindings(doc: Document): void {
-  const cache: ScopeValuesCache = new Map();
-  applyCssCustomProperties(doc, cache);
-
-  for (const el of Array.from(doc.querySelectorAll("[data-var-src]"))) {
-    const id = el.getAttribute("data-var-src")?.trim();
-    if (!id) continue;
-    // Only media elements may take a variable-driven src (see VAR_SRC_TAGS) — a
-    // src on <iframe>/<script>/<embed> is a code-execution sink, not a media ref.
-    if (!VAR_SRC_TAGS.has(el.tagName.toLowerCase())) {
+function variableSrcFor(el: Element, cache: ScopeValuesCache, warn = true): string | null {
+  const id = el.getAttribute("data-var-src")?.trim();
+  if (!id) return null;
+  // Only media elements may take a variable-driven src (see VAR_SRC_TAGS) — a
+  // src on <iframe>/<script>/<embed> is a code-execution sink, not a media ref.
+  if (!VAR_SRC_TAGS.has(el.tagName.toLowerCase())) {
+    if (warn)
       console.warn(
         `[hyperframes] Ignoring data-var-src on <${el.tagName.toLowerCase()}>: variable-bound src is only allowed on ${Array.from(VAR_SRC_TAGS).join("/")}.`,
       );
-      continue;
-    }
-    const url = resolveUrl(valuesForElement(el, cache)[id]);
-    if (url === null) continue;
-    if (!isSafeMediaUrl(url)) {
-      console.warn(`[hyperframes] Ignoring data-var-src="${id}": unsafe URL protocol.`);
-      continue;
-    }
-    el.setAttribute("src", url);
+    return null;
   }
+  const url = resolveUrl(valuesForElement(el, cache)[id]);
+  if (url === null) return null;
+  if (!isSafeMediaUrl(url)) {
+    if (warn) console.warn(`[hyperframes] Ignoring data-var-src="${id}": unsafe URL protocol.`);
+    return null;
+  }
+  return url;
+}
 
-  for (const el of Array.from(doc.querySelectorAll("[data-var-text]"))) {
+/** The src an element loads, preview proxy aside: its bound variable's value, else its attribute. */
+export function unproxiedMediaSrc(el: Element): string | null {
+  return variableSrcFor(el, new Map(), false) ?? unproxiedSrc(el);
+}
+
+const matching = (doc: Document, within: Element | undefined, selector: string): Element[] =>
+  within
+    ? [...(within.matches(selector) ? [within] : []), ...within.querySelectorAll(selector)]
+    : Array.from(doc.querySelectorAll(selector));
+
+/** Applies the bindings in `doc`, or only those inside `within` and `within` itself. */
+export function applyVariableBindings(doc: Document, within?: Element): void {
+  const cache: ScopeValuesCache = new Map();
+  const all = (selector: string) => matching(doc, within, selector);
+  const topRoot = within ? null : findTopRoot(doc);
+  applyCssCustomProperties([...(topRoot ? [topRoot] : []), ...all("[data-composition-id]")], cache);
+
+  for (const el of all("[data-var-src]")) {
+    const url = variableSrcFor(el, cache);
+    if (url !== null && unproxiedSrc(el) !== url) el.setAttribute("src", url);
+  }
+  bindText(all("[data-var-text]"), cache);
+}
+
+/** Binds only text, in `doc` or inside `within`: what composition scripts read before they run. */
+export function applyTextBindings(doc: Document, within?: Element): void {
+  bindText(matching(doc, within, "[data-var-text]"), new Map());
+}
+
+const textWrittenOnce = new WeakSet<Element>();
+
+/** Writes each binding once: a script may then reshape the text, which a second write would duplicate. */
+function bindText(elements: Element[], cache: ScopeValuesCache): void {
+  for (const el of elements) {
     const id = el.getAttribute("data-var-text")?.trim();
-    if (!id) continue;
+    if (!id || textWrittenOnce.has(el)) continue;
     const value = valuesForElement(el, cache)[id];
-    if (isScalar(value)) setOwnTextPreservingChildren(el, String(value));
+    if (!isScalar(value)) continue;
+    setOwnTextPreservingChildren(el, String(value));
+    textWrittenOnce.add(el);
   }
 }

@@ -14,10 +14,9 @@
  * a local registry (the origin is a first-class project setting,
  * `hyperframes.json#registry`) supplies an item with a `registryDependencies`
  * edge, which no shipped catalog item declares today; and `globalThis.fetch`
- * is wrapped so the batch is captured instead of sent. Faking a 200 is what
- * keeps this off production analytics — `flush()` only leaves events queued
- * when the request fails, and only a non-empty queue makes the exit handler
- * spawn the detached `flushSync` child that would bypass the hook.
+ * is wrapped so the batch is captured instead of sent. The exit handler's
+ * detached `flushSync` child would bypass that wrapper, so the hook runs the
+ * child's script in-process instead; nothing reaches production analytics.
  *
  * Usage: node scripts/ci/cli-telemetry-e2e.mjs [path/to/dist/cli.js]
  */
@@ -135,6 +134,23 @@ globalThis.fetch = async function (input, init) {
   }
   return realFetch(input, init);
 };
+// The exit-time flushSync() child would send past the wrapper above: run its script here instead.
+// It runs inside the exit handler, so the wrapper must record before its first await.
+const childProcess = require("node:child_process");
+const realSpawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  if (Array.isArray(args) && args[0] === "-e" && String(args[1]).includes("posthog")) {
+    // The real child reads and deletes args[2]; do the same, then run only its fetch.
+    const file = String(args[2]);
+    const body = require("node:fs").readFileSync(file, "utf8");
+    require("node:fs").unlinkSync(file);
+    const fetchOnly = String(args[1]).slice(String(args[1]).indexOf("fetch("));
+    (0, eval)(fetchOnly.replace("body:b,", "body:" + JSON.stringify(body) + ","));
+    return { unref() {}, on() { return this; } };
+  }
+  return realSpawn.call(this, command, args, options);
+};
+require("node:module").syncBuiltinESMExports();
 `,
 );
 
@@ -409,6 +425,28 @@ check(
   "browser_version_major is a positive number",
   typeof posEvent.browser_version_major === "number" && posEvent.browser_version_major > 0,
   posEvent.browser_version_major,
+);
+const isPct = (v) => typeof v === "number" && v >= 0 && v <= 100;
+check(
+  "cpu_busy_avg_pct is a percentage",
+  isPct(posEvent.cpu_busy_avg_pct),
+  posEvent.cpu_busy_avg_pct,
+);
+check(
+  "cpu_busy_peak_pct is a percentage at or above the average",
+  isPct(posEvent.cpu_busy_peak_pct) && posEvent.cpu_busy_peak_pct >= posEvent.cpu_busy_avg_pct,
+  posEvent.cpu_busy_peak_pct,
+);
+check(
+  "cpu_cores_busy_peak is a core count",
+  Number.isInteger(posEvent.cpu_cores_busy_peak) &&
+    posEvent.cpu_cores_busy_peak <= posEvent.cpu_count,
+  posEvent.cpu_cores_busy_peak,
+);
+check(
+  "load_avg_start and load_avg_end are present",
+  typeof posEvent.load_avg_start === "number" && typeof posEvent.load_avg_end === "number",
+  [posEvent.load_avg_start, posEvent.load_avg_end],
 );
 
 console.log("render: negative fixture (no media, root/body matched, no skill flag, clean env)");

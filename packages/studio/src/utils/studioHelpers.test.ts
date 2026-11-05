@@ -5,6 +5,8 @@ import {
   historyTooltipLabel,
   findMatchingTimelineElementId,
   findTimelineIdByAncestor,
+  resolveAssetHasAudio,
+  resolveDroppedAssetDuration,
   resolveDroppedAssetDimensions,
   resolveElementTrack,
   resolveTimelineIdForSelection,
@@ -209,6 +211,28 @@ describe("resolveDroppedAssetDimensions", () => {
   });
 });
 
+describe("dropped asset probes", () => {
+  const NAME = "assets/50% off #1?'s take.mp4";
+  const URL = "/api/projects/demo/preview/assets/50%25%20off%20%231%3F%27s%20take.mp4";
+
+  it("probe a dropped file's length and size at its own URL", async () => {
+    vi.useFakeTimers();
+    const probes: HTMLVideoElement[] = [];
+    const createElement = document.createElement.bind(document);
+    vi.spyOn(document, "createElement").mockImplementation((tagName, options) => {
+      const el = createElement(tagName, options);
+      if (tagName === "video") probes.push(el as HTMLVideoElement);
+      return el;
+    });
+
+    const duration = resolveDroppedAssetDuration("demo", NAME, "video");
+    const size = resolveDroppedAssetDimensions("demo", NAME, "video");
+    expect(probes.map((probe) => probe.getAttribute("src"))).toEqual([URL, URL]);
+    await vi.advanceTimersByTimeAsync(3000);
+    await Promise.all([duration, size]);
+  });
+});
+
 describe("resolveElementTrack", () => {
   it("rounds an authored track", () => {
     expect(resolveElementTrack({ authoredTrack: 2.4, track: 0 })).toBe(2);
@@ -233,5 +257,34 @@ describe("historyTooltipLabel", () => {
   it("keeps the shortcut when the history is empty", () => {
     expect(historyTooltipLabel("undo", undefined)).toMatch(/^Undo \(.+\)$/);
     expect(historyTooltipLabel("redo", null)).toMatch(/^Redo \(.+\)$/);
+  });
+});
+
+describe("resolveAssetHasAudio", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const stubMetadata = (response: Response | Error) =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        if (response instanceof Error) throw response;
+        return response;
+      }),
+    );
+
+  it("answers the metadata endpoint's audio flag", async () => {
+    stubMetadata(new Response(JSON.stringify({ metadata: { hasAudio: true } })));
+    expect(await resolveAssetHasAudio("p1", "assets/talk.mp4")).toBe(true);
+    stubMetadata(new Response(JSON.stringify({ metadata: { hasAudio: false } })));
+    expect(await resolveAssetHasAudio("p1", "assets/cutout.webm")).toBe(false);
+  });
+
+  it("answers null when the probe cannot tell", async () => {
+    stubMetadata(new Response("nope", { status: 500 }));
+    expect(await resolveAssetHasAudio("p1", "assets/talk.mp4")).toBeNull();
+    stubMetadata(new Error("offline"));
+    expect(await resolveAssetHasAudio("p1", "assets/talk.mp4")).toBeNull();
+    stubMetadata(new Response(JSON.stringify({ metadata: {} })));
+    expect(await resolveAssetHasAudio("p1", "assets/talk.mp4")).toBeNull();
   });
 });

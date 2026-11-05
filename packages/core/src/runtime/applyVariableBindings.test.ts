@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { applyVariableBindings } from "./applyVariableBindings";
 import { getVariables } from "./getVariables";
 
@@ -100,6 +100,21 @@ describe("applyVariableBindings", () => {
     expect(h1?.childNodes[0]?.nodeValue).toBe("Replaced");
   });
 
+  it("a re-apply leaves bound text a script split into glyph spans as one copy", () => {
+    win.__hfVariables = { title: "Hi" };
+    document.body.innerHTML = `<div data-hf-root><h1 data-var-text="title">Hi</h1></div>`;
+    applyVariableBindings(document);
+    const h1 = document.querySelector("h1")!;
+    h1.replaceChildren(
+      ...[...h1.textContent!].map((c) =>
+        Object.assign(document.createElement("span"), { textContent: c }),
+      ),
+    );
+    applyVariableBindings(document);
+    expect(h1.textContent).toBe("Hi");
+    expect(h1.childElementCount).toBe(2);
+  });
+
   it("is idempotent across re-application (loader re-apply path)", () => {
     win.__hfVariables = { title: "Once" };
     document.body.innerHTML = `<div data-hf-root><h1 data-var-text="title">t</h1></div>`;
@@ -174,5 +189,16 @@ describe("applyVariableBindings", () => {
       expect(css).not.toContain("{");
       expect(css).not.toContain("<");
     });
+  });
+});
+
+describe("applyVariableBindings media src", () => {
+  it("leaves an unchanged src alone, since rewriting it restarts the media's load", () => {
+    setDeclared([{ id: "clip", type: "string", label: "Clip", default: "clip.mp4" }]);
+    document.body.innerHTML = '<video data-var-src="clip" src="clip.mp4"></video>';
+    const video = document.querySelector("video")!;
+    const writes = vi.spyOn(video, "setAttribute");
+    applyVariableBindings(document);
+    expect(writes).not.toHaveBeenCalledWith("src", expect.anything());
   });
 });

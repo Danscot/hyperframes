@@ -17,6 +17,7 @@ export interface DockerRunArgsInput {
   outputDir: string;
   /** Filename within `outputDir` (joined to /output inside the container). */
   outputFilename: string;
+  hostStdoutIsTty?: boolean;
   /**
    * Docker `--platform` value (`linux/amd64` or `linux/arm64`). When omitted,
    * resolves to the host architecture via `resolveDockerPlatform()`. Pinning
@@ -49,7 +50,13 @@ export interface DockerRenderOptions {
   crf?: number;
   vp9CpuUsed?: number;
   videoBitrate?: string;
+  keyframeIntervalSeconds?: number;
+  range?: { startSeconds: number; endSeconds?: number };
+  proresProfile?: string;
+  maxBitrate?: string;
+  bufferSize?: string;
   videoFrameFormat?: "auto" | "jpg" | "png";
+  pageMotionBlur?: "off";
   quiet: boolean;
   debug?: boolean;
   bestEffort?: boolean;
@@ -109,6 +116,7 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
   return [
     "run",
     "--rm",
+    ...(input.hostStdoutIsTty ? ["-e", "HYPERFRAMES_STDOUT_IS_TTY=1"] : []),
     "--platform",
     platform,
     "--shm-size=2g",
@@ -140,9 +148,23 @@ export function buildDockerRunArgs(input: DockerRunArgsInput): string[] {
     ...(options.crf != null ? ["--crf", String(options.crf)] : []),
     ...(options.vp9CpuUsed != null ? ["--vp9-cpu-used", String(options.vp9CpuUsed)] : []),
     ...(options.videoBitrate ? ["--video-bitrate", options.videoBitrate] : []),
+    ...(options.proresProfile ? ["--prores-profile", options.proresProfile] : []),
+    ...(options.range
+      ? [
+          "--start",
+          String(options.range.startSeconds),
+          ...(options.range.endSeconds != null ? ["--end", String(options.range.endSeconds)] : []),
+        ]
+      : []),
+    ...(options.keyframeIntervalSeconds != null
+      ? ["--keyframe-interval", String(options.keyframeIntervalSeconds)]
+      : []),
+    ...(options.maxBitrate ? ["--max-bitrate", options.maxBitrate] : []),
+    ...(options.bufferSize ? ["--buffer-size", options.bufferSize] : []),
     ...(options.videoFrameFormat && options.videoFrameFormat !== "auto"
       ? ["--video-frame-format", options.videoFrameFormat]
       : []),
+    ...(options.pageMotionBlur !== undefined ? ["--page-motion-blur", options.pageMotionBlur] : []),
     ...(options.quiet ? ["--quiet"] : []),
     ...(options.debug ? ["--debug"] : []),
     // The in-container CLI is best-effort by default. Only forward the

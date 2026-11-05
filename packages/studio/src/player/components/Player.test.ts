@@ -9,6 +9,8 @@ import {
   readPreviewErrorMessage,
   shouldShowCompositionLoadingOverlay,
 } from "./Player";
+import { usePlayerStore } from "../store/playerStore";
+import { onPreviewDocumentLoaded } from "../sceneSwap";
 
 vi.mock("@hyperframes/player", () => ({}));
 
@@ -22,6 +24,7 @@ class TestHyperframesPlayer extends HTMLElement {
 
   constructor() {
     super();
+    this.attachShadow({ mode: "open" });
 
     const addIframeListener = this.iframeElement.addEventListener.bind(this.iframeElement);
     this.iframeElement.addEventListener = ((type, listener, options) => {
@@ -85,6 +88,8 @@ async function mountPlayer(props: Partial<PlayerProps> = {}) {
 
 const twoFrames = () => act(async () => void (await new Promise((r) => setTimeout(r, 80))));
 
+const flushEffects = () => act(async () => await Promise.resolve());
+
 function createAudioIframe() {
   const iframe = document.createElement("iframe");
   document.body.appendChild(iframe);
@@ -124,6 +129,11 @@ describe("preview errors", () => {
     root = null;
   });
 
+  it("puts the preview on the player's once-a-second paused heartbeat", async () => {
+    const { player } = await mountPlayer();
+    expect(player.hasAttribute("low-power-idle")).toBe(true);
+  });
+
   it("attaches lifecycle listeners before navigating the player", async () => {
     await mountPlayer();
     const srcIndex = lifecycleLog.indexOf("src");
@@ -143,7 +153,10 @@ describe("preview errors", () => {
   });
 
   it("retries a failed preview with a fresh player URL", async () => {
-    const { host, player } = await mountPlayer();
+    const onPainted = vi.fn();
+    const { host, player } = await mountPlayer({ onPainted });
+
+    act(() => void player.dispatchEvent(new Event("painted")));
 
     act(() => {
       player.dispatchEvent(
@@ -164,6 +177,9 @@ describe("preview errors", () => {
     const retryUrl = new URL(player.getAttribute("src") ?? "", window.location.origin);
     expect(retryUrl.searchParams.get("_hfStudioRetry")).toBe("1");
     expect(host.querySelector('[data-testid="composition-preview-error"]')).toBeNull();
+
+    act(() => void player.dispatchEvent(new Event("painted")));
+    expect(onPainted.mock.calls.map(([details]) => details.loadId)).toEqual([1, 2]);
   });
 });
 
@@ -180,6 +196,49 @@ describe("callbacks after the player is already mounted", () => {
 
     expect(second).toHaveBeenCalledTimes(1);
     expect(first).not.toHaveBeenCalled();
+  });
+
+  it("loads the preview on the runtime's ready while a stalled font holds the window's load", async () => {
+    const onLoad = vi.fn();
+    const { player } = await mountPlayer({ onLoad });
+    const iframe = (player as TestHyperframesPlayer).iframeElement;
+    let page = {};
+    Object.defineProperty(iframe, "contentDocument", { get: () => page });
+    Object.defineProperty(iframe, "contentWindow", { get: () => ({ __playerReady: true }) });
+    const announced = vi.fn();
+    onPreviewDocumentLoaded(iframe, announced);
+
+    act(() => void player.dispatchEvent(new Event("ready")));
+    expect(onLoad).toHaveBeenCalledTimes(1);
+
+    act(() => void iframe.dispatchEvent(new Event("load")));
+    act(() => void player.dispatchEvent(new Event("ready")));
+    expect(onLoad).toHaveBeenCalledTimes(1);
+
+    page = {};
+    act(() => void player.dispatchEvent(new Event("ready")));
+    expect(onLoad).toHaveBeenCalledTimes(2);
+    expect(announced).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a ready that arrives before the page's runtime boots to the page's own load", async () => {
+    const onLoad = vi.fn();
+    const { player } = await mountPlayer({ onLoad });
+    const iframe = (player as TestHyperframesPlayer).iframeElement;
+    const page = {};
+    let runtime: { __playerReady?: boolean } = {};
+    Object.defineProperty(iframe, "contentDocument", { get: () => page });
+    Object.defineProperty(iframe, "contentWindow", { get: () => runtime });
+
+    act(() => void player.dispatchEvent(new Event("ready")));
+    expect(onLoad).not.toHaveBeenCalled();
+
+    act(() => void iframe.dispatchEvent(new Event("load")));
+    expect(onLoad).toHaveBeenCalledTimes(1);
+
+    runtime = { __playerReady: true };
+    act(() => void player.dispatchEvent(new Event("ready")));
+    expect(onLoad).toHaveBeenCalledTimes(1);
   });
 
   it("reports the preview error cause", async () => {
@@ -210,6 +269,38 @@ describe("ready to show", () => {
   const painted = (player: TestHyperframesPlayer) =>
     act(() => void player.dispatchEvent(new Event("painted")));
 
+  it("waits two animation frames before notifying that the preview can show", async () => {
+    const callbacks: FrameRequestCallback[] = [];
+    const requestAnimationFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      });
+    try {
+      const onReadyToShowChange = vi.fn();
+      const { player } = await mountPlayer({ onReadyToShowChange });
+      const el = player as TestHyperframesPlayer;
+
+      loadAndReady(el);
+      painted(el);
+      await flushEffects();
+      expect(onReadyToShowChange).not.toHaveBeenCalledWith(true);
+      expect(callbacks).toHaveLength(1);
+
+      act(() => callbacks.shift()?.(0));
+      await flushEffects();
+      expect(onReadyToShowChange).not.toHaveBeenCalledWith(true);
+      expect(callbacks).toHaveLength(1);
+
+      act(() => callbacks.shift()?.(16));
+      await flushEffects();
+      expect(onReadyToShowChange).toHaveBeenLastCalledWith(true);
+    } finally {
+      requestAnimationFrame.mockRestore();
+    }
+  });
+
   it("promotes only once the player reports painted, not at ready or assetsready", async () => {
     const onReadyToShowChange = vi.fn();
     const { player } = await mountPlayer({ onReadyToShowChange });
@@ -229,6 +320,125 @@ describe("ready to show", () => {
 
     act(() => void el.iframeElement.dispatchEvent(new Event("load")));
     expect(onReadyToShowChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("can show a document whose player was ready and painted before its load event", async () => {
+    const onReadyToShowChange = vi.fn();
+    const { player } = await mountPlayer({ onReadyToShowChange });
+    const el = Object.assign(player as TestHyperframesPlayer, { ready: true, painted: true });
+
+    act(() => {
+      el.dispatchEvent(new Event("ready"));
+      el.dispatchEvent(new Event("painted"));
+      el.iframeElement.dispatchEvent(new Event("load"));
+    });
+    await twoFrames();
+    expect(onReadyToShowChange).toHaveBeenLastCalledWith(true);
+
+    for (const state of [
+      { ready: false, painted: true },
+      { ready: true, painted: false },
+    ]) {
+      Object.assign(el, state);
+      act(() => void el.iframeElement.dispatchEvent(new Event("load")));
+      expect(onReadyToShowChange).toHaveBeenLastCalledWith(false);
+    }
+  });
+
+  it("marks the preview booted when it can show and play, not at ready", async () => {
+    usePlayerStore.setState({ previewBooted: false });
+    const { player } = await mountPlayer({});
+    const el = player as TestHyperframesPlayer;
+
+    loadAndReady(el);
+    act(() => void el.dispatchEvent(new Event("assetsready")));
+    await twoFrames();
+    expect(usePlayerStore.getState().previewBooted).toBe(false);
+
+    painted(el);
+    await twoFrames();
+    expect(usePlayerStore.getState().previewBooted).toBe(true);
+  });
+
+  it("marks the preview booted at its first frame while media is still buffering", async () => {
+    usePlayerStore.setState({ previewBooted: false });
+    const onReadyToShowChange = vi.fn();
+    const { player } = await mountPlayer({ onReadyToShowChange });
+    const el = player as TestHyperframesPlayer;
+    document.body.appendChild(el.iframeElement);
+    const doc = el.iframeElement.contentDocument!;
+    const audio = doc.createElement("audio");
+    Object.defineProperty(audio, "readyState", { value: 0, configurable: true });
+    Object.defineProperty(audio, "networkState", { value: 2, configurable: true });
+    doc.body.appendChild(audio);
+
+    loadAndReady(el);
+    painted(el);
+    await twoFrames();
+    expect(onReadyToShowChange).not.toHaveBeenCalledWith(true);
+    expect(usePlayerStore.getState().previewBooted).toBe(true);
+  });
+
+  /** A first load whose one audio has no data yet: Studio's asset wait. */
+  async function loadWithUnloadedMedia(props: Partial<PlayerProps>) {
+    const { host, player } = await mountPlayer(props);
+    const el = player as TestHyperframesPlayer;
+    document.body.appendChild(el.iframeElement);
+    const doc = el.iframeElement.contentDocument!;
+    const audio = doc.createElement("audio");
+    Object.defineProperty(audio, "readyState", { value: 0, configurable: true });
+    Object.defineProperty(audio, "networkState", { value: 2, configurable: true });
+    doc.body.appendChild(audio);
+    loadAndReady(el);
+    painted(el);
+    await flushEffects();
+    return host;
+  }
+
+  it("keeps its asset wait on a later load that only skips the composition cover", async () => {
+    const host = await loadWithUnloadedMedia({ suppressLoadingOverlay: true });
+    expect(host.textContent).toContain("Preparing preview assets");
+  });
+
+  it("draws no loader of its own when the host draws one, and still says the preview is loading", async () => {
+    const onCompositionLoadingChange = vi.fn();
+    const host = await loadWithUnloadedMedia({
+      suppressLoadingOverlay: false,
+      loadingUi: "host",
+      onCompositionLoadingChange,
+    });
+    expect(host.textContent).not.toContain("Preparing preview assets");
+    expect(host.textContent).not.toContain("Loading composition");
+    expect(onCompositionLoadingChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("stops deferring editing work when the preview never shows", async () => {
+    vi.useFakeTimers();
+    try {
+      usePlayerStore.setState({ previewBooted: false });
+      await mountPlayer({});
+      act(() => void vi.advanceTimersByTime(4999));
+      expect(usePlayerStore.getState().previewBooted).toBe(false);
+      act(() => void vi.advanceTimersByTime(1));
+      expect(usePlayerStore.getState().previewBooted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports the document start time with the painted iframe", async () => {
+    const onPainted = vi.fn();
+    const now = vi.spyOn(performance, "now").mockReturnValue(100);
+    const { player } = await mountPlayer({ onPainted });
+
+    painted(player as TestHyperframesPlayer);
+
+    expect(onPainted).toHaveBeenCalledWith({
+      iframe: (player as TestHyperframesPlayer).iframeElement,
+      startedAt: 100,
+      loadId: 1,
+    });
+    now.mockRestore();
   });
 
   it("holds while the shader transition loader is up and fires once it clears", async () => {
@@ -259,6 +469,15 @@ describe("ready to show", () => {
     });
     await twoFrames();
     expect(onReadyToShowChange).not.toHaveBeenCalledWith(true);
+  });
+});
+
+describe("preview canvas chrome", () => {
+  it("does not paint Studio chrome on the scaled composition iframe", async () => {
+    const { player } = await mountPlayer();
+    const injectedStyles = Array.from(player.shadowRoot?.querySelectorAll("style") ?? []);
+
+    expect(injectedStyles.some((style) => style.textContent?.includes("box-shadow"))).toBe(false);
   });
 });
 
@@ -305,5 +524,12 @@ describe("composition loading overlay", () => {
     expect(hasUnloadedAssets(iframe, false)).toBe(false);
 
     iframe.remove();
+  });
+});
+
+describe("accelerated canvases", () => {
+  it("are tracked in Studio's window, whose prototype a preview canvas gets when Studio reaches it first", () => {
+    expect("__hfAccelTracked" in HTMLCanvasElement.prototype.getContext).toBe(true);
+    expect(Reflect.get(window, "__hfAcceleratedCanvases")).toBeInstanceOf(WeakSet);
   });
 });

@@ -1,5 +1,8 @@
 import type { HfColorGradingTarget } from "../colorGrading";
 import type { RuntimeAnalyticsEvent } from "./analytics";
+import type { AudioFades } from "../audioFade";
+import type { RateSpec } from "../speedRamp";
+import type { VolumeKeyframe } from "./mediaVolumeEnvelope";
 
 export type RuntimeJson =
   | string
@@ -20,7 +23,14 @@ type RuntimeBridgeControlActionBase =
   | "set-media-output-muted"
   | "set-native-media-sync-disabled"
   | "set-web-audio-media-disabled"
+  | "set-idle-heartbeat"
+  | "set-display-scale"
+  | "set-preview-quality"
+  | "set-copies-ahead"
+  | "retry-preview-copies"
+  | "request-preview-facts"
   | "set-root-duration"
+  | "set-play-range"
   | "stop-media"
   | "flash-elements";
 
@@ -33,7 +43,13 @@ type RuntimeBridgeControlMessageBase = {
   muted?: boolean;
   volume?: number;
   durationSeconds?: number;
+  startSeconds?: number | null;
+  endSeconds?: number | null;
   disabled?: boolean;
+  slow?: boolean;
+  scale?: number;
+  level?: number;
+  on?: boolean;
   playbackRate?: number;
   target?: HfColorGradingTarget | string | null;
   grading?: RuntimeJson;
@@ -45,7 +61,10 @@ export type RuntimeStateMessage = {
   source: "hf-preview";
   type: "state";
   frame: number;
+  currentTime: number;
+  ended: boolean;
   isPlaying: boolean;
+  buffering: boolean;
   muted: boolean;
   playbackRate: number;
 };
@@ -237,8 +256,64 @@ export type RuntimeGroupLevelsMessage = {
   levels: Array<{ groupId: string; level: number; clipped: boolean }>;
 };
 
+export type RuntimePreviewCopiesMessage = {
+  source: "hf-preview";
+  type: "preview-copies";
+  /** The lighter copies wanted at the current quality; null when none are. */
+  copies: {
+    total: number;
+    ready: number;
+    failed: number;
+    progress: number;
+    error: string | null;
+  } | null;
+};
+
+export type RuntimePreviewHealthMessage = {
+  source: "hf-preview";
+  type: "preview-health";
+  /** How playback went over the last few seconds of play; null while paused, seeking or warming up. */
+  health: {
+    droppedShare: number;
+    seconds: number;
+    choppy: boolean;
+    fps: number;
+    worstFrameMs: number;
+    skippedShare: number;
+    waitingShare: number;
+    frozenShare: number;
+    gapP50Ms: number;
+    gapP95Ms: number;
+    clockSource: "audio" | "webaudio" | "monotonic";
+    mode: "play";
+  } | null;
+};
+
+export type RuntimePreviewFactsMessage = {
+  source: "hf-preview";
+  type: "preview-facts";
+  facts: {
+    sceneCount: number;
+    mountedElementCount: number;
+    durationSeconds: number;
+    videos: Array<{
+      codec: string;
+      width: number;
+      height: number;
+      bitDepth: number;
+      count: number;
+    }>;
+    /** The lower levels at which at least one video gets a lighter copy. */
+    lighterAt: number[];
+    copiesReady: boolean;
+  };
+};
+
 export type RuntimeOutboundMessage =
   | RuntimeStateMessage
+  | RuntimePreviewCopiesMessage
+  | RuntimePreviewHealthMessage
+  | RuntimePreviewFactsMessage
   | RuntimeTimelineMessage
   | RuntimeDiagnosticMessage
   | RuntimePickerHoveredMessage
@@ -256,11 +331,13 @@ export type RuntimeOutboundMessage =
   | RuntimePerformanceMessage
   | RuntimeGroupLevelsMessage;
 
+export type HeldSeek = Promise<void> | void;
+
 export type RuntimePlayer = {
   _timeline: RuntimeTimelineLike | null;
   play: () => void;
   pause: () => void;
-  seek: (timeSeconds: number, options?: { keepPlaying?: boolean }) => void;
+  seek: (timeSeconds: number, options?: { keepPlaying?: boolean }) => HeldSeek;
   renderSeek: (timeSeconds: number, options?: RuntimeSeekOptions) => void;
   getTime: () => number;
   getDuration: () => number;
@@ -277,6 +354,7 @@ export type RuntimeSeekOptions = {
    * engine's sub-frame tick count so a fractional sample time survives quantization.
    */
   subFrameDivisions?: number;
+  exact?: boolean;
 };
 
 export type RuntimeTimelineChildLike = {
@@ -284,7 +362,19 @@ export type RuntimeTimelineChildLike = {
   vars?: unknown;
   startTime?: () => number;
   duration?: () => number;
+  data?: unknown;
   parent?: RuntimeTimelineChildLike;
+  getChildren?: RuntimeTimelineLike["getChildren"];
+};
+
+/** A timeline or tween a composition script started, as a scene swap stops it. */
+export type SceneAnimation = {
+  targets?: () => unknown[];
+  duration?: () => number;
+  getChildren?: (nested?: boolean, tweens?: boolean, timelines?: boolean) => SceneAnimation[];
+  revert?: () => void;
+  kill?: () => void;
+  totalTime?: (timeSeconds?: number, suppressEvents?: boolean) => unknown;
 };
 
 export type RuntimeTimelineLike = {
@@ -292,6 +382,8 @@ export type RuntimeTimelineLike = {
   pause: () => void;
   seek: (timeSeconds?: number, suppressEvents?: boolean) => unknown;
   totalTime?: (timeSeconds?: number, suppressEvents?: boolean) => unknown;
+  totalDuration?: () => number;
+  shiftChildren?: (amount: number) => unknown;
   progress?: (value?: number, suppressEvents?: boolean) => unknown;
   time: () => number;
   duration: () => number;
@@ -310,8 +402,12 @@ export type RuntimeTimelineLike = {
 export type RuntimeDeterministicAdapter = {
   name: string;
   discover: () => void;
-  seek: (ctx: { time: number; suppressEvents?: boolean }) => void;
-  pause: () => void;
+  seek: (ctx: {
+    time: number;
+    suppressEvents?: boolean;
+    pageAnimations?: () => Animation[];
+  }) => void;
+  pause: (ctx?: { pageAnimations?: () => Animation[] }) => void;
   play?: () => void;
   revert?: () => void;
   /**
@@ -352,6 +448,7 @@ export type RuntimeDeterministicAdapter = {
    * (Lottie JSON fetch, etc.) resolves.
    */
   getInferredDurationSeconds?: () => number | null;
+  getAnimationCycleEndSeconds?: () => number | null;
 };
 
 export type RuntimeGsapSetTarget = string | Element | Element[] | null;
@@ -371,3 +468,22 @@ type RuntimeBridgeControlAction =
 
 export type RuntimeBridgeControlMessage = RuntimeBridgeControlMessageBase &
   RuntimeDataControlFields;
+
+export type RuntimeMediaClip = {
+  el: HTMLVideoElement | HTMLAudioElement;
+  start: number;
+  /** The clip's own t=0 when a host's in-point cut its head; source time, lanes and fades run from it. */
+  origin?: number;
+  mediaStart: number;
+  duration: number;
+  end: number;
+  volume: number | null;
+  playbackRate: number;
+  /** The rate lane when the clip has one; otherwise `playbackRate`. */
+  rate?: RateSpec;
+  loop: boolean;
+  sourceDuration: number | null;
+  /** Probed from the GSAP timeline as the renderer does; when set they drive volume, not `data-volume`. */
+  volumeKeyframes?: VolumeKeyframe[];
+  fades?: AudioFades;
+};

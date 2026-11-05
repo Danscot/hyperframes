@@ -16,13 +16,16 @@ import {
   type AutomationSelectionSlice,
 } from "./automationSelectionSlice";
 import { createEditingModeSlice, type EditingModeSlice } from "./editingModeSlice";
+import { createPreviewQualitySlice, type PreviewQualitySlice } from "./previewQualitySlice";
 import { createTimelineFocusRequest, type TimelineFocusRequest } from "./timelineFocusState";
 import { createThumbnailSlice, type ThumbnailSlice } from "./thumbnailSlice";
 import { createPlaybackReadinessSlice } from "./readinessSlice";
 import { createRangeSelectionSlice, type RangeSelectionSlice } from "./rangeSelectionSlice";
 import { createTimelineResetState } from "./timelineResetState";
+import { patchElements, queueElementPatch } from "./elementPatchQueue";
 export type { KeyframeCacheEntry } from "./keyframeSlice";
 export { liveTime } from "./liveTime";
+import { liveTime } from "./liveTime";
 export { createTimelineResetState };
 
 import type {
@@ -60,6 +63,7 @@ type PlayerStoreSlices = KeyframeSlice &
   AutomationSelectionSlice &
   ThumbnailSlice &
   EditingModeSlice &
+  PreviewQualitySlice &
   ReturnType<typeof createPlaybackReadinessSlice> &
   RangeSelectionSlice;
 interface PlayerState extends PlayerStoreSlices {
@@ -82,6 +86,7 @@ interface PlayerState extends PlayerStoreSlices {
   zoomMode: ZoomMode;
   /** Timeline zoom percent relative to the fit width when in manual mode */
   manualZoomPercent: number;
+  userZoomCount: number;
   /**
    * Bumped on every live z-index edit (handleDomZIndexReorderCommit apply AND
    * rollback). Flashless z commits (skipReload) never reload the iframe or
@@ -93,10 +98,10 @@ interface PlayerState extends PlayerStoreSlices {
   inPoint: number | null;
   /** Work-area out-point (seconds). When set, loop ends here and E jumps here. */
   outPoint: number | null;
-
   activeTool: TimelineTool;
   setActiveTool: (tool: TimelineTool) => void;
-
+  selectLeftward: () => void;
+  selectRightward: () => void;
   /** Tween-relative percentage of the last-clicked keyframe diamond. Operations
    *  (drag, resize, rotate) target this instead of recomputing from playhead. */
   activeKeyframePct: number | null;
@@ -250,6 +255,17 @@ interface BeatHistoryEntry {
   label: string;
 }
 
+/** Selects like the marquee: the primary first, so its resets run, then the whole set. */
+function selectAroundPlayhead(
+  state: PlayerState,
+  keep: (el: TimelineElement, playhead: number) => boolean,
+): void {
+  const playhead = state.isPlaying ? liveTime.latest() : state.currentTime;
+  const ids = state.elements.filter((el) => keep(el, playhead)).map((el) => el.key ?? el.id);
+  state.setSelectedElementId(ids[0] ?? null);
+  state.setSelectedElementIds(new Set(ids));
+}
+
 export const usePlayerStore = create<PlayerState>((set, get) => ({
   isPlaying: false,
   currentTime: 0,
@@ -265,6 +281,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   loopEnabled: false,
   zoomMode: "fit",
   manualZoomPercent: 100,
+  userZoomCount: 0,
   zEditVersion: 0,
   timelinePps: 100,
   timelineFitPps: 100,
@@ -273,6 +290,8 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
 
   activeTool: "select",
   setActiveTool: (tool) => set({ activeTool: tool }),
+  selectLeftward: () => selectAroundPlayhead(get(), (el, t) => el.start < t),
+  selectRightward: () => selectAroundPlayhead(get(), (el, t) => el.start + el.duration > t),
 
   ...createKeyframeSlice(set, () => ({
     timelineProjectId: get().timelineProjectId,
@@ -282,6 +301,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
 
   ...createAutomationSelectionSlice(set),
   ...createEditingModeSlice(set),
+  ...createPreviewQualitySlice(set, get),
   ...createRangeSelectionSlice(),
   ...createPlaybackReadinessSlice(set),
 
@@ -529,12 +549,10 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         focusedEaseSegment: id === s.selectedElementId ? s.focusedEaseSegment : null,
       };
     }),
-  updateElement: (elementId, updates) =>
-    set((state) => ({
-      elements: state.elements.map((el) =>
-        (el.key ?? el.id) === elementId ? { ...el, ...updates } : el,
-      ),
-    })),
+  updateElement: (elementId, updates) => {
+    if (queueElementPatch(elementId, updates)) return;
+    set((state) => ({ elements: patchElements(state.elements, new Map([[elementId, updates]])) }));
+  },
   // UI preferences intentionally survive reset. So do timelineSessionEpoch and
   // focusedEaseRequestNonce: the epoch advances only when project identity
   // changes, while a monotonic nonce prevents collisions with stale consumers.
@@ -551,3 +569,32 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
 }));
 
 attachPlayerStoreDevHandle(usePlayerStore);
+
+export function isPreviewBooted(projectId: string): boolean {
+  const { previewBooted, timelineProjectId } = usePlayerStore.getState();
+  return previewBooted && timelineProjectId === projectId;
+}
+
+/** True once projectId's live preview has booted, false once another project replaces it.
+ * Open-time work the first frame does not need (server parses, lint) waits on it. */
+export function whenPreviewBooted(projectId: string): Promise<boolean> {
+  const openedFrom = usePlayerStore.getState().timelineProjectId;
+  let seen = false;
+  const settle = (state: PlayerState): boolean | null => {
+    if (state.timelineProjectId === projectId) {
+      seen = true;
+      return state.previewBooted ? true : null;
+    }
+    return seen || state.timelineProjectId !== openedFrom ? false : null;
+  };
+  return new Promise((resolve) => {
+    const now = settle(usePlayerStore.getState());
+    if (now !== null) return resolve(now);
+    const stop = usePlayerStore.subscribe((state) => {
+      const result = settle(state);
+      if (result === null) return;
+      stop();
+      resolve(result);
+    });
+  });
+}

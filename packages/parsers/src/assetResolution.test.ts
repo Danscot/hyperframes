@@ -1,11 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   collectSubCompositionSrcs,
   isUnresolvedAssetPlaceholder,
+  isWithinProjectRoot,
   maskNonScannableRanges,
+  readProjectFile,
+  readTextFile,
   resolveProjectRelativeSrc,
 } from "./assetResolution.js";
 
@@ -65,6 +70,22 @@ describe("isUnresolvedAssetPlaceholder", () => {
 });
 
 describe("collectSubCompositionSrcs", () => {
+  it("does not retry every unmatched raw text opener or truncate quoted tag delimiters", () => {
+    expect(
+      collectSubCompositionSrcs(
+        "<script>".repeat(10000) + '<div data-composition-src="fake.html">',
+      ),
+    ).toEqual([]);
+    expect(collectSubCompositionSrcs('<div title=">" data-composition-src="real.html">')).toEqual([
+      "real.html",
+    ]);
+  });
+
+  it("reads the actual composition attribute and preserves its raw filename identity", () => {
+    const html = `<div title="data-composition-src='fake.html'" data-composition-src="scenes/it's&amp;%20?#.html"></div>`;
+    expect(collectSubCompositionSrcs(html)).toEqual(["scenes/it's&%20?#.html"]);
+  });
+
   it("finds mounts inside a template, which a DOM query cannot see", () => {
     const html =
       '<!doctype html><html><body><div data-composition-src="compositions/a.html"></div>' +
@@ -136,6 +157,35 @@ describe("resolveProjectRelativeSrc — the one src resolver for lint and render
     expect(resolveProjectRelativeSrc("assets/foo.mp4", projectDir)).toBe(
       join(projectDir, "assets/foo.mp4"),
     );
+  });
+
+  // pathToFileURL gives the host's own form: file:///C:/... on Windows, file:///... elsewhere.
+  it("resolves a file: URL to the file it names, spaces and accents included", () => {
+    const projectDir = join(tmp, "project");
+    const file = join(tmp, "Usu\u00e1rio Teste", "voz \u00f1.wav");
+    mkdirSync(join(tmp, "Usu\u00e1rio Teste"));
+    writeFileSync(file, "");
+    const url = pathToFileURL(file).href;
+    expect(url).toMatch(process.platform === "win32" ? /^file:\/\/\/[A-Z]:\// : /^file:\/\/\/[^/]/);
+
+    expect(resolveProjectRelativeSrc(url, projectDir)).toBe(file);
+  });
+
+  it.runIf(process.platform === "win32")("resolves a Git Bash path to the drive path", () => {
+    const projectDir = join(tmp, "project");
+    const file = join(projectDir, "assets", "foo.mp4");
+    const gitBash = `/${file[0]!.toLowerCase()}${file.slice(2).replaceAll("\\", "/")}`;
+
+    expect(resolveProjectRelativeSrc(gitBash, projectDir).toLowerCase()).toBe(file.toLowerCase());
+  });
+
+  it("treats a file: URL naming no local file as missing, without throwing", () => {
+    const projectDir = join(tmp, "project");
+    const gone = pathToFileURL(join(tmp, "gone.wav")).href;
+
+    for (const url of [gone, "file://not-a-local-host/a.wav", "file:///a%2Fb.wav"]) {
+      expect(existsSync(resolveProjectRelativeSrc(url, projectDir))).toBe(false);
+    }
   });
 
   it("resolves a browser root-absolute URL from the project root", () => {
@@ -217,5 +267,102 @@ describe("resolveProjectRelativeSrc — the one src resolver for lint and render
     for (const src of ["assets/foo.mp4?v=2", "assets/foo.mp4#t=5", " assets/foo.mp4 "]) {
       expect(resolveProjectRelativeSrc(src, projectDir)).toBe(join(projectDir, "assets/foo.mp4"));
     }
+  });
+});
+
+// A CI runner is one OS. Injecting path.win32/path.posix exercises both
+// platforms' separator and drive-letter rules from here, so a regression in
+// either fails this suite regardless of which OS actually runs it.
+describe("isWithinProjectRoot", () => {
+  it("rejects a backslash traversal under path.win32", () => {
+    const root = "C:\\project";
+    const candidate = win32.join(root, "..\\secret.txt");
+    expect(isWithinProjectRoot(root, candidate, win32)).toBe(false);
+  });
+
+  it("rejects a mixed backslash/forward-slash traversal under path.win32", () => {
+    const root = "C:\\project";
+    const candidate = win32.join(root, "..\\../secret.txt");
+    expect(isWithinProjectRoot(root, candidate, win32)).toBe(false);
+  });
+
+  it("rejects a drive-letter path outside the root under path.win32", () => {
+    const root = "C:\\project";
+    const candidate = "D:\\secret.txt";
+    expect(isWithinProjectRoot(root, candidate, win32)).toBe(false);
+  });
+
+  it("allows a nested asset under path.win32", () => {
+    const root = "C:\\project";
+    const candidate = win32.join(root, "assets\\a.png");
+    expect(isWithinProjectRoot(root, candidate, win32)).toBe(true);
+  });
+
+  it("rejects a forward-slash traversal under path.posix", () => {
+    const root = "/project";
+    const candidate = posix.join(root, "../secret.txt");
+    expect(isWithinProjectRoot(root, candidate, posix)).toBe(false);
+  });
+
+  it("allows a nested asset under path.posix", () => {
+    const root = "/project";
+    const candidate = posix.join(root, "assets/a.png");
+    expect(isWithinProjectRoot(root, candidate, posix)).toBe(true);
+  });
+
+  it("allows the root itself", () => {
+    expect(isWithinProjectRoot("/project", "/project", posix)).toBe(true);
+  });
+});
+
+describe("readProjectFile", () => {
+  let dir: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "hf-read-project-file-"));
+    writeFileSync(join(dir, "scene.html"), "<div></div>");
+    mkdirSync(join(dir, "intro"));
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("reads a file's text", () => {
+    expect(readProjectFile(join(dir, "scene.html"))).toEqual({ kind: "file", text: "<div></div>" });
+  });
+
+  it("names a folder instead of throwing EISDIR", () => {
+    expect(readProjectFile(join(dir, "intro"))).toEqual({ kind: "folder" });
+  });
+
+  it("reports a missing path, including one under a file", () => {
+    expect(readProjectFile(join(dir, "gone.html"))).toEqual({ kind: "missing" });
+    expect(readProjectFile(join(dir, "scene.html", "inner.html"))).toEqual({ kind: "missing" });
+  });
+
+  it("reports a name too long or a symlink loop as missing, as existsSync did", () => {
+    expect(readProjectFile(join(dir, `${"a".repeat(300)}.html`))).toEqual({ kind: "missing" });
+    symlinkSync(join(dir, "loop.html"), join(dir, "loop.html"));
+    expect(readProjectFile(join(dir, "loop.html"))).toEqual({ kind: "missing" });
+  });
+
+  it.skipIf(process.platform === "win32")("reports a named pipe without blocking on it", () => {
+    execFileSync("mkfifo", [join(dir, "pipe.html")]);
+    expect(readProjectFile(join(dir, "pipe.html"))).toEqual({ kind: "folder" });
+  });
+});
+
+describe("readTextFile and readProjectFile read a byte order mark as browsers do", () => {
+  const text = "<h1>Café</h1>";
+  const saved: Array<[string, Buffer]> = [
+    ["UTF-16LE", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")])],
+    ["UTF-16BE", Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text, "utf16le").swap16()])],
+    ["UTF-8 with a mark", Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text)])],
+    ["UTF-8", Buffer.from(text)],
+  ];
+  it.each(saved)("%s", (_name, bytes) => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-text-"));
+    const path = join(dir, "page.html");
+    writeFileSync(path, bytes);
+    expect(readTextFile(path)).toBe(text);
+    expect(readProjectFile(path)).toEqual({ kind: "file", text });
+    rmSync(dir, { recursive: true, force: true });
   });
 });

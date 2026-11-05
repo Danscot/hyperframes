@@ -1,11 +1,13 @@
 // Shared scaffolding for the lightweight composition servers used by `play` and
 // `present`: locating the built runtime/player/slideshow bundles, serving
 // composition asset files, and binding to a free port.
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { getMimeType } from "@hyperframes/studio-server";
+import { getMimeType, openRangeEnd } from "@hyperframes/studio-server";
+import { stripSdrPngColourTags } from "@hyperframes/core/compiler/png-colour-tags";
 import { injectTagsAtHeadStart } from "@hyperframes/core/compiler/html-document";
 
 /**
@@ -36,6 +38,7 @@ function helperDir(): string {
 export function resolveRuntimePath(): string | null {
   const d = helperDir();
   const candidates = [
+    resolve(d, "hyperframe.runtime.iife.js"),
     resolve(d, "hyperframe-runtime.js"),
     resolve(d, "..", "hyperframe-runtime.js"),
     // Monorepo dev: src/<dir>/ → src/ → cli/ → packages/ then into core/dist/
@@ -81,6 +84,22 @@ export function assetContentType(filePath: string): string {
   return getMimeType(filePath);
 }
 
+/** `body` with a content validator, or a 304 when the browser already holds these bytes. */
+export function revalidatedResponse(
+  body: string,
+  contentType: string,
+  ifNoneMatch: string | undefined,
+): Response {
+  const etag = `"${createHash("sha256").update(body).digest("base64url").slice(0, 27)}"`;
+  const headers = { "Content-Type": contentType, "Cache-Control": "no-cache", ETag: etag };
+  if (ifNoneMatch === etag) return new Response(null, { status: 304, headers });
+  return new Response(body, { status: 200, headers });
+}
+
+function untaggedPngBody(filePath: string, contentType: string): Buffer | null {
+  return contentType === "image/png" ? stripSdrPngColourTags(readFileSync(filePath)) : null;
+}
+
 /**
  * Hono-native Range/206 response for a file on disk, mirroring the inline
  * Range logic in `packages/studio-server/src/routes/preview.ts`'s static
@@ -92,9 +111,25 @@ export function buildRangeResponse(
   filePath: string,
   contentType: string,
   rangeHeader: string | undefined,
+  ifNoneMatch?: string,
 ): Response {
-  const size = statSync(filePath).size;
+  const { size, mtimeMs } = statSync(filePath);
   const last = size - 1;
+  // Always revalidated, so an edited asset is seen; unchanged bytes cost a 304, not a refetch.
+  const cache = {
+    "Cache-Control": "no-cache",
+    ETag: `"${mtimeMs.toString(36)}-${size.toString(36)}"`,
+  };
+  if (ifNoneMatch === cache.ETag) return new Response(null, { status: 304, headers: cache });
+  const untagged = untaggedPngBody(filePath, contentType);
+  if (untagged) {
+    const headers = {
+      ...cache,
+      "Content-Type": contentType,
+      "Content-Length": `${untagged.length}`,
+    };
+    return new Response(new Uint8Array(untagged), { status: 200, headers });
+  }
   const match = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
 
   const body = (start: number, end: number): ReadableStream<Uint8Array> | null =>
@@ -106,6 +141,7 @@ export function buildRangeResponse(
     return new Response(body(0, last), {
       status: 200,
       headers: {
+        ...cache,
         "Content-Type": contentType,
         "Accept-Ranges": "bytes",
         "Content-Length": String(size),
@@ -115,7 +151,11 @@ export function buildRangeResponse(
 
   const hasStart = match[1] !== "";
   const start = hasStart ? Number(match[1]) : Math.max(0, size - Number(match[2]));
-  const end = !hasStart ? last : match[2] !== "" ? Math.min(Number(match[2]), last) : last;
+  const end = !hasStart
+    ? last
+    : match[2] !== ""
+      ? Math.min(Number(match[2]), last)
+      : openRangeEnd(start, last, contentType);
   if (start > end || start > last) {
     return new Response(null, {
       status: 416,
@@ -126,6 +166,7 @@ export function buildRangeResponse(
   return new Response(body(start, end), {
     status: 206,
     headers: {
+      ...cache,
       "Content-Type": contentType,
       "Accept-Ranges": "bytes",
       "Content-Range": `bytes ${start}-${end}/${size}`,

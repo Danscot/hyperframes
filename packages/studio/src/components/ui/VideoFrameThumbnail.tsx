@@ -26,9 +26,18 @@ export function VideoFrameThumbnail({
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d");
 
+    // Clearing src fires one more `error` on the video, so the error handler
+    // must be detached first — otherwise error → cleanup → error spins forever.
     const cleanup = () => {
+      video.removeEventListener("error", onError);
       video.src = "";
       video.load();
+    };
+    const onError = () => {
+      // Ignore the synthetic error cleanup itself just triggered.
+      if (!video.getAttribute("src")) return;
+      setFailed(true);
+      cleanup();
     };
 
     video.addEventListener("loadedmetadata", () => {
@@ -44,11 +53,7 @@ export function VideoFrameThumbnail({
       cleanup();
     });
 
-    video.addEventListener("error", () => {
-      // Resolve the loading state — a permanent shimmer reads as "still loading".
-      setFailed(true);
-      cleanup();
-    });
+    video.addEventListener("error", onError);
     video.src = src;
     video.load();
 
@@ -64,9 +69,7 @@ export function VideoFrameThumbnail({
   }
 
   if (!frame) {
-    return (
-      <div className="w-full h-full bg-neutral-800 animate-pulse motion-reduce:animate-none" />
-    );
+    return <div data-thumbnail-loading className="w-full h-full bg-panel-surface" />;
   }
 
   return <img src={frame} alt="" draggable={false} className="w-full h-full object-contain" />;

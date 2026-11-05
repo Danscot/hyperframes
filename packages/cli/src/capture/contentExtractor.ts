@@ -22,7 +22,11 @@ import { basename, join } from "node:path";
 import type sharpType from "sharp";
 import type { CatalogedAsset } from "./assetCataloger.js";
 import type { DesignTokens } from "./types.js";
-import { loadOptionalPackage, type OptionalPackageModules } from "../utils/optionalPackages.js";
+import {
+  loadOptionalPackage,
+  loadSharp,
+  type OptionalPackageModules,
+} from "../utils/optionalPackages.js";
 
 const DEFAULT_VISION_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -408,11 +412,8 @@ export async function captionImagesWithGemini(
               ],
               config: {
                 maxOutputTokens: maxTokens,
-                // A one-line factual caption needs no reasoning, and leaving thinking on is
-                // not merely wasteful: thinking tokens are drawn from maxOutputTokens, so the
-                // model can spend the whole budget and return empty text. That surfaces as a
-                // successful request with no caption — the capture then logs "Captioned N/N
-                // images" followed by "0 images captioned", which is what production shows.
+                // Thinking tokens are drawn from maxOutputTokens, so the model can spend the
+                // whole budget and return a successful request with no caption text.
                 thinkingConfig: { thinkingBudget: 0 },
                 abortSignal: signal,
                 httpOptions: { timeout: timeoutMs },
@@ -463,7 +464,7 @@ export async function captionImagesWithGemini(
       const results = await Promise.allSettled(
         batch.map(async (file: string) => {
           const filePath = join(outputDir, "assets", file);
-          const fd = openSync(filePath, "r");
+          const fd = openSync(filePath, "r", 0o600);
           let buffer: Buffer;
           try {
             const stat = fstatSync(fd);
@@ -523,7 +524,7 @@ export async function captionImagesWithGemini(
       // than crashing the whole capture command on import.
       let sharp: typeof sharpType;
       try {
-        sharp = (await import("sharp")).default as typeof sharpType;
+        sharp = await loadSharp("SVG captions");
       } catch (err) {
         warnings.push(
           `Skipped ${svgFiles.length} SVG caption(s): sharp could not load (${(err as Error).message}). ` +

@@ -11,8 +11,8 @@ import {
   shouldDeclineTextCutoverForTarget,
 } from "./sdkCutoverEligibility";
 import {
-  asCutoverError,
   declinedCutover,
+  failedCutover,
   persistSdkCandidateMutation,
   type CutoverDeps,
   type CutoverOptions,
@@ -32,7 +32,6 @@ export type {
   CutoverResult,
   PublishSdkSession,
 } from "./sdkEditTransaction";
-
 function sdkFamilyEnabled(family: StudioSdkOperationFamily): boolean {
   const configured = Object.prototype.hasOwnProperty.call(
     studioAvailability,
@@ -45,15 +44,15 @@ function sdkFamilyEnabled(family: StudioSdkOperationFamily): boolean {
 
 function trackCutoverResult(
   result: CutoverResult,
+  family: StudioSdkOperationFamily,
   context: { hfId?: string | null; opCount: number },
 ): void {
   if (result.status === "committed") {
-    trackStudioEvent("sdk_cutover_success", context);
+    trackStudioEvent("sdk_cutover_success", { ...context, family });
   } else if (result.status === "failed") {
-    trackStudioEvent("sdk_cutover_failed", { ...context, error: result.error.message });
+    failedCutover(result.error, family, context);
   }
 }
-
 /** True when targetPath isn't the composition the SDK session models. */
 function wrongCompositionFile(deps: CutoverDeps, targetPath: string): boolean {
   return deps.compositionPath != null && targetPath !== deps.compositionPath;
@@ -104,9 +103,20 @@ export async function sdkCutoverPersist(
     (session) => {
       for (const editOp of patchOpsToSdkEditOps(hfId, ops)) session.dispatch(editOp);
     },
-    options,
+    {
+      ...options,
+      targets: [
+        {
+          file: targetPath,
+          hfId,
+          ...(selection.id && { id: selection.id }),
+          ...(selection.selector && { selector: selection.selector }),
+          ...(selection.selectorIndex !== undefined && { selectorIndex: selection.selectorIndex }),
+        },
+      ],
+    },
   );
-  trackCutoverResult(result, { hfId, opCount: ops.length });
+  trackCutoverResult(result, "dom", { hfId, opCount: ops.length });
   return result;
 }
 
@@ -148,15 +158,12 @@ export async function sdkTimingPersist(
       options,
       serializedBefore,
     );
-    trackCutoverResult(result, { hfId, opCount: 1 });
+    trackCutoverResult(result, "timing", { hfId, opCount: 1 });
     return result;
   } catch (error) {
-    const failed = { status: "failed", error: asCutoverError(error) } as const;
-    trackStudioEvent("sdk_cutover_failed", { hfId, error: failed.error.message });
-    return failed;
+    return failedCutover(error, "timing", { hfId, opCount: 1 });
   }
 }
-
 export async function sdkTimingBatchPersist(
   changes: Array<{
     hfId: string;
@@ -202,24 +209,22 @@ export async function sdkTimingBatchPersist(
       serializedBefore,
     );
     if (result.status === "failed") {
-      trackStudioEvent("sdk_cutover_failed", {
+      return failedCutover(result.error, "timing", {
         hfId: changes[0]?.hfId ?? null,
-        error: result.error.message,
+        opCount: changes.length,
       });
-      return result;
     }
     trackStudioEvent("sdk_cutover_success", {
       hfId: changes[0]?.hfId ?? null,
       opCount: changes.length,
+      family: "timing",
     });
     return result;
   } catch (error) {
-    const failed = { status: "failed", error: asCutoverError(error) } as const;
-    trackStudioEvent("sdk_cutover_failed", {
+    return failedCutover(error, "timing", {
       hfId: changes[0]?.hfId ?? null,
-      error: failed.error.message,
+      opCount: changes.length,
     });
-    return failed;
   }
 }
 
@@ -227,7 +232,6 @@ type SdkGsapTweenOp =
   | { kind: "add"; target: string; spec: GsapTweenSpec }
   | { kind: "set"; animationId: string; properties: Partial<GsapTweenSpec> }
   | { kind: "remove"; animationId: string };
-
 export function sdkGsapTweenPersist(
   targetPath: string,
   op: SdkGsapTweenOp,
@@ -279,7 +283,6 @@ export function sdkGsapTweenPersist(
     });
   });
 }
-
 async function dispatchGsapOpAndPersist(
   family: "gsap-animation" | "gsap-keyframe",
   targetPath: string,
@@ -321,18 +324,15 @@ async function dispatchGsapOpAndPersist(
       serializedBefore,
     );
     if (result.status === "committed") {
-      trackStudioEvent("sdk_cutover_success", { opCount: 1 });
+      trackStudioEvent("sdk_cutover_success", { opCount: 1, family });
     } else if (result.status === "failed") {
-      trackStudioEvent("sdk_cutover_failed", { error: result.error.message });
+      return failedCutover(result.error, family, { opCount: 1 });
     }
     return result;
   } catch (error) {
-    const failed = { status: "failed", error: asCutoverError(error) } as const;
-    trackStudioEvent("sdk_cutover_failed", { error: failed.error.message });
-    return failed;
+    return failedCutover(error, family, { opCount: 1 });
   }
 }
-
 export function sdkGsapKeyframePersist(
   targetPath: string,
   animationId: string,
@@ -595,6 +595,6 @@ export async function sdkDeletePersist(
     (session) => session.removeElement(hfId),
     { label: "Delete element" },
   );
-  trackCutoverResult(result, { hfId, opCount: 1 });
+  trackCutoverResult(result, "lifecycle", { hfId, opCount: 1 });
   return result;
 }

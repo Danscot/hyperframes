@@ -1,9 +1,13 @@
 import { buildProjectApiPath } from "../../utils/projectRouting";
 import { forwardRef, useEffect, useRef, useState } from "react";
 import { isLottieAnimationLoaded } from "@hyperframes/core/runtime/lottie-readiness";
+import { installAcceleratedCanvasTracker } from "@hyperframes/core/page-motion-blur";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { applyPreviewVariablesToUrl } from "../../hooks/previewVariablesStore";
 import { HyperframesLoader } from "../../components/ui";
+import { usePlayerStore } from "../store/playerStore";
+import { announcePreviewDocumentLoaded } from "../sceneSwap";
+import type { IframeWindow } from "../lib/playbackTypes";
 // Importing "@hyperframes/player" registers a class extending HTMLElement at
 // module load, which throws under SSR, hence the dynamic import behind a
 // `typeof window` guard. Kicking it here rather than in the mount effect puts
@@ -22,6 +26,8 @@ export function loadPlayerModule(): Promise<unknown> {
 
 if (typeof window !== "undefined") void loadPlayerModule().catch(() => {});
 
+if (typeof window !== "undefined") installAcceleratedCanvasTracker();
+
 interface PlayerProps {
   projectId?: string;
   directUrl?: string;
@@ -30,13 +36,18 @@ interface PlayerProps {
   onReadyToShowChange?: (ready: boolean) => void;
   onPreviewError?: (message: string) => void;
   onCompositionLoadingChange?: (loading: boolean) => void;
+  onPainted?: (details: { iframe: HTMLIFrameElement; startedAt: number; loadId: number }) => void;
   portrait?: boolean;
   style?: React.CSSProperties;
   suppressLoadingOverlay?: boolean;
+  loadingUi?: "studio" | "host";
+  noLoadTimeout?: boolean;
 }
 
 interface HyperframesPlayerElement extends HTMLElement {
   iframeElement: HTMLIFrameElement;
+  ready?: boolean;
+  painted?: boolean;
 }
 
 const MEDIA_HAVE_FUTURE_DATA = 3;
@@ -56,6 +67,7 @@ function getShaderTransitionLoading(event: Event): boolean | null {
 }
 
 const COMPOSITION_LOADING_OVERLAY_DELAY_MS = 400;
+const PREVIEW_BOOT_DEADLINE_MS = 5000;
 const DEFAULT_PREVIEW_ERROR = "The composition preview did not become ready.";
 
 export function shouldShowCompositionLoadingOverlay(compositionLoading: boolean): boolean {
@@ -79,6 +91,9 @@ function enableInteractiveIframe(player: HyperframesPlayerElement): void {
   container?.style.setProperty("pointer-events", "auto");
   iframe?.style.setProperty("pointer-events", "auto");
 }
+
+const studioDraws = (wait: boolean, loadingUi: PlayerProps["loadingUi"]) =>
+  wait && loadingUi !== "host";
 
 function isPreviewMediaElement(el: Element): el is HTMLMediaElement {
   const tagName = el.tagName.toLowerCase();
@@ -123,6 +138,9 @@ export function hasUnloadedAssets(iframe: HTMLIFrameElement, lastResult: boolean
   }
 }
 
+const runtimeBootedIn = (iframe: HTMLIFrameElement) =>
+  (iframe.contentWindow as IframeWindow | null)?.__playerReady === true;
+
 /**
  * Renders a composition preview using the <hyperframes-player> web component.
  *
@@ -140,9 +158,12 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       onReadyToShowChange,
       onPreviewError,
       onCompositionLoadingChange,
+      onPainted,
       portrait,
       style,
       suppressLoadingOverlay,
+      noLoadTimeout,
+      ...host
     },
     ref,
   ) => {
@@ -151,6 +172,8 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
     const assetPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const assetFadeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const retryPreviewRef = useRef<(() => void) | null>(null);
+    const loadStartedAtRef = useRef(0);
+    const loadIdRef = useRef(0);
     const retryCountRef = useRef(0);
     // Read at call time: this element outlives its first props (a shadow preview is
     // promoted in place), so mount-time closures would go stale.
@@ -209,6 +232,9 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           retryUrl.searchParams.set("_hfStudioRetry", String(retryCountRef.current));
           setPreviewError(null);
           setCompositionLoading(true);
+          loadStartedAtRef.current = performance.now();
+          loadIdRef.current += 1;
+          player.removeAttribute("no-load-timeout");
           player.setAttribute("src", retryUrl.pathname + retryUrl.search);
         };
         retryPreviewRef.current = retryPreview;
@@ -218,11 +244,16 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           const loading = getShaderTransitionLoading(event);
           if (loading !== null) setShaderTransitionLoading(loading);
         };
+        let loadedDocument: Document | null = null;
         const handleReady = () => {
           setPreviewError(null);
           setCompositionLoading(false);
+          if (iframe.contentDocument && runtimeBootedIn(iframe)) handleLoad();
         };
-        const handlePainted = () => setPainted(true);
+        const handlePainted = () => {
+          setPainted(true);
+          onPainted?.({ iframe, startedAt: loadStartedAtRef.current, loadId: loadIdRef.current });
+        };
         const handleError = (event: Event) => {
           const message = readPreviewErrorMessage(event);
           onPreviewErrorRef.current?.(message);
@@ -230,12 +261,15 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           setCompositionLoading(false);
         };
         const handleLoad = () => {
+          const doc = iframe.contentDocument;
+          if (doc && doc === loadedDocument) return;
+          loadedDocument = doc;
           loadCountRef.current++;
           setLoaded(true);
           setPreviewError(null);
           setShaderTransitionLoading(false);
-          setCompositionLoading(true);
-          setPainted(false);
+          setCompositionLoading(!player.ready);
+          setPainted(Boolean(player.painted));
           // Reveal animation on reload (hot-reload, composition switch)
           if (loadCountRef.current > 1) {
             container.classList.remove("preview-revealing");
@@ -245,6 +279,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
             container.addEventListener("animationend", onEnd, { once: true });
           }
           onLoadRef.current();
+          announcePreviewDocumentLoaded(iframe);
 
           // Show a loading overlay until every `<video>`/`<audio>` and Lottie
           // asset is ready. Without this users can click play before audio has
@@ -274,7 +309,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
               if (!lastUnloaded || attempts > 100) {
                 if (lastUnloaded && attempts > 100) {
                   console.debug(
-                    "[studio] asset readiness poll hit the 10s cap — continuing with unloaded assets",
+                    "[studio] asset readiness poll hit the 10s cap, continuing with unloaded assets",
                   );
                 }
                 if (assetPollRef.current) clearInterval(assetPollRef.current);
@@ -306,26 +341,18 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
 
         player.setAttribute("shader-capture-scale", "1");
         player.setAttribute("shader-loading", "player");
+        player.setAttribute("low-power-idle", "");
+        player.toggleAttribute("no-load-timeout", noLoadTimeout === true);
         player.setAttribute("width", String(portrait ? 1080 : 1920));
         player.setAttribute("height", String(portrait ? 1920 : 1080));
         player.style.width = "100%";
         player.style.height = "100%";
         player.style.display = "block";
         player.style.background = "transparent";
+        loadStartedAtRef.current = performance.now();
+        loadIdRef.current += 1;
         player.setAttribute("src", src);
         container.appendChild(player);
-
-        // Inject pasteboard shadow: let the shadow around the canvas bleed
-        // into the surrounding pasteboard area (overflow: visible on the container)
-        // and add a subtle outline + drop-shadow so the canvas boundary reads
-        // against the gray pasteboard, consistent with professional editors.
-        if (player.shadowRoot) {
-          const pasteboardStyle = document.createElement("style");
-          pasteboardStyle.textContent =
-            ".hfp-container{overflow:visible}" +
-            ".hfp-iframe{box-shadow:0 0 0 1px rgba(255,255,255,0.08),0 4px 32px rgba(0,0,0,.7)}";
-          player.shadowRoot.appendChild(pasteboardStyle);
-        }
 
         enableInteractiveIframe(player);
 
@@ -416,13 +443,13 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       setAssetsLoading(false);
     };
 
-    const readyToShow =
-      loaded &&
-      painted &&
-      !compositionLoading &&
-      !shaderTransitionLoading &&
-      !assetsLoading &&
-      !previewError;
+    const firstFrameShown =
+      loaded && painted && !compositionLoading && !shaderTransitionLoading && !previewError;
+    const readyToShow = firstFrameShown && !assetsLoading;
+    // Work waiting on the boot starts at the first frame, while media still buffers.
+    useEffect(() => {
+      if (firstFrameShown) usePlayerStore.getState().markPreviewBooted();
+    }, [firstFrameShown]);
     // `painted` means the player's own loader has finished fading; two frames of grace on top.
     useEffect(() => {
       if (!readyToShow) {
@@ -439,16 +466,30 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       };
     }, [readyToShow]);
 
-    const showCompositionOverlay =
+    useEffect(() => {
+      if (previewError) usePlayerStore.getState().markPreviewBooted();
+    }, [previewError]);
+
+    useEffect(() => {
+      const timer = setTimeout(
+        () => usePlayerStore.getState().markPreviewBooted(),
+        PREVIEW_BOOT_DEADLINE_MS,
+      );
+      return () => clearTimeout(timer);
+    }, [projectId]);
+
+    const compositionWaitShown =
       !suppressLoadingOverlay &&
       !compositionOverlayDeferred &&
       shouldShowCompositionLoadingOverlay(compositionLoading);
-    const showAssetOverlay =
-      assetOverlayVisible && !shaderTransitionLoading && !showCompositionOverlay && !previewError;
+    const assetWaitShown =
+      assetOverlayVisible && !shaderTransitionLoading && !compositionWaitShown && !previewError;
+    const showCompositionOverlay = studioDraws(compositionWaitShown, host.loadingUi);
+    const showAssetOverlay = studioDraws(assetWaitShown, host.loadingUi);
 
     useEffect(() => {
-      onCompositionLoadingChange?.(showCompositionOverlay || showAssetOverlay);
-    }, [onCompositionLoadingChange, showCompositionOverlay, showAssetOverlay]);
+      onCompositionLoadingChange?.(compositionWaitShown || assetWaitShown);
+    }, [onCompositionLoadingChange, compositionWaitShown, assetWaitShown]);
 
     return (
       <div

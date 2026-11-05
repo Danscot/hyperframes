@@ -5,6 +5,7 @@
 
 import { ContextMenu as BaseContextMenu } from "@base-ui/react/context-menu";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
+import { useRef } from "react";
 import type { ComponentPropsWithoutRef, ElementType, ReactElement, ReactNode } from "react";
 import { cn } from "./cn";
 
@@ -20,27 +21,52 @@ type StyledProps<T extends ElementType> = Omit<ComponentPropsWithoutRef<T>, "cla
 export type PopupPreviewState = "open";
 
 /** Where the portal puts the popup. `null` keeps it inline, next to its trigger. */
-type PortalContainer = ComponentPropsWithoutRef<typeof BaseMenu.Portal>["container"];
+export type PortalContainer = ComponentPropsWithoutRef<typeof BaseMenu.Portal>["container"];
+
+const CONTENTS = { display: "contents" } as const;
+
+/** Base UI reads a `null` container as "not resolved yet" and renders nothing, so give `null` a host by the trigger. */
+export function useInlinePortal(container: PortalContainer) {
+  const host = useRef<HTMLSpanElement>(null);
+  if (container !== null) return { host: null, portal: { container } };
+  return {
+    host: <span ref={host} style={CONTENTS} />,
+    portal: { container: host, style: CONTENTS },
+  };
+}
 
 /** Matches Tooltip's gap from its trigger, and its viewport margin. */
 const SIDE_OFFSET = 6;
 const VIEWPORT_MARGIN = 8;
 
 /**
- * Chrome shared by every floating panel (`Popover` too); callers add their own shadow token.
+ * Enter and exit shared by menus, popovers, dropdowns, and tooltips.
+ * The open duration class differs; the shape does not.
  * `data-starting-style`/`data-ending-style` are Base UI's transition attributes.
+ */
+export function floatingMotion(openDuration: "duration-open" | "duration-tooltip") {
+  return cn(
+    "origin-[var(--transform-origin)] outline-hidden",
+    "transition-[opacity,transform] ease-out-quint",
+    openDuration,
+    "data-[ending-style]:duration-close data-[ending-style]:ease-in",
+    "data-[starting-style]:[opacity:var(--popup-enter-opacity)]",
+    "data-[starting-style]:[scale:var(--popup-enter-scale)]",
+    "data-[ending-style]:opacity-0",
+  );
+}
+
+/**
+ * Chrome shared by every floating panel (`Popover` too); callers add their own shadow token.
  */
 export const popupSurface = cn(
   "rounded-lg border border-border-input bg-surface",
-  "origin-[var(--transform-origin)] outline-hidden",
-  "transition-[opacity,transform] ease-out-quint duration-open",
-  "data-[starting-style]:opacity-0 data-[starting-style]:scale-95",
-  "data-[ending-style]:opacity-0 data-[ending-style]:scale-95",
+  floatingMotion("duration-open"),
   "data-[preview-state=open]:opacity-100 data-[preview-state=open]:scale-100",
 );
 
-/** The popup's own layer: menus sit above panel chrome and below a modal. */
-const POPUP_LAYER = "z-200";
+/** Every floating list, menu, popover and tooltip sits on this layer, above panel chrome and modals. */
+export const POPUP_LAYER = "z-200";
 
 const menuPopup = cn(popupSurface, "min-w-36 p-1 shadow-menu");
 
@@ -54,7 +80,9 @@ const itemBase = cn(
   "data-[disabled]:pointer-events-none data-[disabled]:opacity-40",
 );
 
-const itemDanger = cn("text-danger data-[highlighted]:bg-danger/15 data-[highlighted]:text-danger");
+const itemDanger = cn(
+  "text-danger-ink data-[highlighted]:bg-danger/15 data-[highlighted]:text-danger-ink",
+);
 
 export type MenuItemTone = "default" | "danger";
 
@@ -62,7 +90,7 @@ interface PositionedProps {
   side?: "top" | "bottom" | "left" | "right";
   align?: "start" | "center" | "end";
   sideOffset?: number;
-  /** Portal target. Pass the shadow root when the trigger lives in one. */
+  /** Portal target. Pass the shadow root when the trigger lives in one; `null` keeps it inline. */
   container?: PortalContainer;
   /** Names the popup for assistive tech. A menu with no name is unlabelled. */
   "aria-label"?: string;
@@ -94,10 +122,12 @@ export function Menu({
   "data-preview-state": previewState,
   ...root
 }: MenuProps) {
+  const inline = useInlinePortal(container);
   return (
     <BaseMenu.Root {...root}>
       <BaseMenu.Trigger render={trigger} />
-      <BaseMenu.Portal container={container}>
+      {inline.host}
+      <BaseMenu.Portal {...inline.portal}>
         <BaseMenu.Positioner
           side={side}
           align={align}
@@ -138,10 +168,12 @@ export function ContextMenu({
   "data-preview-state": previewState,
   ...root
 }: Omit<ContextMenuProps, "side" | "align" | "sideOffset">) {
+  const inline = useInlinePortal(container);
   return (
     <BaseContextMenu.Root {...root}>
       <BaseContextMenu.Trigger render={trigger} />
-      <BaseContextMenu.Portal container={container}>
+      {inline.host}
+      <BaseContextMenu.Portal {...inline.portal}>
         <BaseContextMenu.Positioner collisionPadding={VIEWPORT_MARGIN} className={POPUP_LAYER}>
           <BaseContextMenu.Popup
             aria-label={ariaLabel}
@@ -204,6 +236,22 @@ export function MenuRadioItem({ className, children, ...props }: MenuRadioItemPr
         <BaseMenu.RadioItemIndicator className="size-1.5 rounded-full bg-accent" />
       </span>
     </BaseMenu.RadioItem>
+  );
+}
+
+/** An on/off row; the tick renders only while `checked`. */
+export function MenuCheckboxItem({
+  className,
+  children,
+  ...props
+}: StyledProps<typeof BaseMenu.CheckboxItem>) {
+  return (
+    <BaseMenu.CheckboxItem className={cn(itemBase, className)} {...props}>
+      <span className="truncate">{children}</span>
+      <span className="flex size-3 shrink-0 items-center justify-center text-accent-ink">
+        <BaseMenu.CheckboxItemIndicator>✓</BaseMenu.CheckboxItemIndicator>
+      </span>
+    </BaseMenu.CheckboxItem>
   );
 }
 

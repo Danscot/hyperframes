@@ -49,7 +49,21 @@ describe("cloud/errors reportApiError", () => {
     expect(errorBox).toHaveBeenCalledWith(
       "Upload failed (HTTP 413)",
       "project too large",
-      "The zip exceeded the 200 MB limit. Run `hyperframes cloud render --dry-run`, then add only verified-unneeded paths to `.hyperframesignore` or pre-host required large media.",
+      "The zip exceeded the 200 MB limit. Run `hyperframes cloud render --dry-run` to see what stays in it, then add only verified-unneeded paths to `.hyperframesignore`.",
+    );
+  });
+
+  it("points an upload the server refuses as too large to dry-run, not to --help", () => {
+    const err = new HyperframesApiError({
+      status: 400,
+      message: "File too large. Maximum is 200 MiB.",
+      code: "invalid_parameter",
+    });
+    expect(() => reportApiError("Upload failed", err)).toThrow(CliRuntimeError);
+    expect(errorBox).toHaveBeenCalledWith(
+      "Upload failed (HTTP 400)",
+      "File too large. Maximum is 200 MiB.",
+      expect.stringContaining("hyperframes cloud render --dry-run"),
     );
   });
 
@@ -92,6 +106,21 @@ describe("cloud/errors reportApiError", () => {
       "List failed (HTTP 500)",
       "boom",
       "code: some_unmapped_code",
+    );
+  });
+
+  it("names the refused parameter next to the server's message", () => {
+    const err = new HyperframesApiError({
+      status: 400,
+      message: "Stored file type not supported",
+      code: "invalid_parameter",
+      param: "content_type",
+    });
+    expect(() => reportApiError("Media upload failed", err)).toThrow(CliRuntimeError);
+    expect(errorBox).toHaveBeenCalledWith(
+      "Media upload failed (HTTP 400)",
+      "Stored file type not supported (parameter: content_type)",
+      expect.any(String),
     );
   });
 

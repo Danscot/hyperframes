@@ -16,9 +16,17 @@
 // submodule so Windows builds don't emit backslash-separated paths (or worse,
 // drive-letter-prefixed artifacts from `resolve("/", ...)`).
 import { posix } from "path";
+import { rewriteSrcsetUrls } from "./srcset.js";
 const { join, resolve, dirname } = posix;
 
-import { CSS_URL_RE, PATH_ATTRS, isNonRelativeUrl } from "./assetPaths.js";
+import {
+  CSS_URL_RE,
+  PATH_ATTRS,
+  isNonRelativeUrl,
+  splitUrlSuffix,
+  decodeWellFormedEscapes,
+  encodeUrlPath,
+} from "./assetPaths.js";
 
 const isAbsoluteOrSpecial = isNonRelativeUrl;
 
@@ -52,12 +60,6 @@ function needsRewrite(val: string): boolean {
  */
 export type AssetExists = (projectRelativePath: string) => boolean;
 
-/** Split `foo.png?v=2#frag` into its path and its `?`/`#` suffix. */
-function splitPathSuffix(value: string): [string, string] {
-  const marker = value.search(/[?#]/);
-  return marker === -1 ? [value, ""] : [value.slice(0, marker), value.slice(marker)];
-}
-
 /**
  * Rewrite a single relative path from a sub-composition's context to the
  * project root context.
@@ -76,16 +78,13 @@ export function rewriteAssetPath(
   if (isAbsoluteOrSpecial(relativePath)) return relativePath;
   const compDir = dirname(compSrcPath);
   if (!compDir || compDir === ".") return relativePath;
-  if (!needsRewrite(relativePath)) {
-    if (!assetExists) return relativePath;
-    const [filePart, suffix] = splitPathSuffix(relativePath);
-    if (!filePart) return relativePath;
-    const sibling = resolve("/", join(compDir, filePart)).slice(1);
-    return assetExists(sibling) ? sibling + suffix : relativePath;
-  }
-  const resolved = join(compDir, relativePath);
-  const normalized = resolve("/", resolved).slice(1);
-  return normalized;
+  const { basePath, suffix } = splitUrlSuffix(relativePath);
+  const slashed = basePath.replace(/\\/g, "/");
+  if (!slashed || slashed.startsWith("/")) return relativePath;
+  const filePath = decodeWellFormedEscapes(slashed);
+  const sibling = resolve("/", join(compDir, filePath)).slice(1);
+  if (!needsRewrite(filePath) && (!assetExists || !assetExists(sibling))) return relativePath;
+  return encodeUrlPath(sibling) + suffix;
 }
 
 /**
@@ -113,6 +112,12 @@ export function rewriteAssetPaths<T>(
         setAttr(el, attr, rewritten);
       }
     }
+    const srcset = getAttr(el, "srcset");
+    if (!srcset) continue;
+    const rewritten = rewriteSrcsetUrls(srcset, (url) =>
+      rewriteAssetPath(compSrcPath, url, assetExists),
+    );
+    if (rewritten !== srcset) setAttr(el, "srcset", rewritten);
   }
 }
 

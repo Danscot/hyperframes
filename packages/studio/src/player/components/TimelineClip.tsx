@@ -1,13 +1,28 @@
 import { memo, type CSSProperties, type ReactNode } from "react";
 import type { TimelineElement } from "../store/playerStore";
-import { defaultTimelineTheme, getClipHandleOpacity, type TimelineTheme } from "./timelineTheme";
+import {
+  CLIP_TRIM_HIT_PX,
+  clipWidthLadder,
+  defaultTimelineTheme,
+  getClipHandleOpacity,
+  type TimelineTheme,
+} from "./timelineTheme";
 import type { TimelineEditCapabilities } from "./timelineEditing";
 import { isAudioTimelineElement } from "../../utils/timelineInspector";
 import { timelineClipFocusId } from "./timelineNavigationIdentity";
+import { ClipFadesContext, TimelineClipFades, useClipFadeDraft } from "./TimelineClipFades";
+import { rendersWaveform } from "./AudioWaveform";
+import { ClipBadges } from "./ClipBadges";
+import { linkLabelColor } from "./linkLabelColor";
+import { OutOfSyncBadge } from "./OutOfSyncBadge";
+import { clipSpeedSuffix } from "./clipToolAttrs";
+import { ClipPeakTooltip } from "./ClipPeakTooltip";
+import { timeLayerPercent } from "./TimelineTimeLayer";
 
 interface TimelineClipProps {
   el: TimelineElement;
   pps: number;
+  passengerStyle?: CSSProperties;
   clipY: number;
   clipHeight?: number;
   isSelected: boolean;
@@ -30,10 +45,25 @@ interface TimelineClipProps {
   children?: ReactNode;
 }
 
+const HANDLES_MIN_PX = 32;
+
+const CLIP_MIN_WIDTH_PX = 4;
+export const clipWidthPx = (el: TimelineElement, pps: number) =>
+  Math.max(el.duration * pps, CLIP_MIN_WIDTH_PX);
+
+/** Zoom-dependent drawing as one value: width tier and trim fit, or the scale while fades show. */
+export function clipZoomKey(el: TimelineElement, pps: number, interacting: boolean) {
+  const fadesLive = interacting || (el.fadeIn ?? 0) > 0 || (el.fadeOut ?? 0) > 0;
+  if (fadesLive) return pps;
+  const widthPx = clipWidthPx(el, pps);
+  return `${clipWidthLadder(widthPx)}${widthPx >= HANDLES_MIN_PX ? "+handles" : ""}`;
+}
+
 // fallow-ignore-next-line complexity
 export const TimelineClip = memo(function TimelineClip({
   el,
   pps,
+  passengerStyle,
   clipY,
   clipHeight,
   isSelected,
@@ -55,13 +85,14 @@ export const TimelineClip = memo(function TimelineClip({
   onContextMenu,
   children,
 }: TimelineClipProps) {
-  const leftPx = el.start * pps;
-  const widthPx = Math.max(el.duration * pps, 4);
+  const widthPx = clipWidthPx(el, pps);
   const handleOpacity = getClipHandleOpacity({ isHovered, isSelected, isDragging });
-  const displayLabel = el.label || el.id || el.tag;
-  const showHandles = handleOpacity > 0.01 && (widthPx >= 32 || isSelected);
-  const showLabel = widthPx >= 40 || isSelected;
-  const showDefaultText = !hasCustomContent && (widthPx >= 40 || isSelected);
+  const displayLabel = `${el.label || el.id || el.tag}${clipSpeedSuffix(el.playbackRate, el.automation)}`;
+  const isAudioClip = isAudioTimelineElement(el);
+  const ladder = clipWidthLadder(widthPx);
+  const showHandles = handleOpacity > 0.01 && (widthPx >= HANDLES_MIN_PX || isSelected);
+  const showLabel = !isAudioClip || ladder === "labeled";
+  const showDefaultText = !hasCustomContent && ladder === "labeled";
   const startLabel = el.start.toFixed(1);
   const endLabel = (el.start + el.duration).toFixed(1);
   const themeVariables = {
@@ -74,6 +105,14 @@ export const TimelineClip = memo(function TimelineClip({
     "--clip-border-active": theme.clipBorderActive,
     "--clip-handle": theme.handleColor,
   } as CSSProperties;
+  const linkColor = linkLabelColor(el.link);
+  if (linkColor) Object.assign(themeVariables, { "--clip-link-color": linkColor });
+  const hasFades = (isAudioClip || Boolean(el.hasAudio)) && !isGestureActor;
+  const fade = useClipFadeDraft(el);
+  const badges =
+    ladder === "labeled" && !isGestureActor ? (
+      <ClipBadges el={el} onOpenMenu={onContextMenu} />
+    ) : null;
   const clipClassName = [
     "timeline-clip",
     "absolute",
@@ -81,19 +120,19 @@ export const TimelineClip = memo(function TimelineClip({
     isSelected ? "is-selected" : "",
     isHovered ? "is-hovered" : "",
     isDragging ? "is-dragging" : "",
-    isAudioTimelineElement(el) ? "is-audio" : "",
+    isAudioClip ? "is-audio" : "",
   ]
     .filter((className) => className.length > 0)
     .join(" ");
   const style: CSSProperties = {
-    left: leftPx,
-    width: widthPx,
+    left: timeLayerPercent(el.start),
+    width: timeLayerPercent(el.duration),
+    minWidth: CLIP_MIN_WIDTH_PX,
     top: clipY,
     ...(clipHeight === undefined ? { bottom: clipY } : { height: clipHeight }),
-    borderRadius: theme.clipRadius,
+    borderRadius: isAudioClip ? theme.audioClipRadius : theme.clipRadius,
     ...themeVariables,
     zIndex: isDragging ? 20 : isSelected ? 10 : isHovered ? 5 : 1,
-    // Regular cursor over clips (CapCut-style, user preference) — no grab hand.
     cursor: "default",
     appearance: "none",
     color: "inherit",
@@ -101,9 +140,10 @@ export const TimelineClip = memo(function TimelineClip({
     padding: 0,
     textAlign: "left",
     transform: isDragging ? "translateY(-1px)" : undefined,
+    ...passengerStyle,
   };
 
-  return (
+  const clip = (
     <button
       type="button"
       data-clip={isGestureActor ? undefined : "true"}
@@ -112,17 +152,25 @@ export const TimelineClip = memo(function TimelineClip({
       data-clip-start={el.start}
       data-clip-end={el.start + el.duration}
       data-clip-hidden={el.hidden ? "true" : undefined}
+      data-link-color={linkColor ?? undefined}
+      data-ladder={ladder}
       data-active={isActive ? "" : undefined}
       aria-hidden={isGestureActor ? "true" : undefined}
       tabIndex={isGestureActor ? undefined : tabIndex}
       aria-label={`${displayLabel}, ${startLabel} to ${endLabel} seconds`}
       aria-pressed={isGestureActor ? undefined : isSelected}
+      aria-keyshortcuts={isGestureActor || !capabilities.canMove ? undefined : "Space"}
+      aria-description={
+        isGestureActor || !capabilities.canMove
+          ? undefined
+          : "Space picks up. Up and Down choose a new track. Enter drops. Escape cancels."
+      }
       className={clipClassName}
       style={style}
       title={
         isComposition
           ? `${el.compositionSrc} • Double-click to open`
-          : `${displayLabel} • ${el.start.toFixed(1)}s – ${(el.start + el.duration).toFixed(1)}s`
+          : `${displayLabel} • ${startLabel}s to ${endLabel}s`
       }
       onPointerEnter={onHoverStart}
       onPointerLeave={onHoverEnd}
@@ -141,7 +189,7 @@ export const TimelineClip = memo(function TimelineClip({
             left: 0,
             top: 0,
             bottom: 0,
-            width: 14,
+            width: CLIP_TRIM_HIT_PX,
             cursor: "col-resize",
             zIndex: 4,
           }}
@@ -156,7 +204,7 @@ export const TimelineClip = memo(function TimelineClip({
               width: 2,
               borderRadius: 1,
               background: "var(--clip-handle)",
-              opacity: handleOpacity * 0.6,
+              opacity: handleOpacity,
             }}
           />
         </div>
@@ -171,7 +219,7 @@ export const TimelineClip = memo(function TimelineClip({
             right: 0,
             top: 0,
             bottom: 0,
-            width: 14,
+            width: CLIP_TRIM_HIT_PX,
             cursor: "col-resize",
             zIndex: 4,
           }}
@@ -186,18 +234,42 @@ export const TimelineClip = memo(function TimelineClip({
               width: 2,
               borderRadius: 1,
               background: "var(--clip-handle)",
-              opacity: handleOpacity * 0.6,
+              opacity: handleOpacity,
             }}
           />
         </div>
       )}
-      {showLabel && <span className="timeline-clip__label">{displayLabel}</span>}
+      {showLabel && (
+        <span className="timeline-clip__label">
+          <span className="timeline-clip__name">{displayLabel}</span>
+          {!isAudioClip && badges}
+        </span>
+      )}
+      {isAudioClip && badges}
+      {!isGestureActor && el.syncOrigin && <OutOfSyncBadge el={el} />}
       {showDefaultText && (
         <span className="timeline-clip__timecode">
           {startLabel}-{endLabel}s
         </span>
       )}
-      {children}
+      <ClipFadesContext.Provider value={hasFades ? fade.shape : null}>
+        {children}
+      </ClipFadesContext.Provider>
+      {/* Fade handles for anything the mixer hears: audio clips and videos marked
+          data-has-audio. They write data-fade-in/out, the timeline half of the
+          inspector's Fade rows. */}
+      {hasFades && (
+        <TimelineClipFades
+          el={el}
+          pps={pps}
+          widthPx={widthPx}
+          showHandles={(isHovered || isSelected) && !isDragging}
+          focusable={isSelected}
+          hasWaveform={rendersWaveform(el)}
+          fade={fade}
+        />
+      )}
     </button>
   );
+  return isAudioClip || el.hasAudio ? <ClipPeakTooltip>{clip}</ClipPeakTooltip> : clip;
 });

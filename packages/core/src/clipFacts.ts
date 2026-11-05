@@ -34,6 +34,14 @@ const roundTo3 = (n: number) => Math.round(n * 1000) / 1000;
 
 const num = (n: number) => String(roundTo3(n));
 
+export {
+  instantTolerance,
+  isInsideSpan,
+  sameInstant,
+  spansOverlap,
+  spansShareTime,
+} from "@hyperframes/parsers/time-spans";
+
 export function formatClipLine(clip: ClipFact): string {
   const parts = [
     `${clip.kind} "${clip.id}"`,

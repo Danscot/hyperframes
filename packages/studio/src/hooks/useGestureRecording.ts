@@ -1,6 +1,8 @@
+import { revealClip } from "@hyperframes/core/runtime/clip-reveal";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePlayerStore, liveTime } from "../player/store/playerStore";
 import { frameToSeconds, secondsToFrame } from "../player/lib/time";
+import { useLinkedClipPreferences } from "../utils/linkedClipPreferences";
 
 export interface GestureSample {
   time: number;
@@ -30,13 +32,13 @@ interface BasePosition {
 
 interface GsapRuntime {
   timeline: { seek: (t: number) => void };
-  gsap: { set: (target: string, vars: Record<string, number | string>) => void };
-  selector: string;
+  gsap: { set: (target: Element, vars: Record<string, number | string>) => void };
   element: HTMLElement;
   startTime: number;
   maxSeekTime: number;
   savedVisibility: string;
   savedTranslate: string;
+  putMarkBack: (() => void) | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,12 +83,11 @@ function readBasePosition(element: HTMLElement, iframeEl: HTMLIFrameElement): Ba
 function connectGsapRuntime(
   element: HTMLElement,
   iframeEl: HTMLIFrameElement,
-  selector: string | null,
   elementEndTime: number | undefined,
 ): GsapRuntime | null {
   try {
     const win = iframeEl.contentWindow as Window & {
-      gsap?: { set: (t: string, v: Record<string, number | string>) => void };
+      gsap?: { set: (t: Element, v: Record<string, number | string>) => void };
       __timelines?: Record<string, { seek: (t: number) => void; duration: () => number }>;
       __player?: { getTime: () => number };
     };
@@ -98,18 +99,18 @@ function connectGsapRuntime(
           ([key, value]) => key !== "__proxied" && typeof value?.seek === "function",
         )?.[1] ?? null)
       : null;
-    if (win?.gsap?.set && tl?.seek && selector) {
+    if (win?.gsap?.set && tl?.seek && element.id) {
       const tlDuration = tl.duration();
       return {
         timeline: tl,
         gsap: win.gsap,
-        selector,
         element,
         startTime: win.__player?.getTime() ?? 0,
         maxSeekTime:
           elementEndTime != null && elementEndTime < tlDuration ? elementEndTime : tlDuration,
         savedVisibility: element.style.visibility,
         savedTranslate: element.style.getPropertyValue("translate"),
+        putMarkBack: null,
       };
     }
   } catch {
@@ -126,8 +127,9 @@ function applyRuntimePreview(
   const seekTime = Math.min(runtime.startTime + time, runtime.maxSeekTime);
   runtime.timeline.seek(seekTime);
   runtime.element.style.setProperty("translate", "none");
-  runtime.gsap.set(runtime.selector, { ...properties });
-  runtime.element.style.visibility = "visible";
+  runtime.gsap.set(runtime.element, { ...properties });
+  const putMarkBack = revealClip(runtime.element);
+  runtime.putMarkBack ??= putMarkBack;
   liveTime.notify(seekTime);
   usePlayerStore.getState().setCurrentTime(seekTime);
 }
@@ -140,12 +142,13 @@ function recordSample(r: RecordingRefs, time: number, properties: Record<string,
   // stripStudioEditsFromTarget in studio-api), so the keyframes must already
   // include it. Subtracting it made the committed gesture play shoved off by the
   // offset (the offset was removed twice).
-  const frame = secondsToFrame(time);
-  const sample = { time: frameToSeconds(frame), properties: { ...properties } };
+  const fps = useLinkedClipPreferences.getState().compositionFps;
+  const frame = secondsToFrame(time, fps);
+  const sample = { time: frameToSeconds(frame, fps), properties: { ...properties } };
   const lastIndex = r.samples.length - 1;
   const lastSample = r.samples[lastIndex];
   // Gesture events follow the display refresh rate (often 60/120Hz), but the
-  // Studio preview is authored at 30fps. Keep the latest pointer state for each
+  // composition has its own frame rate. Keep the latest pointer state for each
   // output frame so recording cannot create visually indistinguishable piles.
   if (lastSample?.time === sample.time) {
     r.samples[lastIndex] = sample;
@@ -254,9 +257,10 @@ function releaseRuntimePreview(r: RecordingRefs): void {
   if (!runtime) return;
   const { element, savedVisibility, savedTranslate } = runtime;
   element.style.visibility = savedVisibility;
+  runtime.putMarkBack?.();
   element.style.setProperty("translate", savedTranslate || "");
   try {
-    runtime.gsap.set(runtime.selector, {
+    runtime.gsap.set(runtime.element, {
       clearProps: "x,y,scale,scaleX,scaleY,rotation,rotationX,rotationY,opacity,z",
     });
   } catch {
@@ -324,8 +328,7 @@ export function useGestureRecording() {
       r.scale = computeIframeScale(iframeEl);
 
       // --- Phase 3: Connect to the iframe GSAP runtime ---
-      const selector = element.id ? `#${element.id}` : null;
-      r.runtime = connectGsapRuntime(element, iframeEl, selector, elementEndTime);
+      r.runtime = connectGsapRuntime(element, iframeEl, elementEndTime);
       // Clear the optimistic path offset only while a live runtime owns the
       // preview. releaseRuntimePreview restores it on every exit path.
       if (r.runtime && (base.cssOffX || base.cssOffY)) {

@@ -1,7 +1,10 @@
 // fallow-ignore-file code-duplication
-// fallow-ignore-file dead-code
+import type { TimelineEditOutcome } from "../../hooks/timelineEditPermission";
 import type { TimelineElement } from "../store/playerStore";
-import type { TimelineMoveOperation } from "../../hooks/timelineMoveAdapter";
+import type {
+  TimelineMoveOperation,
+  TimelineAtomicMoveUpdates,
+} from "../../hooks/timelineMoveAdapter";
 import type { BlockedTimelineEditIntent } from "./timelineEditing";
 import type { PropertyGroupName } from "@hyperframes/core/gsap-parser";
 import type { TimelineKeyframeTarget } from "./timelineKeyframeIdentity";
@@ -38,21 +41,26 @@ export interface TimelineDropCallbacks {
   ) => Promise<void> | void;
 }
 
+export type TimelineLinkEdit =
+  | { kind: "unlink"; elements: readonly TimelineElement[] }
+  | { kind: "link"; elements: readonly TimelineElement[] }
+  | { kind: "detach"; element: TimelineElement }
+  | { kind: "merge"; video: TimelineElement; audio: TimelineElement }
+  | { kind: "move-into-sync"; element: TimelineElement; start: number }
+  | { kind: "slip-into-sync"; element: TimelineElement; mediaStart: number };
+
 export interface TimelineEditCallbacks {
   onMoveElement?: (
     element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "track">,
+    updates: TimelineAtomicMoveUpdates,
   ) => Promise<void> | void;
   /** Atomic multi-clip move (single undo) for main-track ripple + track-insert.
    *  `coalesceKey` (drag-commit gesture id) merges the move history entry with a
-   *  lane change's follow-up z-reorder entry into one undo step; `coalesceMs`
-   *  widens that entry's fold window when a server round-trip separates the
-   *  gesture's records (per-gesture-unique keys keep the fold gesture-scoped). */
+   *  lane change's follow-up z-reorder entry into one undo step. */
   onMoveElements?: (
-    edits: Array<{ element: TimelineElement; updates: Pick<TimelineElement, "start" | "track"> }>,
+    edits: Array<{ element: TimelineElement; updates: TimelineAtomicMoveUpdates }>,
     coalesceKey?: string,
     operation?: TimelineMoveOperation,
-    coalesceMs?: number,
   ) => Promise<void> | void;
   onResizeElement?: (
     element: TimelineElement,
@@ -83,13 +91,14 @@ export interface TimelineEditCallbacks {
   ) => Promise<void> | void;
   /** B7's bus strip: live-write the group's own attribute while dragging. */
   onSetAudioGroupAttributeLive?: (groupId: string, attr: string, value: string | null) => void;
+  onRevertAudioGroupAttributeLive?: (groupId: string, attr: string) => void;
   /** ...and persist one undo entry on release. */
   onSetAudioGroupAttributeQuiet?: (
     groupId: string,
     attr: string,
     value: string | null,
     label: string,
-  ) => Promise<void>;
+  ) => Promise<TimelineEditOutcome | void>;
   /** C1's ungrouped-track FX pointer: "Group these clips" — write
    *  `data-audio-group` on every one of them, atomically. Same shape B6's
    *  carve auto-grouping uses. */
@@ -105,16 +114,28 @@ export interface TimelineEditCallbacks {
     attr: string,
     value: string | null,
   ) => void;
+  onRevertElementAttributeLive?: (element: TimelineElement, attr: string) => void;
   onSetElementAttributeQuiet?: (
     element: TimelineElement,
     attr: string,
     value: string | null,
     label: string,
-  ) => Promise<void>;
+  ) => Promise<TimelineEditOutcome | void>;
+  /** One attribute on several clips, saved as one undo step. */
+  onSetElementsAttributeQuiet?: (
+    edits: ReadonlyArray<{ element: TimelineElement; value: string | null }>,
+    attr: string,
+    label: string,
+  ) => Promise<TimelineEditOutcome | void>;
   onBlockedEditAttempt?: (element: TimelineElement, intent: BlockedTimelineEditIntent) => void;
+  onLinkEdit?: (edit: TimelineLinkEdit) => Promise<void> | void;
+  onDeleteElementOnly?: (element: TimelineElement) => Promise<void> | void;
   onSplitElement?: (element: TimelineElement, splitTime: number) => Promise<void> | void;
   onRazorSplit?: (element: TimelineElement, splitTime: number) => Promise<void> | void;
   onRazorSplitAll?: (splitTime: number) => Promise<void> | void;
+  onFreezeFrame?: (element: TimelineElement, time: number) => Promise<void> | void;
+  clipMenuTools?: boolean;
+  onNotice?: (message: string, tone?: "error" | "info") => void;
   onDeleteKeyframe?: (elementId: string, keyframe: TimelineKeyframeTarget) => void;
   onDeleteAllKeyframes?: (element: TimelineElement, animationId?: string) => void;
   onMoveKeyframeToPlayhead?: (element: TimelineElement, keyframe: TimelineKeyframeTarget) => void;

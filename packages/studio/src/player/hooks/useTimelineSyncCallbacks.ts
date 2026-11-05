@@ -15,6 +15,7 @@ import type { PlaybackAdapter, IframeWindow } from "../lib/playbackTypes";
 import { readTimelineDurationFromDocument } from "../lib/timelineDOM";
 import { buildMissingCompositionElements } from "../lib/timelineIframeHelpers";
 import { acceptedRuntimeMessageFps } from "../lib/runtimeProtocol";
+import { useLinkedClipPreferences } from "../../utils/linkedClipPreferences";
 import {
   buildTimelineElementsFromClips,
   syncManifestTimeline,
@@ -59,6 +60,7 @@ export interface UseTimelineSyncCallbacksParams {
   isCurrent?: (context?: number) => boolean;
   /** Fires when no adapter appeared within the wait window. */
   onLoadGiveUp?: (context?: number) => void;
+  hostOwnsDeadline?: boolean;
 }
 
 /**
@@ -162,6 +164,7 @@ export function useTimelineSyncCallbacks({
   onAdapterReady = revealAndCommit,
   isCurrent,
   onLoadGiveUp,
+  hostOwnsDeadline,
 }: UseTimelineSyncCallbacksParams) {
   // Convert a runtime timeline message (from iframe postMessage) into TimelineElements
   const processTimelineMessage = useCallback(
@@ -196,8 +199,10 @@ export function useTimelineSyncCallbacks({
       // at the authored root `data-duration` so a runtime that measures only the
       // furthest clip end (shorter than the authored window) can't leave a stale,
       // too-short total in the transport (the "0:44/0:40" bug).
+      const fps = acceptedRuntimeMessageFps(data);
+      useLinkedClipPreferences.getState().setCompositionFps(fps);
       const newDuration = resolveTimelineTotalDuration({
-        manifestDurationSeconds: data.durationInFrames / acceptedRuntimeMessageFps(data),
+        manifestDurationSeconds: data.durationInFrames / fps,
         authoredRootDurationSeconds: readTimelineDurationFromDocument(iframeDoc),
       });
       syncManifestTimeline(
@@ -244,7 +249,7 @@ export function useTimelineSyncCallbacks({
       adapter.pause();
       const startTime = seekAdapterToRestorePoint(adapter, pendingSeekRef);
       const commit = () => {
-        // Keep non-React listeners such as the capture link and time display in sync
+        // Keep non-React listeners such as the time display in sync
         // with the initial adapter seek on iframe load.
         liveTime.notify(startTime);
         syncAdapterDuration(adapter, setDuration);
@@ -295,6 +300,8 @@ export function useTimelineSyncCallbacks({
 
   const onIframeLoad = useCallback(
     (context?: number) => {
+      const loadedDoc = safeContentDocument(iframeRef.current);
+      if (loadedDoc) usePlayerStore.getState().markPreviewLoadStep(loadedDoc);
       applyPreviewAudioState();
       if (probeIntervalRef.current) clearInterval(probeIntervalRef.current);
       stopWaitingRef.current?.();
@@ -307,33 +314,49 @@ export function useTimelineSyncCallbacks({
       // Listen for those instead of polling.
       const iframe = iframeRef.current;
       let settled = false;
+      let retryFrame = 0;
+      const stopWaiting = () => {
+        window.removeEventListener("message", onMessage);
+        cancelAnimationFrame(retryFrame);
+      };
 
       const trySettle = () => {
         if (settled) return;
         if (initializeAdapter(context)) {
           settled = true;
-          window.removeEventListener("message", onMessage);
+          stopWaiting();
           if (probeIntervalRef.current) clearInterval(probeIntervalRef.current);
+          return;
         }
+        cancelAnimationFrame(retryFrame);
+        retryFrame = requestAnimationFrame(trySettle);
       };
 
       const onMessage = (e: MessageEvent) => {
         if (isPreviewReadinessMessage(e, iframe)) trySettle();
       };
       window.addEventListener("message", onMessage);
-      stopWaitingRef.current = () => window.removeEventListener("message", onMessage);
+      stopWaitingRef.current = stopWaiting;
+      if (hostOwnsDeadline) return;
 
       // Safety net: if no message arrives within 5s, try one last time then give up.
       probeIntervalRef.current = setTimeout(() => {
         if (!settled) {
           trySettle();
         }
-        window.removeEventListener("message", onMessage);
+        stopWaiting();
         if (!settled) onLoadGiveUp?.(context);
         revealIframe(iframeRef.current);
       }, 5000) as unknown as ReturnType<typeof setInterval>;
     },
-    [initializeAdapter, iframeRef, probeIntervalRef, applyPreviewAudioState, onLoadGiveUp],
+    [
+      initializeAdapter,
+      iframeRef,
+      probeIntervalRef,
+      applyPreviewAudioState,
+      onLoadGiveUp,
+      hostOwnsDeadline,
+    ],
   );
 
   const cancelPendingLoad = useCallback(() => {

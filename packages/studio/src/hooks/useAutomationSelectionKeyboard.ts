@@ -31,6 +31,8 @@ import {
   type HfAutomationLane,
 } from "@hyperframes/core/audio-automation";
 import { clampNumber } from "../utils/studioHelpers";
+import { isTypingTarget } from "../utils/typingTarget";
+import { matchesKey } from "../player/components/studioShortcuts";
 import type { AutomationSelection } from "../player/store/automationSelectionSlice";
 import type {
   AutomationLaneBinding,
@@ -38,24 +40,6 @@ import type {
 } from "../player/components/useAutomationLanes";
 
 type PlayerState = ReturnType<typeof usePlayerStore.getState>;
-
-function isTextInput(el: Element | null): boolean {
-  if (!el) return false;
-  const tag = el.tagName;
-  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
-  return el instanceof HTMLElement && el.isContentEditable;
-}
-
-/**
- * A Cmd/Ctrl+<letter> chord. `e.key` is normalised because CapsLock makes it
- * "V"/"C", and useAppHotkeys already lowercases — a raw `e.key === "v"` test
- * would silently drop the keystroke here while that dispatcher still acted on
- * it. Shift and Alt are excluded for the same parity reason (useAppHotkeys
- * gates its own copy/paste on `!shiftKey && !altKey`).
- */
-function isChord(e: KeyboardEvent, letter: string): boolean {
-  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === letter;
-}
 
 /** A `TimelineElement`'s identity as the selection and lane bindings key by. */
 function elementKeyOf(element: TimelineElement): string {
@@ -108,7 +92,7 @@ function resolveDeleteWrite(
   state: PlayerState,
   lanes: UseAutomationLanesResult,
   sel: AutomationSelection,
-): { onCommit(next: HfAutomation): void; next: HfAutomation } | null {
+): { onCommit: AutomationLaneBinding["onCommit"]; next: HfAutomation } | null {
   const ctx = resolveSelectionContext(state, lanes, sel);
   if (!ctx) return null;
   const points = ctx.lane.points.filter((p) => !pointInSelection(p, sel));
@@ -139,18 +123,7 @@ function pasteTargetName(
 
 /**
  * Where Cmd+V lands, or null when nothing is selected, the clip's lanes are
- * read-only, it has no automation lane to fall back to, or the dom-edit layer
- * would write the result to a DIFFERENT clip.
- *
- * That last guard is the one with teeth. `binding.onCommit` persists through
- * handleDomAttributeQuietCommit, which targets whatever the dom-edit layer
- * currently has selected — not the element `bind()` was handed (see the
- * doc-comment on `onSelect` in useAutomationLanes). Selecting a clip in the
- * timeline sets `selectedElementId` synchronously but resolves the dom-edit
- * selection asynchronously, so clicking clip B and immediately pressing Cmd+V
- * would serialize B's automation onto A. Every other lane path is a pointer
- * gesture on the lane itself, which cannot run before the selection lands;
- * paste is the only one that can, so it refuses rather than write blind.
+ * read-only, or it has no automation lane to fall back to.
  */
 function resolvePasteTarget(
   state: PlayerState,
@@ -169,7 +142,6 @@ function resolvePasteTarget(
   const elementKey = elementKeyOf(element);
   const binding = lanes.bind(element, true);
   if (binding.readOnly) return null;
-  if (binding.commitTargetKey !== elementKey) return null;
   const target = pasteTargetName(binding, elementKey, sel);
   if (!target) return null;
   const range = resolveAutomationRange(target, binding.chain ?? undefined);
@@ -225,6 +197,8 @@ function pasteAnchor(
   return clampNumber(raw, 0, element.duration - span);
 }
 
+let latestPaste = 0;
+
 /**
  * Cmd/Ctrl+V: paste the clipboard onto the selected clip's lane, at the active
  * selection or the playhead. Returns false (untouched event) when the chord
@@ -237,7 +211,7 @@ function handlePaste(
   state: PlayerState,
   lanes: UseAutomationLanesResult,
 ): boolean {
-  if (!isChord(e, "v")) return false;
+  if (!matchesKey(e, "paste")) return false;
   const clip = readClipboard(state.timelineProjectId);
   if (!clip) return false;
   const sel = state.automationSelection;
@@ -252,12 +226,10 @@ function handlePaste(
 
   e.preventDefault();
   e.stopImmediatePropagation();
-  paste.binding.onCommit(withLane(paste.binding.automation, { target: paste.target, points }));
-  // Select the pasted span — the only feedback that it landed — and mark it, so
-  // an immediate second Cmd+V recognises this selection as the paste's own and
-  // chains right after it instead of overwriting it.
-  // Full-height box over the pasted span: everything that landed is selected, so
-  // Delete straight after a paste undoes it in one press.
+  const saved = paste.binding.onCommit(
+    withLane(paste.binding.automation, { target: paste.target, points }),
+  );
+  const seq = ++latestPaste;
   const mark = {
     elementKey: paste.elementKey,
     target: paste.target,
@@ -266,8 +238,17 @@ function handlePaste(
     v0: paste.range.min,
     v1: paste.range.max,
   };
-  state.setAutomationSelection(mark);
-  markLastPaste(mark);
+  // Once the latest paste lands, and only over the selection it was pasted at, select
+  // and mark its full-height span: the feedback that it landed, what a second Cmd+V
+  // chains after, and what Delete takes back in one press.
+  void saved.then((outcome) => {
+    if (outcome && outcome.status !== "saved") return;
+    const current = usePlayerStore.getState();
+    const moved = current.selectedElementId !== state.selectedElementId;
+    if (seq !== latestPaste || moved || current.automationSelection !== sel) return;
+    current.setAutomationSelection(mark);
+    markLastPaste(mark);
+  });
   return true;
 }
 
@@ -280,7 +261,7 @@ function handleCopy(
   lanes: UseAutomationLanesResult,
   sel: AutomationSelection,
 ): boolean {
-  if (!isChord(e, "c")) return false;
+  if (!matchesKey(e, "copy")) return false;
   const ctx = resolveSelectionContext(state, lanes, sel);
   if (!ctx) return false;
   if (!copyRange(state.timelineProjectId, ctx.lane, ctx.range, sel.t0, sel.t1)) return false;
@@ -300,16 +281,15 @@ function handleCopy(
  *
  * Store and clipboard only, no lane binding, so the dispatcher can call it
  * without holding the binding factory. That leaves one accepted residual: the
- * predicate cannot see a read-only lane, an unresolvable target, or the
- * dom-edit target mismatch `resolvePasteTarget` guards, so in those rare cases
+ * predicate cannot see a read-only lane or an unresolvable target, so in those rare cases
  * the keystroke is a no-op instead of falling through to clip copy/paste. A
  * dead key beats today's double write.
  */
 export function automationOwnsKey(e: KeyboardEvent): boolean {
-  if (isTextInput(document.activeElement)) return false;
+  if (isTypingTarget(document.activeElement)) return false;
   const state = usePlayerStore.getState();
-  if (isChord(e, "c")) return state.automationSelection !== null;
-  if (!isChord(e, "v")) return false;
+  if (matchesKey(e, "copy")) return state.automationSelection !== null;
+  if (!matchesKey(e, "paste")) return false;
   const clip = readClipboard(state.timelineProjectId);
   if (!clip) return false;
   const element = findElement(state.elements, state.selectedElementId);
@@ -327,13 +307,12 @@ function handleDelete(
   lanes: UseAutomationLanesResult,
   sel: AutomationSelection,
 ): boolean {
-  const isDeleteKey = e.key === "Delete" || e.key === "Backspace";
-  if (!isDeleteKey || e.metaKey || e.ctrlKey) return false;
+  if (!matchesKey(e, "deleteSelected") && !matchesKey(e, "deleteSelectedAlt")) return false;
   const write = resolveDeleteWrite(state, lanes, sel);
   if (!write) return false;
   e.preventDefault();
   e.stopImmediatePropagation();
-  write.onCommit(write.next);
+  void write.onCommit(write.next);
   return true;
 }
 
@@ -344,7 +323,7 @@ export function useAutomationSelectionKeyboard({
 }): void {
   useEffect(() => {
     const handler = (e: KeyboardEvent): void => {
-      if (isTextInput(document.activeElement)) return;
+      if (isTypingTarget(document.activeElement)) return;
       // Somebody upstream already claimed this key. useAppHotkeys is on
       // window/capture so it always runs first, and it deliberately lets a
       // keyframe selection outrank an automation range on Delete — without
@@ -358,7 +337,7 @@ export function useAutomationSelectionKeyboard({
       const sel = state.automationSelection;
       if (!sel) return;
 
-      if (e.key === "Escape") {
+      if (matchesKey(e, "cancel")) {
         state.clearAutomationSelection();
         return;
       }

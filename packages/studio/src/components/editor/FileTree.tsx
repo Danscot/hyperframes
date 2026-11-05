@@ -263,7 +263,7 @@ export const FileTree = memo(function FileTree({
       <div
         className={`flex-1 overflow-y-auto py-1 transition-colors ${
           dragOverFolder === ""
-            ? "bg-[#3CE6AC]/5 outline-solid outline-1 outline-[#3CE6AC]/30 -outline-offset-1"
+            ? "bg-accent/5 outline-solid outline-1 outline-accent-ink -outline-offset-1"
             : ""
         }`}
         onContextMenu={handleRootContextMenu}
@@ -293,7 +293,7 @@ export const FileTree = memo(function FileTree({
           )}
         {children.length === 0 && !inlineInput && (
           <div className="px-3 py-4 text-center text-[11px] text-neutral-600">
-            No files yet{hasFileOps ? " — use + above to create one" : ""}.
+            No files yet{hasFileOps ? ". Use + above to create one" : ""}.
           </div>
         )}
         {children.map((child) =>

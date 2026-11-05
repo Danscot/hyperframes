@@ -23,6 +23,7 @@ import {
   getCapturePerfSummary,
   initializeSession,
   prepareCaptureSessionForReuse,
+  shouldDisableBrowserPoolForParallelWorker,
   spawnStreamingEncoder,
   type BeforeCaptureHook,
   type CaptureOptions,
@@ -30,13 +31,14 @@ import {
   type CaptureSession,
   type EngineConfig,
   type StreamingEncoder,
+  type StreamingEncoderResult,
 } from "@hyperframes/engine";
 import type { FileServerHandle } from "../../fileServer.js";
 import type { ProducerLogger } from "../../../logger.js";
 import type { ProgressCallback, RenderJob } from "../../renderOrchestrator.js";
 import { wrapCaptureStageError } from "../captureStageError.js";
 import { ensureFrameWritten } from "./captureHdrFrameShared.js";
-import { updateJobStatus } from "../shared.js";
+import { reportFrameProgress } from "../shared.js";
 import { encoderFailureError } from "../encoderInterruption.js";
 import type { SdrSegmentedCapturePlan } from "../capturePlan.js";
 import { planSegments, type SegmentSlice } from "../segmentPlan.js";
@@ -123,6 +125,7 @@ export type CaptureSegmentedStageResult =
   | {
       success: true;
       encodeMs: number;
+      encoderDrainWaitMs?: number;
       probeSession: null;
       lastBrowserConsole: string[];
       workerCount: number;
@@ -143,7 +146,7 @@ export function segmentOutputPath(segmentDir: string, index: number): string {
 
 /**
  * One closed-GOP encoder per segment. `gopSize` is the segment's own frame
- * count so the segment is exactly one GOP and concat-copy has an IDR at every
+ * count (or the keyframe interval if shorter) so concat-copy has an IDR at every
  * boundary; without it ffmpeg picks its own keyframes and a boundary can land
  * mid-GOP, which decodes as a glitch rather than an error.
  */
@@ -154,7 +157,7 @@ function segmentEncoderOptions(
   return {
     ...base,
     lockGopForChunkConcat: true,
-    gopSize: segment.endFrame - segment.startFrame,
+    gopSize: Math.min(base.gopSize ?? Infinity, segment.endFrame - segment.startFrame),
   };
 }
 
@@ -201,7 +204,7 @@ async function captureSegmentFrames(
       ctx.captureFrame(ctx.session, i, time),
       ctx.stallTimeoutMs - (Date.now() - lastProgressAt),
       {
-        captureMode: ctx.session.captureMode,
+        session: ctx.session,
         frameIndex: i,
         totalFrames: ctx.totalFrames,
         stallTimeoutMs: ctx.stallTimeoutMs,
@@ -212,20 +215,24 @@ async function captureSegmentFrames(
     ctx.job.framesRendered = i + 1;
     lastProgressAt = Date.now();
 
-    updateJobStatus(
+    reportFrameProgress(
       ctx.job,
-      "rendering",
       `Streaming frame ${i + 1}/${ctx.totalFrames} (segment ${segment.index + 1}/${ctx.segmentCount}` +
         (ctx.skipped > 0 ? `, skipped ${ctx.skipped}` : "") +
         ")",
       Math.round(25 + ((i + 1) / ctx.totalFrames) * 55),
       ctx.onProgress,
+      i + 1,
+      ctx.totalFrames,
     );
   }
 }
 
-/** Capture one segment into its own encoder. Returns the encoder's encode ms. */
-async function captureSegment(ctx: SegmentCaptureContext, segment: SegmentSlice): Promise<number> {
+/** Capture one segment into its own encoder. Returns the encoder's result. */
+async function captureSegment(
+  ctx: SegmentCaptureContext,
+  segment: SegmentSlice,
+): Promise<StreamingEncoderResult> {
   const segmentPath = segmentOutputPath(ctx.segmentDir, segment.index);
   let encoder: StreamingEncoder;
   try {
@@ -258,7 +265,7 @@ async function captureSegment(ctx: SegmentCaptureContext, segment: SegmentSlice)
       // finished; absent only in unit tests, whose fake encoder writes none.
       bytes: existsSync(segmentPath) ? statSync(segmentPath).size : 0,
     });
-    return encodeResult.durationMs;
+    return encodeResult;
   } finally {
     // A throw above (capture failure, abort, write error) leaves ffmpeg
     // running; close() is idempotent so this is safe next to the success
@@ -289,15 +296,23 @@ function defaultSessionFactory(input: CaptureSegmentedStageInput): SessionFactor
   let probeSession = input.probeSession;
   return {
     create: async () => {
-      const session = probeSession
-        ? probeSession
-        : await openSegmentedSession({ ...input, probeSession: null });
+      const probeCannotCaptureEveryFrame = Boolean(probeSession?.deRiskFrames?.size);
+      if (probeSession && probeCannotCaptureEveryFrame) {
+        await closeCaptureSession(probeSession).catch(() => {});
+        probeSession = null;
+      }
+      const session = probeSession ?? (await openSegmentedSession(input));
       if (probeSession) {
         openSegmentedSessionReuse(input, probeSession);
         probeSession = null;
       }
-      if (!session.isInitialized) await initializeSession(session);
-      await completeDeferredDrawElementInit(session);
+      try {
+        if (!session.isInitialized) await initializeSession(session);
+        await completeDeferredDrawElementInit(session);
+      } catch (error) {
+        await closeCaptureSession(session).catch(() => {});
+        throw error;
+      }
       return session;
     },
   };
@@ -310,7 +325,6 @@ function openSegmentedSessionReuse(
   prepareCaptureSessionForReuse(session, input.framesDir, input.createRenderVideoFrameInjector());
 }
 
-/** Reuse the probe session when there is one, else open a fresh one. */
 async function openSegmentedSession(input: CaptureSegmentedStageInput): Promise<CaptureSession> {
   // Same reasoning as the streaming stage: the resolved forceScreenshot comes
   // from the immutable plan, not from the caller-owned cfg.
@@ -319,16 +333,16 @@ async function openSegmentedSession(input: CaptureSegmentedStageInput): Promise<
       ? input.cfg
       : { ...input.cfg, forceScreenshot: input.plan.forceScreenshot };
   const videoInjector = input.createRenderVideoFrameInjector();
-  if (input.probeSession) {
-    prepareCaptureSessionForReuse(input.probeSession, input.framesDir, videoInjector);
-    return input.probeSession;
-  }
+  const captureOptions = { ...input.buildCaptureOptions(), deFrameFallback: false };
+  const ownBrowser = shouldDisableBrowserPoolForParallelWorker({
+    parallel: (input.workerCount ?? 1) > 1,
+  });
   return createCaptureSession(
     input.fileServer.url,
     input.framesDir,
-    input.buildCaptureOptions(),
+    captureOptions,
     videoInjector,
-    captureCfg,
+    ownBrowser ? { ...captureCfg, enableBrowserPool: false } : captureCfg,
   );
 }
 
@@ -358,6 +372,7 @@ interface SegmentWorker {
 /** Counters shared by every worker; JS is single-threaded, so += is safe. */
 interface SegmentTotals {
   encodeMs: number;
+  encoderDrainWaitMs: number;
   segmentRetries: number;
   browserRecycles: number;
 }
@@ -373,12 +388,13 @@ interface SegmentRun {
   skipSize: number;
   workerCount: number;
   recycleEvery: number;
+  /** One for all workers, so only the first create() takes the probe session. */
+  sessionFactory: SessionFactory;
 }
 
 async function createSegmentWorker(run: SegmentRun, id: number): Promise<SegmentWorker> {
   const { input, deps } = run;
-  const factory =
-    input.sessionFactoryForWorker?.(id) ?? input.sessionFactory ?? defaultSessionFactory(input);
+  const factory = input.sessionFactoryForWorker?.(id) ?? run.sessionFactory;
   return {
     id,
     factory,
@@ -401,6 +417,18 @@ async function createSegmentWorker(run: SegmentRun, id: number): Promise<Segment
       onSegmentComplete: input.onSegmentComplete,
     },
   };
+}
+
+async function openSegmentWorkersTogether(
+  run: SegmentRun,
+  workersToCloseLater: SegmentWorker[],
+): Promise<void> {
+  const opened = await Promise.allSettled(
+    Array.from({ length: run.workerCount }, (_, id) => createSegmentWorker(run, id)),
+  );
+  for (const o of opened) if (o.status === "fulfilled") workersToCloseLater.push(o.value);
+  const failure = opened.find((o) => o.status === "rejected");
+  if (failure && failure.status === "rejected") throw failure.reason;
 }
 
 /** Close this worker's browser and open a fresh one at a segment boundary. */
@@ -471,7 +499,12 @@ async function retryAfterTargetLoss(
   // so a retry also restarts the cadence clock. Intended: the fresh browser
   // is as new as a cadence restart would have made it.
   await recycleWorkerSession(run, worker, "retry");
-  run.totals.encodeMs += await captureSegment(worker.ctx, segment);
+  addSegmentEncode(run.totals, await captureSegment(worker.ctx, segment));
+}
+
+function addSegmentEncode(totals: SegmentTotals, result: StreamingEncoderResult): void {
+  totals.encodeMs += result.durationMs;
+  totals.encoderDrainWaitMs += result.drainWaitMs ?? 0;
 }
 
 async function runOneSegment(
@@ -488,7 +521,7 @@ async function runOneSegment(
     segmentIndex: segment.index,
   });
   try {
-    run.totals.encodeMs += await captureSegment(worker.ctx, segment);
+    addSegmentEncode(run.totals, await captureSegment(worker.ctx, segment));
   } catch (err) {
     if (err instanceof SegmentEncoderSpawnError) return onSegmentSpawnFailure(run, err, segment);
     await retryAfterTargetLoss(run, worker, err, segment, segmentPath);
@@ -544,13 +577,14 @@ export async function runCaptureSegmentedStage(
   const run: SegmentRun = {
     input,
     deps,
-    totals: { encodeMs: 0, segmentRetries: 0, browserRecycles: 0 },
+    totals: { encodeMs: 0, encoderDrainWaitMs: 0, segmentRetries: 0, browserRecycles: 0 },
     segments,
     pending,
     segmentDir,
     skipSize: skip.size,
     workerCount: Math.max(1, input.workerCount ?? 1),
     recycleEvery: input.browserRecycleEverySegments ?? 0,
+    sessionFactory: input.sessionFactory ?? defaultSessionFactory(input),
   };
   const queue = createSegmentQueue(pending);
   // Built from the plan, not from completion order: workers finish out of
@@ -560,9 +594,8 @@ export async function runCaptureSegmentedStage(
   let fellBackToStreaming = false;
 
   const workers: SegmentWorker[] = [];
-  for (let id = 0; id < run.workerCount; id++) workers.push(await createSegmentWorker(run, id));
   const consoleOf = () => workers[0]?.ctx.session.browserConsoleBuffer ?? [];
-  let lastBrowserConsole: string[] = consoleOf();
+  let lastBrowserConsole: string[] = [];
 
   /** Pull segments until the queue drains, another worker failed, or we fell back. */
   const runWorkerLoop = async (worker: SegmentWorker): Promise<void> => {
@@ -580,6 +613,7 @@ export async function runCaptureSegmentedStage(
 
   try {
     assertNotAborted();
+    await openSegmentWorkersTogether(run, workers);
     // allSettled, not all: closing a session out from under a worker that is
     // still capturing orphans its ffmpeg and races the CDP connection, so
     // every worker has to stop before the finally runs. The first error is
@@ -609,6 +643,7 @@ export async function runCaptureSegmentedStage(
   return {
     success: true,
     encodeMs: run.totals.encodeMs,
+    encoderDrainWaitMs: run.totals.encoderDrainWaitMs,
     probeSession: null,
     lastBrowserConsole,
     workerCount: run.workerCount,

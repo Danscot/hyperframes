@@ -14,6 +14,9 @@ export const MEDIA_VISUAL_STYLE_PROPERTIES = [
   "filter",
   "mix-blend-mode",
   "backdrop-filter",
+  "border-width",
+  "border-style",
+  "border-color",
   "border-radius",
   "overflow",
   "clip-path",
@@ -80,6 +83,18 @@ export function snapTimeToFrameBoundary(timeSeconds: number, fps: number): numbe
   return Math.abs(framePosition - nearestFrame) <= FRAME_BOUNDARY_EPSILON
     ? nearestFrame / grid
     : time;
+}
+
+/** The window export shows a clip in: both ends snapped like its seeks, so a hair off a frame counts as on it. */
+export function exportClipWindow(
+  start: number,
+  end: number,
+  fps: number,
+): { start: number; end: number } {
+  return {
+    start: snapTimeToFrameBoundary(start, fps),
+    end: Number.isFinite(end) ? snapTimeToFrameBoundary(end, fps) : end,
+  };
 }
 
 export function copyMediaVisualStyles(

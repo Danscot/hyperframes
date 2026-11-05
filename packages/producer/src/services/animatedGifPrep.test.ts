@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseHTML } from "linkedom";
@@ -132,6 +132,41 @@ describe("prepareAnimatedGifInputs", () => {
     expect(calls[0]?.args.join(" ")).toContain("-stream_loop 19");
   });
 
+  for (const { name, loopCount, expectedLoops, expectedPad } of [
+    { name: "looping", loopCount: 0, expectedLoops: 10, expectedPad: 0 },
+    { name: "held", loopCount: undefined, expectedLoops: 1, expectedPad: 1.8 },
+  ]) {
+    it(`plans ${name} playback from image delays rather than trailing controls`, async () => {
+      const projectDir = makeProject();
+      try {
+        writeFileSync(
+          join(projectDir, "reaction.gif"),
+          gif([...frame(5), ...frame(15), ...frame(200).slice(0, 8)], loopCount),
+        );
+        const calls: AnimatedGifTranscodeRequest[] = [];
+        const result = await prepareAnimatedGifInputs(
+          '<img data-start="0" data-duration="2" src="reaction.gif" />',
+          {
+            projectDir,
+            downloadDir: projectDir,
+            transcode: async (request) => {
+              calls.push(request);
+              writeFileSync(request.outputPath, "webm");
+            },
+          },
+        );
+        const prepared = result.preparedGifs[0];
+        expect(prepared?.metadata.durationSeconds).toBe(0.2);
+        expect(prepared?.loopIterations).toBe(expectedLoops);
+        expect(prepared?.padSeconds).toBe(expectedPad);
+        if (loopCount === 0) expect(calls[0]?.args.join(" ")).toContain("-stream_loop 9");
+        else expect(calls[0]?.args.join(" ")).toContain("tpad=stop_mode=clone:stop_duration=1.8");
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("leaves single-frame GIF images unchanged", async () => {
     const projectDir = makeProject();
     writeFileSync(join(projectDir, "still.gif"), gif(frame(10)));
@@ -147,15 +182,17 @@ describe("prepareAnimatedGifInputs", () => {
     expect(result.preparedAssets.size).toBe(0);
   });
 
-  it("lets data-loop override infinite GIF metadata", async () => {
+  it.each([0, 3])("lets data-loop=false override GIF loop count %i", async (loopCount) => {
     const projectDir = makeProject();
-    writeFileSync(join(projectDir, "reaction.gif"), gif([...frame(10), ...frame(10)], 0));
+    writeFileSync(join(projectDir, "reaction.gif"), gif([...frame(10), ...frame(10)], loopCount));
+    const calls: AnimatedGifTranscodeRequest[] = [];
     const result = await prepareAnimatedGifInputs(
       `<img data-start="0" data-duration="2" data-loop="false" src="reaction.gif" />`,
       {
         projectDir,
         downloadDir: projectDir,
         transcode: async (request) => {
+          calls.push(request);
           writeFileSync(request.outputPath, "webm");
         },
       },
@@ -163,6 +200,9 @@ describe("prepareAnimatedGifInputs", () => {
 
     const { document } = parseHTML(result.html);
     expect(document.querySelector("video")?.hasAttribute("loop")).toBe(false);
+    expect(result.preparedGifs[0]?.loopIterations).toBe(1);
+    expect(result.preparedGifs[0]?.padSeconds).toBe(1.8);
+    expect(calls[0]?.args).not.toContain("-stream_loop");
   });
 
   it("expands finite loop metadata into the transcoded source", async () => {

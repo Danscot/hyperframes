@@ -1,3 +1,4 @@
+import { formatFindingTimes } from "./checkFindings.js";
 export interface LayoutRect {
   left: number;
   top: number;
@@ -15,13 +16,17 @@ export type LayoutIssueCode =
   | "canvas_overflow"
   | "container_overflow"
   | "content_overlap"
+  | "visibility_escapes_segment"
   | "text_occluded"
+  | "canvas_covered"
+  | "video_alpha_unread"
   | "text_not_painted"
   | "caption_zone_collision"
   | "frame_out_of_frame"
   // Coordinate-frame findings — geometry computed in one frame, rendered in another.
   | "escaped_container"
   | "panel_out_of_canvas"
+  | "canvas_content_at_edge"
   | "connector_detached"
   | "connector_orphan"
   // Cross-sample rotation finding — a spinning element whose bbox center drifts
@@ -47,6 +52,7 @@ export interface LayoutIssue {
   code: LayoutIssueCode;
   severity: LayoutIssueSeverity;
   time: number;
+  times?: number[];
   firstSeen?: number;
   lastSeen?: number;
   occurrences?: number;
@@ -58,9 +64,11 @@ export interface LayoutIssue {
   rect: LayoutRect;
   containerRect?: LayoutRect;
   overflow?: LayoutOverflow;
-  /** `text_occluded` only: approximate fraction (0-1) of the occlusion probe
-   * grid that hit an opaque occluder — see layout-audit.browser.js. */
+  /** `text_occluded` only (0-1): probe-grid share hit by an opaque occluder, or behind a
+   * transparent video the most covered word's share under its alpha (layout-audit.browser.js). */
   coveredFraction?: number;
+  /** `text_occluded` only: the global window the element's own clip is on screen. */
+  lifetime?: { start: number; end: number };
   fixHint?: string;
 }
 
@@ -117,12 +125,9 @@ export function computeOverflow(
 }
 
 /**
- * Whether a computed `overflow*` value clips its box. Mirrors the rule the
- * browser audit (layout-audit.browser.js) uses to decide that text spilling
- * past such an ancestor is intentionally masked (odometer/ticker reels) rather
- * than a `text_box_overflow` defect. Kept here as the one unit-testable seam of
- * that suppression: only `visible` (and the `clip visible` no-op) must NOT clip
- * — every clipping value must, or real masked overflow gets reported as a bug.
+ * Whether a computed `overflow*` value clips its box. Mirrors
+ * `clipsOverflowValue` in layout-audit.browser.js. `visible` and `clip visible`
+ * do not clip.
  */
 export function overflowValueClips(value: string | null | undefined): boolean {
   return !!value && value !== "visible" && value !== "clip visible";
@@ -143,10 +148,12 @@ export function summarizeLayoutIssues(issues: LayoutIssue[]): LayoutSummary {
 }
 
 export function formatLayoutIssue(issue: LayoutIssue): string {
-  const timeLabel =
-    issue.occurrences && issue.occurrences > 1
-      ? `t=${formatNumber(issue.firstSeen ?? issue.time)}-${formatNumber(issue.lastSeen ?? issue.time)}s (${issue.occurrences} samples)`
-      : `t=${formatNumber(issue.time)}s`;
+  let timeLabel = `t=${formatNumber(issue.time)}s`;
+  if (issue.times) {
+    timeLabel = formatFindingTimes(issue);
+  } else if (issue.occurrences && issue.occurrences > 1) {
+    timeLabel = `t=${formatNumber(issue.firstSeen ?? issue.time)}-${formatNumber(issue.lastSeen ?? issue.time)}s (${issue.occurrences} samples)`;
+  }
   const parts = [
     timeLabel,
     issue.code,
@@ -166,6 +173,7 @@ export function dedupeLayoutIssues(issues: LayoutIssue[]): LayoutIssue[] {
 
   for (const issue of issues) {
     const key = [
+      Reflect.get(issue, "sourceFile") ?? "",
       issue.code,
       issue.severity,
       issue.time.toFixed(3),
@@ -184,7 +192,7 @@ export function dedupeLayoutIssues(issues: LayoutIssue[]): LayoutIssue[] {
 }
 
 // Persistence-tier thresholds (#U10): occurrences>=2 alone can't imply the 500ms floor under dense 8fps sampling, so content_overlap promotion requires a literal firstSeen..lastSeen span >= 500ms — stricter for sparse callers too.
-const CONTENT_OVERLAP_HELD_ERROR_MS = 500;
+export const CONTENT_OVERLAP_HELD_ERROR_MS = 500;
 const HELD_ACROSS_SAMPLES_MIN_OCCURRENCES = 2;
 
 // Tiering only applies to layout-audit.browser.js's own per-sample seek-grid
@@ -200,9 +208,11 @@ const PERSISTENCE_TIERED_CODES: ReadonlySet<LayoutIssueCode> = new Set([
   "canvas_overflow",
   "container_overflow",
   "content_overlap",
+  "visibility_escapes_segment",
   "text_occluded",
   "escaped_container",
   "panel_out_of_canvas",
+  "canvas_content_at_edge",
   "connector_detached",
   "connector_orphan",
 ]);
@@ -217,6 +227,7 @@ const TEXT_AGNOSTIC_KEY_CODES: ReadonlySet<LayoutIssueCode> = new Set([
 export function collapseStaticLayoutIssues(
   issues: LayoutIssue[],
   totalSampleCount?: number,
+  sampleTimes?: readonly number[],
 ): LayoutIssue[] {
   const groups = new Map<
     string,
@@ -256,36 +267,64 @@ export function collapseStaticLayoutIssues(
   const multiSampleRun = sampleCount > 1;
 
   return [...groups.values()].map(({ issue, firstSeen, lastSeen, occurrences, times }) =>
-    applyPersistenceTier(
+    tierIssue(
       {
         ...issue,
-        time: firstSeen,
         firstSeen,
         lastSeen,
         occurrences,
         heldMs: longestContiguousRunMs(times),
+        times: [...new Set(times)].sort((a, b) => a - b),
       },
       multiSampleRun,
+      sampleCount,
+      sampleTimes,
     ),
   );
 }
 
-function longestContiguousRunMs(times: number[]): number {
+export function longestContiguousRunMs(times: number[]): number {
+  const run = longestContiguousRun(times);
+  return ((run.at(-1) ?? 0) - (run[0] ?? 0)) * 1000;
+}
+
+export function longestContiguousRun(times: number[]): number[] {
   const sorted = [...new Set(times)].sort((a, b) => a - b);
-  const first = sorted[0];
-  const last = sorted.at(-1);
-  if (first === undefined || last === undefined) return 0;
-  let longest = 0;
-  let runStart = first;
-  let previous = first;
+  let longest: number[] = [];
+  let run: number[] = [];
+  const span = (values: number[]) => (values.at(-1) ?? 0) - (values[0] ?? 0);
   for (const current of sorted) {
-    if ((current - previous) * 1000 > CONTIGUOUS_SAMPLE_GAP_MS) {
-      longest = Math.max(longest, previous - runStart);
-      runStart = current;
+    const previous = run.at(-1);
+    if (previous !== undefined && (current - previous) * 1000 > CONTIGUOUS_SAMPLE_GAP_MS) {
+      if (longest.length === 0 || span(run) > span(longest)) longest = run;
+      run = [];
     }
-    previous = current;
+    run.push(current);
   }
-  return Math.max(longest, last - runStart) * 1000;
+  return longest.length === 0 || span(run) > span(longest) ? run : longest;
+}
+
+/** A full-frame card or a fade to colour covers the canvas briefly; most of the film is a blank stage. */
+function coverTier(issue: LayoutIssue, sampleCount: number): LayoutIssue {
+  return (issue.occurrences ?? 1) * 2 >= sampleCount ? issue : { ...issue, severity: "info" };
+}
+
+function tierIssue(
+  issue: LayoutIssue,
+  multiSampleRun: boolean,
+  sampleCount: number,
+  sampleTimes?: readonly number[],
+): LayoutIssue {
+  if (multiSampleRun && issue.code === "canvas_covered") return coverTier(issue, sampleCount);
+  return applyPersistenceTier(issue, multiSampleRun, sampleTimes);
+}
+
+/** An element whose clip spans no more samples than it was caught at was caught for its whole life. */
+function caughtForWholeLifetime(issue: LayoutIssue, sampleTimes?: readonly number[]): boolean {
+  if (!issue.lifetime || !sampleTimes) return false;
+  const { start, end } = issue.lifetime;
+  const sampled = sampleTimes.filter((time) => time >= start && time < end).length;
+  return (issue.occurrences ?? 1) >= sampled;
 }
 
 /**
@@ -300,7 +339,11 @@ function longestContiguousRunMs(times: number[]): number {
  * is a parked entrance, not drift. Codes without a promotion rule are left
  * untouched when held — persistence, not the code, decides their tier.
  */
-function applyPersistenceTier(issue: LayoutIssue, multiSampleRun: boolean): LayoutIssue {
+function applyPersistenceTier(
+  issue: LayoutIssue,
+  multiSampleRun: boolean,
+  sampleTimes?: readonly number[],
+): LayoutIssue {
   if (!multiSampleRun) return issue;
   if (!PERSISTENCE_TIERED_CODES.has(issue.code)) return issue;
 
@@ -309,7 +352,7 @@ function applyPersistenceTier(issue: LayoutIssue, multiSampleRun: boolean): Layo
   // lastSeen) — always under the ignore floor, so occurrences <= 1 is a
   // complete (not approximate) test for "held under 250ms".
   if (occurrences <= 1) {
-    return { ...issue, severity: "info" };
+    return caughtForWholeLifetime(issue, sampleTimes) ? issue : { ...issue, severity: "info" };
   }
   if (issue.code === "content_overlap" && isContentOverlapHeldLongEnough(issue, occurrences)) {
     return { ...issue, severity: "error" };
@@ -376,6 +419,7 @@ function severityRank(severity: LayoutIssueSeverity): number {
 
 function staticIssueKey(issue: LayoutIssue): string {
   return [
+    Reflect.get(issue, "sourceFile") ?? "",
     issue.code,
     issue.severity,
     issue.selector,

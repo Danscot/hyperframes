@@ -1,6 +1,6 @@
 import { vi } from "vitest";
 
-const previewState = vi.hoisted(() => ({ captionEditMode: false }));
+const previewState = vi.hoisted(() => ({ captionEditMode: false, isPlaying: false }));
 export function getPreviewState() {
   return previewState;
 }
@@ -8,10 +8,14 @@ export const iframeRef = { current: null as HTMLIFrameElement | null };
 
 vi.mock("../../contexts/StudioContext", () => ({
   useStudioShellContext: () => ({ activeCompPath: "index.html", previewIframeRef: iframeRef }),
+  useStudioShellContextOptional: () => ({
+    activeCompPath: "index.html",
+    previewIframeRef: iframeRef,
+  }),
   useStudioPlaybackContext: () => ({
     captionEditMode: previewState.captionEditMode,
     compositionLoading: false,
-    isPlaying: false,
+    isPlaying: previewState.isPlaying,
   }),
 }));
 vi.mock("../../captions/store", () => {

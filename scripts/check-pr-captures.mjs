@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Fail a PR touching packages/studio or packages/player unless its body has Before and After sections with media.
+// Markdown and tests under them are not behaviour a user sees, so they are not watched.
 // usage: node scripts/check-pr-captures.mjs --base origin/main --head <sha>; the body arrives in the env (see main).
 
 import { execFileSync } from "node:child_process";
@@ -33,8 +34,6 @@ function isMediaUrl(raw) {
   const url = parseUrl(raw);
   return url !== null && (isAttachmentUrl(url) || MEDIA_PATH.test(url.pathname));
 }
-
-const TEST_FILE = /\.(?:test|spec)\.[jt]sx?$/;
 
 const CAPTURE_TITLES = {
   before: /^before(?:\s*[:(].*|\s+[-–—]\s.*)?$/i,
@@ -131,8 +130,13 @@ function parseRecord(record) {
   return { path: rest.join("\t"), lines };
 }
 
+const DOC_FILE = /\.mdx?$/i;
+const TEST_PATH = /\/(?:tests|__tests__)\/|\.(?:test|spec)\./;
 const isWatched = (path) =>
-  path !== "" && WATCHED_PREFIXES.some((prefix) => path.startsWith(prefix));
+  path !== "" &&
+  WATCHED_PREFIXES.some((prefix) => path.startsWith(prefix)) &&
+  !DOC_FILE.test(path) &&
+  !TEST_PATH.test(path);
 
 /** Parse `git diff --numstat -z --no-renames`, keeping watched paths. A binary file counts as a full budget. */
 export const parseNumstat = (numstat) =>
@@ -141,8 +145,7 @@ export const parseNumstat = (numstat) =>
     .map(parseRecord)
     .filter((file) => isWatched(file.path));
 
-const isVisualFile = (path) =>
-  VISUAL_EXTENSIONS.some((ext) => path.endsWith(ext)) && !TEST_FILE.test(path);
+const isVisualFile = (path) => VISUAL_EXTENSIONS.some((ext) => path.endsWith(ext));
 
 /** Why a "No visible change" declaration does not hold for this diff; empty means it holds. */
 export function noVisibleChangeFailures(files) {
@@ -192,9 +195,13 @@ export function evaluate({ body, files }) {
   return { ok: false, problems: [...verdict.problems, ...captures] };
 }
 
-const DOWNLOAD_ATTEMPTS = 3;
-const DOWNLOAD_DEADLINE_MS = 45_000;
-const RETRY_DELAYS_MS = [1000, 3000];
+const DOWNLOAD_ATTEMPTS = 5;
+// A freshly uploaded GitHub attachment can 404 for up to a few minutes before
+// its storage read-path catches up with the write — observed up to ~3 minutes
+// in production, with no edit to the PR in between. The deadline and delays
+// below give a 404 on an attachment host room to clear before this gives up.
+const DOWNLOAD_DEADLINE_MS = 180_000;
+const RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000];
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_ASSET_BYTES = 100 * 1024 * 1024;
@@ -266,7 +273,22 @@ async function readCapped(response, budget) {
   return collector.bytes();
 }
 
-const isRetryableStatus = (status) => status === 429 || status >= 500;
+const isServerRetryable = (status) => status === 429 || status >= 500;
+
+// A 404 is final for almost anything — but for a GitHub attachment URL, right
+// after it was uploaded, it means "not replicated yet," not "does not exist."
+// Reproduced this week: the same asset URL 404'd, then 200'd minutes later
+// with no edit to the PR in between, and whichever asset had been attached
+// most recently was always the one that failed. Scoped to the attachment host
+// so a real 404 on any other URL (a typo'd link, a deleted gist) still fails fast.
+const isRetryableAttachment404 = (status, url) => {
+  if (status !== 404) return false;
+  const parsed = parseUrl(url);
+  return parsed !== null && isAttachmentUrl(parsed);
+};
+
+const isRetryableStatus = (status, url) =>
+  isServerRetryable(status) || isRetryableAttachment404(status, url);
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** One attempt: the bytes, or a NonRetryable for a final status, or a plain Error for a retryable one. */
@@ -274,7 +296,7 @@ async function attemptDownload(url, fetchImpl, signal, budget) {
   const response = await fetchTrusted(url, fetchImpl, signal);
   if (response.ok) return readCapped(response, budget);
   const message = `HTTP ${response.status}`;
-  throw isRetryableStatus(response.status) ? new Error(message) : new NonRetryable(message);
+  throw isRetryableStatus(response.status, url) ? new Error(message) : new NonRetryable(message);
 }
 
 async function waitForRetry(attempt, sleep, signal) {
@@ -447,7 +469,7 @@ function printFailure(problems, prNumber) {
     "Edit the body text first: gh pr edit --body-file replaces the body and drops attachments.",
   );
   console.error(
-    `A change with no visible effect (under ${NO_VISIBLE_CHANGE_MAX_LINES} lines, no .tsx/.css/.html) may instead add a '## No visible change' section.`,
+    `A change with no visible effect (under ${NO_VISIBLE_CHANGE_MAX_LINES} lines, no .tsx/.css/.html; tests and Markdown are not counted) may instead add a '## No visible change' section.`,
   );
 }
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { isVideoAudible } from "../../player/lib/timelineElementHelpers";
 import { useTrackDesignInput } from "../../contexts/DesignPanelInputContext";
 import { Check, ClipboardList } from "../../icons/SystemIcons";
 import type { DomEditSelection } from "./domEditing";
@@ -8,7 +9,7 @@ import {
   formatNumericValue,
   formatTimingValue,
   parseNumericValue,
-  stripQueryAndHash,
+  readClipInPoint,
 } from "./propertyPanelHelpers";
 import { FlatSelectRow, FlatSlider } from "./propertyPanelFlatPrimitives";
 import { FlatToggle } from "./propertyPanelFlatToggle";
@@ -25,15 +26,28 @@ import {
   audioGainToFaderPosition,
   audioGainToText,
 } from "@hyperframes/core/audio-gain";
+import {
+  HF_AUDIO_FADE_IN_DATA_KEY,
+  HF_AUDIO_FADE_OUT_DATA_KEY,
+  clampFadesToDuration,
+  formatFadeSeconds,
+  readFadeSeconds,
+} from "@hyperframes/core/audio-fade";
+import { parseGainInput, parseRateInput, parseSecondsInput } from "./audioInspectorInput";
+import type { CommitDomAttributeBatch } from "../../hooks/domEditCommitTypes";
+import { commitCutout, commitHasAudioToggle, commitMutedToggle } from "./mediaAudioEdits";
+import { authoredSrcPath } from "../../player/components/thumbnailUtils";
 
 // fallow-ignore-next-line complexity
 export function FlatMediaSection({
+  projectId = null,
   projectDir,
   element,
   styles,
   onSetStyle,
   onSetAttribute,
   onSetHtmlAttribute,
+  onSetAttributeBatch,
   onRemoveBackground,
   volumeAutomated,
   onAutomateVolume,
@@ -42,13 +56,15 @@ export function FlatMediaSection({
   automatedVolumeValue,
   rate,
 }: {
+  projectId?: string | null;
   projectDir: string | null;
   element: DomEditSelection;
   styles: Record<string, string>;
   onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
   onSetAttribute: (attr: string, value: string) => void | Promise<void>;
   onSetHtmlAttribute: (attr: string, value: string | null) => void | Promise<void>;
-  /** A volume lane in the timeline drives the level; the slider writes a keyframe instead. */
+  onSetAttributeBatch: CommitDomAttributeBatch;
+  /** A volume lane in the timeline drives the level; the Volume slider writes a keyframe. */
   volumeAutomated?: boolean;
   onAutomateVolume?: () => void;
   onRemoveVolumeAutomation?: () => void;
@@ -72,18 +88,11 @@ export function FlatMediaSection({
   const isVisualMedia = isVideo || isImage;
   const el = element.element;
 
-  // While a lane owns the level, the envelope's live value at the playhead is
-  // what the slider must show — the static attribute is only what the engine
-  // falls back to outside automation.
-  const volume =
-    volumeAutomated && automatedVolumeValue !== undefined
-      ? automatedVolumeValue
-      : (parseNumericValue(element.dataAttributes.volume ?? "") ?? 1);
-  const volumeFaderPosition = audioGainToFaderPosition(volume);
-  const mediaStart =
-    Number.parseFloat(
-      element.dataAttributes["media-start"] ?? element.dataAttributes["playback-start"] ?? "0",
-    ) || 0;
+  // Gain is `data-volume`, ahead of the effects; Volume is the lane's level at the
+  // playhead, unity without one. What plays is gain times level, as in an editor.
+  const gain = parseNumericValue(element.dataAttributes.volume ?? "") ?? 1;
+  const volume = volumeAutomated && automatedVolumeValue !== undefined ? automatedVolumeValue : 1;
+  const { mediaStart, mediaStartAttr } = readClipInPoint(element.dataAttributes);
   const constantRate = Number.parseFloat(element.dataAttributes["playback-rate"] ?? "1") || 1;
   const playbackRate =
     rate?.automated && rate.automatedValue !== undefined ? rate.automatedValue : constantRate;
@@ -92,9 +101,17 @@ export function FlatMediaSection({
     (el as HTMLMediaElement).duration ||
     0;
   const mediaStartMax = Math.max(30, Math.ceil(sourceDuration || mediaStart + 10));
+  const fadeIn = readFadeSeconds(element.dataAttributes[HF_AUDIO_FADE_IN_DATA_KEY]);
+  const fadeOut = readFadeSeconds(element.dataAttributes[HF_AUDIO_FADE_OUT_DATA_KEY]);
+  const clipDuration = Number.parseFloat(element.dataAttributes.duration ?? "") || 0;
+  const fadeMax = clipDuration > 0 ? clipDuration : 10;
   const hasLoop = el.hasAttribute("loop");
   const hasMuted = el.hasAttribute("muted");
-  const hasAudio = element.dataAttributes["has-audio"] === "true";
+  const hasAudio = isVideoAudible({
+    tag: el.tagName,
+    hasAudioAttr: element.dataAttributes["has-audio"],
+    muted: el.hasAttribute("muted"),
+  });
   const objectFit = styles["object-fit"] || "contain";
   const objectPosition = styles["object-position"] || "center";
 
@@ -105,12 +122,11 @@ export function FlatMediaSection({
   const [createPlate, setCreatePlate] = useState(false);
   const [quality, setQuality] = useState<"fast" | "balanced" | "best">("balanced");
 
-  const absoluteSrc =
-    projectDir && srcAttr && !srcAttr.startsWith("http") ? `${projectDir}/${srcAttr}` : srcAttr;
   const projectSrc =
     srcAttr && !/^(?:https?:|data:|blob:)/i.test(srcAttr)
-      ? stripQueryAndHash(srcAttr.startsWith("./") ? srcAttr.slice(2) : srcAttr)
+      ? authoredSrcPath(srcAttr.startsWith("./") ? srcAttr.slice(2) : srcAttr)
       : "";
+  const absoluteSrc = projectDir && projectSrc ? `${projectDir}/${projectSrc}` : srcAttr;
   const canRemoveBackground = Boolean(onRemoveBackground && isVisualMedia && projectSrc);
 
   useEffect(() => {
@@ -118,13 +134,7 @@ export function FlatMediaSection({
     setCreatePlate(false);
   }, [srcAttr]);
 
-  const applyCutoutResult = async (result: BackgroundRemovalResult) => {
-    await onSetHtmlAttribute("src", result.outputPath);
-    if (isVideo) {
-      await onSetAttribute("has-audio", "");
-      await onSetHtmlAttribute("muted", "true");
-    }
-  };
+  const mediaEdit = { element, projectId, projectSrc, commit: onSetAttributeBatch };
 
   const runBackgroundRemoval = async () => {
     if (!onRemoveBackground || !projectSrc || removeBusy) return;
@@ -137,8 +147,8 @@ export function FlatMediaSection({
         quality,
         onProgress: setRemoveProgress,
       });
-      await applyCutoutResult(result);
-      setRemoveProgress({ status: "complete", progress: 100, stage: "Applied cutout", ...result });
+      const stage = await commitCutout(mediaEdit, result.outputPath, hasAudio);
+      setRemoveProgress({ status: "complete", progress: 100, stage, ...result });
     } catch (error) {
       setRemoveProgress({
         status: "failed",
@@ -190,7 +200,7 @@ export function FlatMediaSection({
               data-flat-media-remove-bg="true"
               disabled={!canRemoveBackground || removeBusy}
               onClick={() => void runBackgroundRemoval()}
-              className="flex items-center gap-1 text-[10px] font-medium text-panel-accent disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex items-center gap-1 text-[10px] font-medium text-accent-ink disabled:cursor-not-allowed disabled:opacity-50"
               title={
                 canRemoveBackground
                   ? "Remove background and save a transparent asset"
@@ -221,7 +231,7 @@ export function FlatMediaSection({
               <div className="h-1 overflow-hidden rounded-full bg-panel-hover">
                 <div
                   className={`h-full rounded-full ${
-                    removeProgress.status === "failed" ? "bg-red-400" : "bg-panel-accent"
+                    removeProgress.status === "failed" ? "bg-danger-ink" : "bg-panel-accent"
                   }`}
                   style={{ width: `${Math.max(0, Math.min(100, removeProgress.progress))}%` }}
                 />
@@ -232,9 +242,25 @@ export function FlatMediaSection({
       )}
       {(isVideo || isAudio) && (
         <>
-          {/* While a lane owns the level, a commit writes a keyframe at the
-              playhead instead of the plain attribute — same slider, same
-              gesture, the write just goes through the envelope. */}
+          <FlatSlider
+            label="Gain"
+            value={audioGainToFaderPosition(gain)}
+            min={AUDIO_GAIN_FADER_MIN}
+            max={AUDIO_GAIN_FADER_MAX}
+            tier={gain === 1 ? "default" : "explicitCustom"}
+            displayValue={audioGainToText(gain)}
+            centerTick
+            onCommit={(next) =>
+              void onSetAttribute("volume", formatAudioGain(audioFaderPositionToGain(next)))
+            }
+            onCommitText={(text) => {
+              const next = parseGainInput(text);
+              if (next === null) return false;
+              void onSetAttribute("volume", formatAudioGain(next));
+              return true;
+            }}
+          />
+          {/* A commit writes a keyframe at the playhead, starting a lane when there is none. */}
           <div
             className="hf-volume-row flex items-center gap-1"
             data-volume-automated={volumeAutomated ? "" : undefined}
@@ -242,19 +268,18 @@ export function FlatMediaSection({
             <div className="min-w-0 flex-1">
               <FlatSlider
                 label="Volume"
-                value={volumeFaderPosition}
+                value={audioGainToFaderPosition(volume)}
                 min={AUDIO_GAIN_FADER_MIN}
                 max={AUDIO_GAIN_FADER_MAX}
                 tier={volume === 1 ? "default" : "explicitCustom"}
                 displayValue={audioGainToText(volume)}
                 centerTick
-                onCommit={(next) => {
-                  const gain = audioFaderPositionToGain(next);
-                  if (volumeAutomated) {
-                    onCommitVolumeAt?.(gain);
-                  } else {
-                    void onSetAttribute("volume", formatAudioGain(gain));
-                  }
+                onCommit={(next) => onCommitVolumeAt?.(audioFaderPositionToGain(next))}
+                onCommitText={(text) => {
+                  const next = parseGainInput(text);
+                  if (next === null) return false;
+                  onCommitVolumeAt?.(next);
+                  return true;
                 }}
               />
             </div>
@@ -285,6 +310,13 @@ export function FlatMediaSection({
                     void onSetAttribute("playback-rate", formatNumericValue(speed));
                   }
                 }}
+                onCommitText={(text) => {
+                  const speed = parseRateInput(text);
+                  if (speed === null) return false;
+                  if (rate?.automated) rate.onCommitAt(speed);
+                  else void onSetAttribute("playback-rate", formatNumericValue(speed));
+                  return true;
+                }}
               />
             </div>
             <AutomationToggle
@@ -295,7 +327,10 @@ export function FlatMediaSection({
               onRemoveAutomation={rate ? () => rate.onRemoveAutomation() : undefined}
             />
           </div>
-          {rate?.canApplyPreset && (
+          {/* Speed presets are picture-driven ramps (slow-mo reveals, whip
+              speed-ups); on a bare audio clip they only warp pitch, so the
+              row is video-only. */}
+          {rate?.canApplyPreset && !isAudio && (
             <FlatSelectRow
               label="Speed preset"
               value=""
@@ -311,8 +346,22 @@ export function FlatMediaSection({
             max={mediaStartMax * 100}
             tier={mediaStart === 0 ? "default" : "explicitCustom"}
             displayValue={formatTimingValue(mediaStart)}
-            onCommit={(next) => void onSetAttribute("media-start", (next / 100).toFixed(2))}
+            onCommit={(next) => void onSetAttribute(mediaStartAttr, (next / 100).toFixed(2))}
+            onCommitText={(text) => {
+              const seconds = parseSecondsInput(text);
+              if (seconds === null) return false;
+              void onSetAttribute(mediaStartAttr, Math.min(seconds, mediaStartMax).toFixed(2));
+              return true;
+            }}
           />
+          {(isAudio || hasAudio) && (
+            <MediaFadeSliders
+              fadeIn={fadeIn}
+              fadeOut={fadeOut}
+              fadeMax={fadeMax}
+              onSetAttribute={onSetAttribute}
+            />
+          )}
           <FlatToggle
             label="Loop"
             checked={hasLoop}
@@ -321,21 +370,13 @@ export function FlatMediaSection({
           <FlatToggle
             label="Muted"
             checked={hasMuted}
-            onChange={(next) => void onSetHtmlAttribute("muted", next ? "true" : null)}
+            onChange={(next) => void commitMutedToggle(mediaEdit, next)}
           />
           {isVideo && (
             <FlatToggle
               label="Has audio track"
               checked={hasAudio}
-              onChange={(next) => {
-                if (next) {
-                  void onSetAttribute("has-audio", "true");
-                  void onSetHtmlAttribute("muted", null);
-                } else {
-                  void onSetAttribute("has-audio", "");
-                  void onSetHtmlAttribute("muted", "true");
-                }
-              }}
+              onChange={(next) => void commitHasAudioToggle(mediaEdit, next)}
             />
           )}
         </>
@@ -370,4 +411,47 @@ export function FlatMediaSection({
       )}
     </div>
   );
+}
+
+function MediaFadeSliders({
+  fadeIn,
+  fadeOut,
+  fadeMax,
+  onSetAttribute,
+}: {
+  fadeIn: number;
+  fadeOut: number;
+  fadeMax: number;
+  onSetAttribute: (attr: string, value: string) => void | Promise<void>;
+}) {
+  const fadeText = (seconds: number) => (seconds > 0 ? formatFadeSeconds(seconds) : "");
+  return (["in", "out"] as const).map((edge) => {
+    const seconds = edge === "in" ? fadeIn : fadeOut;
+    const dataKey = edge === "in" ? HF_AUDIO_FADE_IN_DATA_KEY : HF_AUDIO_FADE_OUT_DATA_KEY;
+    const edgeMax = Math.max(0, fadeMax - (edge === "in" ? fadeOut : fadeIn));
+    return (
+      <FlatSlider
+        key={edge}
+        label={`Fade ${edge}`}
+        value={Math.round(seconds * 100)}
+        min={0}
+        max={Math.round(edgeMax * 100)}
+        tier={seconds === 0 ? "default" : "explicitCustom"}
+        displayValue={formatTimingValue(seconds)}
+        onCommit={(next) => void onSetAttribute(dataKey, fadeText(next / 100))}
+        onCommitText={(text) => {
+          const parsed = parseSecondsInput(text);
+          if (parsed === null) return false;
+          const next = Math.min(parsed, edgeMax);
+          const bounded = clampFadesToDuration(
+            { fadeIn: edge === "in" ? next : fadeIn, fadeOut: edge === "out" ? next : fadeOut },
+            fadeMax,
+          );
+          void onSetAttribute(dataKey, fadeText(edge === "in" ? bounded.fadeIn : bounded.fadeOut));
+          return true;
+        }}
+        onReset={seconds > 0 ? () => void onSetAttribute(dataKey, "") : undefined}
+      />
+    );
+  });
 }

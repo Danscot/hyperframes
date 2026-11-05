@@ -1,17 +1,28 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { compareVersions } from "compare-versions";
 import { readConfig, readConfigFresh, writeConfig } from "../telemetry/config.js";
 import { VERSION } from "../version.js";
+import { isCI, isUnattended } from "./attendedTerminal.js";
 import { isDevMode } from "./env.js";
-import { detectInstaller } from "./installerDetection.js";
+import { asNotice } from "./jsonError.js";
+import { hostAnswers } from "./hostAnswers.js";
+import { claimDailyNotice } from "./dailyNotice.js";
+import {
+  detectInstaller,
+  runningInstall,
+  updateCommandFor,
+  type InstallChannel,
+  type RunningInstall,
+} from "./installerDetection.js";
 import { readPinnedHyperframesVersions } from "./projectPin.js";
 import { isSafeVersion } from "./safeVersion.js";
 
 export { isSafeVersion } from "./safeVersion.js";
 
 const NPM_REGISTRY_URL = "https://registry.npmjs.org/hyperframes/latest";
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const SKILLS_COUNT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 3000;
 
 /** Returns true if `a` is newer than `b` per semver (handles alpha, beta, rc). */
@@ -33,50 +44,48 @@ export interface UpdateMeta {
   version: string;
   latestVersion?: string;
   updateAvailable: boolean;
+  /** When the registry gave `latestVersion` (ISO). Absent when no usable answer is cached. */
+  checkedAt?: string;
+  /** Installed skills behind this CLI's release tag, per the cached background check. */
+  skillsOutdated?: number;
+  /** Core skills not installed, from the same cached check and under the same rules as `skillsOutdated`. */
+  skillsMissing?: number;
+  /**
+   * One sentence for the agent to pass on to the person: a newer CLI or skills, and the command
+   * that updates them. Added by `withMeta` at most once a day per project; absent otherwise.
+   */
+  updateNotice?: string;
   /** Present (and true) only for commands superseded by `check`; absent otherwise. */
   deprecated?: boolean;
 }
 
 /**
- * Check npm registry for the latest version. Uses a 24h cache to avoid
+ * Check npm registry for the latest version. Uses a 2h cache to avoid
  * hitting the registry on every invocation.
  *
- * @param force - Skip cache and fetch fresh data
+ * @param force - Skip the cache, opt-outs and DNS probe: the caller waits for the registry
  */
 export async function checkForUpdate(force?: boolean): Promise<UpdateCheckResult> {
   const config = readConfig();
-  const now = Date.now();
-
-  // Also guard the cache read: a cache written before this boundary guard
-  // existed could hold an unsafe latestVersion — re-validate before trusting it.
-  if (
-    !force &&
-    config.lastUpdateCheck &&
-    config.latestVersion &&
-    isSafeVersion(config.latestVersion)
-  ) {
-    const lastCheck = new Date(config.lastUpdateCheck).getTime();
-    if (now - lastCheck < CHECK_INTERVAL_MS) {
-      return {
-        current: VERSION,
-        latest: config.latestVersion,
-        updateAvailable: isNewerSemver(config.latestVersion, VERSION),
-      };
-    }
-  }
+  if (!force && !updateCheckDue(config)) return fallbackResult(config.latestVersion);
 
   try {
+    if (!force && !(await hostAnswers(new URL(NPM_REGISTRY_URL).hostname))) {
+      return fallbackResult(config.latestVersion);
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const res = await fetch(NPM_REGISTRY_URL, {
-      signal: controller.signal,
-      headers: { Connection: "close" },
-    });
-    clearTimeout(timeout);
-
-    if (!res.ok) return fallbackResult(config.latestVersion);
-
-    const data = (await res.json()) as { version?: unknown };
+    let data: { version?: unknown };
+    try {
+      const res = await fetch(NPM_REGISTRY_URL, {
+        signal: controller.signal,
+        headers: { Connection: "close" },
+      });
+      if (!res.ok) return fallbackResult(config.latestVersion);
+      data = (await res.json()) as { version?: unknown };
+    } finally {
+      clearTimeout(timeout);
+    }
     // Registry boundary guard: only a strict-semver STRING is trusted. This
     // value is cached and later flows into an install command that the
     // background auto-updater executes, so a poisoned or non-string
@@ -103,15 +112,38 @@ export async function checkForUpdate(force?: boolean): Promise<UpdateCheckResult
   }
 }
 
+/**
+ * Whether the background check should ask the registry: not opted out, and no fresh safe cache.
+ * A cached latest older than the running CLI predates this install, so it is stale however recent.
+ */
+export function updateCheckDue(config = readConfig()): boolean {
+  if (updateCheckDisabled()) return false;
+  if (!config.lastUpdateCheck || !isSafeCache(config.latestVersion)) return true;
+  if (isNewerSemver(VERSION, config.latestVersion)) return true;
+  const fresh = Date.now() - new Date(config.lastUpdateCheck).getTime() < CHECK_INTERVAL_MS;
+  return !fresh;
+}
+
+export function cachedUpdateCheck(): UpdateCheckResult {
+  return fallbackResult(readConfig().latestVersion);
+}
+
 function fallbackResult(cachedLatest?: string): UpdateCheckResult {
   // Only surface a cached version we can prove is safe — a pre-existing
   // poisoned cache must not leak through the fallback path either.
-  const safeCached = cachedLatest && isSafeVersion(cachedLatest) ? cachedLatest : undefined;
+  const safeCached = cachedVersionForThisInstall(cachedLatest);
   return {
     current: VERSION,
     latest: safeCached ?? VERSION,
     updateAvailable: safeCached ? isNewerSemver(safeCached, VERSION) : false,
   };
+}
+
+const isSafeCache = (value: unknown): value is string =>
+  typeof value === "string" && isSafeVersion(value);
+
+function cachedVersionForThisInstall(value: unknown): string | undefined {
+  return isSafeCache(value) && !isNewerSemver(VERSION, value) ? value : undefined;
 }
 
 /**
@@ -120,12 +152,127 @@ function fallbackResult(cachedLatest?: string): UpdateCheckResult {
  */
 export function getUpdateMeta(): UpdateMeta {
   const config = readConfig();
+  const latestVersion = cachedVersionForThisInstall(config.latestVersion);
+  const checkedAt = latestVersion ? config.lastUpdateCheck : undefined;
+  const skillsOutdated = cachedSkillsCount(config, config.skillsOutdatedCount);
+  const skillsMissing = cachedSkillsCount(config, config.skillsMissingCount);
   return {
     version: VERSION,
-    latestVersion: config.latestVersion,
-    updateAvailable: config.latestVersion ? isNewerSemver(config.latestVersion, VERSION) : false,
+    latestVersion,
+    updateAvailable: latestVersion ? isNewerSemver(latestVersion, VERSION) : false,
+    ...(checkedAt ? { checkedAt } : {}),
+    ...(skillsOutdated === undefined ? {} : { skillsOutdated }),
+    ...(skillsMissing === undefined ? {} : { skillsMissing }),
   };
 }
+
+/** A cached skills count, only when taken for this CLI version's tag in the last 24 h. */
+function cachedSkillsCount(
+  config: ReturnType<typeof readConfig>,
+  count: unknown,
+): number | undefined {
+  if (process.env["HYPERFRAMES_SKIP_SKILLS"] === "1") return undefined;
+  if (!config.lastSkillsCheck || config.skillsCheckedVersion !== VERSION) return undefined;
+  const age = Date.now() - new Date(config.lastSkillsCheck).getTime();
+  if (!(age >= 0 && age < SKILLS_COUNT_MAX_AGE_MS)) return undefined;
+  return typeof count === "number" && Number.isInteger(count) && count >= 0 ? count : undefined;
+}
+
+/** "3 installed HyperFrames skills are out of date and 1 core skill is missing", or null. */
+function skillsBehindPhrase(meta: UpdateMeta): string | null {
+  const outdated = meta.skillsOutdated ?? 0;
+  const missing = meta.skillsMissing ?? 0;
+  const parts: string[] = [];
+  if (outdated > 0) {
+    parts.push(
+      `${outdated} installed HyperFrames ${outdated === 1 ? "skill is" : "skills are"} out of date`,
+    );
+  }
+  if (missing > 0) {
+    const which = outdated > 0 ? "core" : "core HyperFrames";
+    parts.push(`${missing} ${which} ${missing === 1 ? "skill is" : "skills are"} missing`);
+  }
+  return parts.length > 0 ? parts.join(" and ") : null;
+}
+
+const GLOBAL_CHANNELS: ReadonlySet<InstallChannel> = new Set(["npm", "pnpm", "bun", "brew"]);
+
+/** A project-local CLI moves with its project's manager; `update` there then only does the skills. */
+function projectNoticeCommand(
+  install: RunningInstall,
+  cliBehind: boolean,
+  skillsBehind: boolean,
+  latest: string,
+): string {
+  if (!cliBehind) return "npx hyperframes update";
+  const bump = updateCommandFor(install, latest);
+  return skillsBehind ? `${bump}, then npx hyperframes update` : bump;
+}
+
+/**
+ * A command that moves THIS install. A global CLI runs its own `hyperframes update` (or just its
+ * manager's command when only the CLI is behind): `npx hyperframes` would run a project's copy or
+ * a fresh npx one instead. An npx run pins `@latest`, since npx's cache can hold the old CLI.
+ */
+export function updateCommandForThisInstall(
+  cliBehind: boolean,
+  skillsBehind: boolean,
+  latest: string,
+): string {
+  const install = runningInstall();
+  if (GLOBAL_CHANNELS.has(install.channel)) {
+    return skillsBehind ? "hyperframes update" : updateCommandFor(install, latest);
+  }
+  if (install.channel === "project") {
+    return projectNoticeCommand(install, cliBehind, skillsBehind, latest);
+  }
+  return install.channel === "npx" && cliBehind
+    ? "npx hyperframes@latest update"
+    : "npx hyperframes update";
+}
+
+/** The sentence itself: the newer CLI, the skills behind, or both, and the command. */
+function noticeSentence(
+  version: string,
+  latest: string | null,
+  skills: string | null,
+  command: string,
+): string {
+  const cli = latest ? `HyperFrames CLI ${latest} is available (this run is ${version})` : null;
+  if (cli && skills) return `For the user: ${cli}, and ${skills}. To update both, run: ${command}`;
+  if (cli) return `For the user: ${cli}. To update, run: ${command}`;
+  return `For the user: ${skills} (this run is HyperFrames CLI ${version}). To update them, run: ${command}`;
+}
+
+/** The update notice for this run's `_meta`, before the once-a-day gate; null when there is nothing to say. */
+function updateNoticeText(meta: UpdateMeta): string | null {
+  if (updateCheckDisabled() || process.env["HYPERFRAMES_PLUGIN_VERSION"]) return null;
+  const latest = meta.updateAvailable ? (meta.latestVersion ?? null) : null;
+  const skills = skillsBehindPhrase(meta);
+  if (!latest && !skills) return null;
+  const command = updateCommandForThisInstall(
+    latest !== null,
+    skills !== null,
+    latest ?? meta.version,
+  );
+  return noticeSentence(meta.version, latest, skills, command);
+}
+
+/** The notice when it is due for this project today; a failure here never fails the command. */
+function noticeOrNull(meta: UpdateMeta): string | null {
+  try {
+    const notice = updateNoticeText(meta);
+    return notice && claimDailyNotice("update", resolve(process.cwd())) ? notice : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * For `withMeta` in commands whose own output is about updating (`update`, `upgrade`, `skills`):
+ * the same commands `cli.ts` keeps the stderr notices away from.
+ */
+export const NO_UPDATE_NOTICE = { updateNotice: false };
 
 /**
  * Wrap a JSON payload with the _meta version envelope.
@@ -134,12 +281,20 @@ export function getUpdateMeta(): UpdateMeta {
  * Pass `{ deprecated: true }` from a command superseded by `check` (validate,
  * inspect, layout) to add `_meta.deprecated: true`; every other call site is
  * unaffected — the key is only ever added, never set to `false`.
+ *
+ * `_meta.updateNotice` is added when the CLI or the skills are behind, at most once a day per
+ * project (the numeric fields stay on every result). `{ updateNotice: false }` leaves it out,
+ * for `update`, whose own result already says what to run.
  */
 export function withMeta<T extends object>(
   data: T,
-  options?: { deprecated?: boolean },
+  options?: { deprecated?: boolean; updateNotice?: boolean },
 ): T & { _meta: UpdateMeta } {
   const meta = getUpdateMeta();
+  if (options?.updateNotice !== false) {
+    const notice = noticeOrNull(meta);
+    if (notice) meta.updateNotice = notice;
+  }
   if (options?.deprecated) meta.deprecated = true;
   return { ...data, _meta: meta };
 }
@@ -151,22 +306,26 @@ export function withMeta<T extends object>(
  * output.
  */
 export function printDeprecationNotice(command: string): void {
-  process.stderr.write(
-    `'hyperframes ${command}' is deprecated and will be removed in a future release. Use 'hyperframes check' instead.\n`,
+  asNotice(() =>
+    process.stderr.write(
+      `'hyperframes ${command}' is deprecated and will be removed in a future release. Use 'hyperframes check' instead.\n`,
+    ),
   );
 }
 
+/** True when the update check is off: dev mode, CI, or the HYPERFRAMES_NO_UPDATE_CHECK opt-out. */
+export function updateCheckDisabled(): boolean {
+  if (isDevMode()) return true;
+  if (isCI()) return true;
+  return process.env["HYPERFRAMES_NO_UPDATE_CHECK"] === "1";
+}
+
 /**
- * True when update / freshness notices should stay silent — CI, non-TTY, dev
- * mode, or the HYPERFRAMES_NO_UPDATE_CHECK opt-out. Shared with the skills
- * freshness notice so both honour the same gating.
+ * True when update / freshness notices should stay silent: the check is off or stderr is not a
+ * terminal. Shared with the skills freshness notice so both honour the same gating.
  */
 export function updateNoticesSuppressed(): boolean {
-  if (isDevMode()) return true;
-  if (process.env["CI"] === "true" || process.env["CI"] === "1") return true;
-  if (!process.stderr.isTTY) return true;
-  if (process.env["HYPERFRAMES_NO_UPDATE_CHECK"] === "1") return true;
-  return false;
+  return updateCheckDisabled() || !process.stderr.isTTY || isUnattended();
 }
 
 /**
@@ -178,6 +337,7 @@ export function printUpdateNotice(): void {
 
   const meta = getUpdateMeta();
   if (!meta.updateAvailable || !meta.latestVersion) return;
+  if (readConfig().pendingUpdate?.version === meta.latestVersion) return;
 
   // Show the command that updates *this* install: the detected package
   // manager's upgrade for owned global installs (npm/bun/pnpm/brew), and the
@@ -197,20 +357,14 @@ export function printUpdateNotice(): void {
 const STALE_PIN_THROTTLE_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Actionable, throttled notice for a project whose package.json still pins an
- * OLD hyperframes version. Unlike printUpdateNotice this DOES fire on non-TTY
- * (agents render with piped stderr) \u2014 but only when there's a concrete stale
- * pin to act on, at most once/24h per install, and never under --json/CI/dev/
- * opt-out. The whole cli.ts update block is already skipped for --json, so a
- * JSON stdout stays clean regardless.
+ * Actionable notice when the running CLI is older than the project's pin (every
+ * run), or when the pin is older than the latest release (once/24h per install).
+ * Unlike printUpdateNotice this DOES fire on non-TTY (agents render with piped
+ * stderr), but never under --json/CI/dev/opt-out: the whole cli.ts update block
+ * is skipped for --json, so a JSON stdout stays clean regardless.
  */
 export function printStalePinNotice(cwd: string = process.cwd()): void {
-  if (isDevMode()) return;
-  if (process.env["CI"] === "true" || process.env["CI"] === "1") return;
-  if (process.env["HYPERFRAMES_NO_UPDATE_CHECK"] === "1") return;
-
-  const latest = getUpdateMeta().latestVersion;
-  if (!latest || !isSafeVersion(latest)) return;
+  if (updateCheckDisabled()) return;
 
   let scripts: Record<string, string> = {};
   try {
@@ -220,7 +374,20 @@ export function printStalePinNotice(cwd: string = process.cwd()): void {
   } catch {
     return;
   }
-  const stale = readPinnedHyperframesVersions(scripts).filter((v) => {
+  const pins = readPinnedHyperframesVersions(scripts);
+  // A CLI older than the pin (e.g. a stale npx cache) misjudges every run, so this is never throttled.
+  const newerPins = pins.filter((v) => isNewerSemver(v, VERSION)).sort(compareVersions);
+  if (newerPins.length > 0) {
+    process.stderr.write(
+      `\n  This is hyperframes ${VERSION}, but this project pins hyperframes@${newerPins.join(", ")}.\n` +
+        `  Run it through the project's npm scripts, or npx hyperframes@${newerPins.at(-1)}.\n\n`,
+    );
+    return;
+  }
+
+  const latest = getUpdateMeta().latestVersion;
+  if (!latest || !isSafeVersion(latest)) return;
+  const stale = pins.filter((v) => {
     try {
       return compareVersions(latest, v) > 0;
     } catch {
@@ -229,9 +396,9 @@ export function printStalePinNotice(cwd: string = process.cwd()): void {
   });
   if (stale.length === 0) return;
 
-  const config = readConfig();
-  const last = config.lastStalePinNoticeAt ?? 0;
+  const last = readConfig().lastStalePinNoticeAt ?? 0;
   if (Date.now() - last < STALE_PIN_THROTTLE_MS) return;
+  const config = readConfigFresh();
   config.lastStalePinNoticeAt = Date.now();
   writeConfig(config);
 

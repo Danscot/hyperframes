@@ -308,13 +308,13 @@ export function Transform3DCube({
           onClick={onKeyframe}
           title={
             keyframed
-              ? "3D transform is keyframed — click a field diamond to add keyframes"
+              ? "3D transform is keyframed. Click a field diamond to add keyframes"
               : "Keyframe the 3D transform (animate it over time)"
           }
           aria-label="Keyframe 3D transform"
           aria-pressed={keyframed}
           className={`absolute left-1.5 top-1.5 rounded p-0.5 hover:bg-neutral-800 ${
-            keyframed ? "text-[#5ff0bf]" : "text-neutral-500 hover:text-neutral-200"
+            keyframed ? "text-accent-ink" : "text-neutral-500 hover:text-neutral-200"
           }`}
         >
           <svg

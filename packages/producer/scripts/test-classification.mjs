@@ -5,31 +5,11 @@ import { fileURLToPath } from "node:url";
 
 export const PRODUCER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-// These tests need host capabilities such as Chrome, ffmpeg, worker threads,
-// or local sockets. Keep the list explicit so a filename-only rename does not
-// make Git/fallow re-audit thousands of unchanged test lines as new code.
-const INTEGRATION_TEST_FILES = new Set([
-  "src/regression-harness-psnr.test.ts",
-  "src/services/coreRuntimeBrowser.test.ts",
-  "src/services/deterministicFonts-systemCapture.test.ts",
-  "src/services/distributed/assemble.test.ts",
-  "src/services/distributed/chunkBoundary.test.ts",
-  "src/services/distributed/crossWorkerIdempotency.test.ts",
-  "src/services/distributed/plan.test.ts",
-  "src/services/distributed/planSizeCap.test.ts",
-  "src/services/distributed/renderChunk.test.ts",
-  "src/services/fileServer.test.ts",
-  "src/services/fileServer.file-race.test.ts",
-  "src/services/healthWorker.test.ts",
-  "src/services/hyperframeLint.file-race.test.ts",
-  "src/services/assetMediaType.test.ts",
-  "src/services/htmlCompiler.mediaType.test.ts",
-  "src/services/htmlCompiler.naturalDuration.test.ts",
-  "src/services/render/hlsRender.integration.test.ts",
-  "src/services/render/stages/compileStage.mediaType.test.ts",
-  "src/utils/audioRegression.test.ts",
-  "src/utils/streamDurationParity.test.ts",
-]);
+// The tests that need host capabilities such as Chrome, ffmpeg, worker threads or local sockets, one path per
+// line, so adding one never edits (or re-pins) the selection logic below.
+const INTEGRATION_TEST_FILES = new Set(
+  JSON.parse(readFileSync(resolve(PRODUCER_ROOT, "scripts/integration-tests.json"), "utf8")),
+);
 
 function collectTestFiles(directory, files = []) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -55,11 +35,13 @@ export function classifyTestSource(filePath, source, integrationFiles = INTEGRAT
 }
 
 export function discoverProducerTests(producerRoot = PRODUCER_ROOT) {
-  const srcDir = resolve(producerRoot, "src");
-  const files = collectTestFiles(srcDir).map((absolutePath) => ({
-    absolutePath,
-    filePath: relative(producerRoot, absolutePath).replaceAll("\\", "/"),
-  }));
+  const roots = ["src", "tests"].map((directory) => resolve(producerRoot, directory));
+  const files = roots
+    .flatMap((directory) => collectTestFiles(directory))
+    .map((absolutePath) => ({
+      absolutePath,
+      filePath: relative(producerRoot, absolutePath).replaceAll("\\", "/"),
+    }));
   const discoveredFiles = new Set(files.map((test) => test.filePath));
   const staleEntries = [...INTEGRATION_TEST_FILES].filter((file) => !discoveredFiles.has(file));
   if (staleEntries.length > 0) {

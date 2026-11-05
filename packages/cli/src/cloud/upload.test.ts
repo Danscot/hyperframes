@@ -1,8 +1,13 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, onTestFinished, vi } from "vitest";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingHttpHeaders } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { HyperframesApiError } from "./_gen/client.js";
 import type { HyperframesCloudClient } from "./_gen/client.js";
-import { uploadZipViaDirectUpload } from "./upload.js";
+import { uploadAssetViaDirectUpload, uploadZipViaDirectUpload } from "./upload.js";
 
 function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -187,6 +192,62 @@ describe("uploadZipViaDirectUpload", () => {
     expect(completeCalls).toBe(1);
   });
 
+  it("names the file and keeps the server's words when complete refuses its type", async () => {
+    const completeAssetUpload = vi.fn(async () => {
+      throw new HyperframesApiError({
+        status: 400,
+        message: "Stored file type not supported: application/octet-stream",
+        code: "invalid_parameter",
+        param: "asset_id",
+      });
+    });
+    const client = makeClient({
+      completeAssetUpload:
+        completeAssetUpload as unknown as HyperframesCloudClient["completeAssetUpload"],
+    });
+
+    const err = await uploadAssetViaDirectUpload({
+      client,
+      bytes: new Uint8Array([0]),
+      filename: "song.mp3",
+      contentType: "audio/mpeg",
+      fetchImpl: makeFetchOk(),
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(HyperframesApiError);
+    expect((err as HyperframesApiError).message).toBe(
+      "The cloud couldn't read this audio file's type: song.mp3. It said: Stored file type not supported: application/octet-stream",
+    );
+    expect((err as HyperframesApiError).param).toBe("asset_id");
+    expect((err as HyperframesApiError).status).toBe(400);
+  });
+
+  it("does not blame the file's type when complete refuses an expired upload", async () => {
+    const completeAssetUpload = vi.fn(async () => {
+      throw new HyperframesApiError({
+        status: 400,
+        message: "This upload has expired; create a new upload.",
+        code: "invalid_parameter",
+      });
+    });
+    const client = makeClient({
+      completeAssetUpload:
+        completeAssetUpload as unknown as HyperframesCloudClient["completeAssetUpload"],
+    });
+
+    const err = await uploadAssetViaDirectUpload({
+      client,
+      bytes: new Uint8Array([0]),
+      filename: "song.mp3",
+      contentType: "audio/mpeg",
+      fetchImpl: makeFetchOk(),
+    }).catch((e: unknown) => e);
+
+    expect((err as HyperframesApiError).message).toBe(
+      "The cloud refused song.mp3: This upload has expired; create a new upload.",
+    );
+  });
+
   it("surfaces PUT failures with response body detail", async () => {
     const client = makeClient();
     const fetchImpl = vi.fn(
@@ -230,5 +291,83 @@ describe("uploadZipViaDirectUpload", () => {
       onProgress: (e) => events.push({ phase: e.phase }),
     });
     expect(events.map((e) => e.phase)).toEqual(["initialize", "upload", "upload", "complete"]);
+  });
+});
+
+describe("uploadAssetViaDirectUpload from a file on disk", () => {
+  async function withServer(
+    status: number,
+    run: (url: string, got: { headers?: IncomingHttpHeaders; body?: Buffer }) => Promise<void>,
+  ): Promise<void> {
+    const got: { headers?: IncomingHttpHeaders; body?: Buffer } = {};
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      Object.assign(got, { headers: req.headers, body: Buffer.concat(chunks) });
+      res.writeHead(status).end(status === 200 ? "" : "SignatureDoesNotMatch");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await run(`http://127.0.0.1:${(server.address() as AddressInfo).port}/put`, got);
+    } finally {
+      server.close();
+    }
+  }
+
+  function fileOnDisk(bytes: Buffer): string {
+    const dir = mkdtempSync(join(tmpdir(), "hf-upload-test-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    writeFileSync(join(dir, "clip.mp4"), bytes);
+    return join(dir, "clip.mp4");
+  }
+
+  const clientFor = (url: string) =>
+    makeClient({
+      createAssetUpload: vi.fn(async () => ({
+        asset_id: "asset_xyz",
+        upload_url: url,
+        upload_headers: {},
+        expires_in_seconds: 3600,
+        max_bytes: 200 * 1024 * 1024,
+        status: "pending_upload" as const,
+      })),
+    } as Partial<HyperframesCloudClient>);
+
+  it("hashes the file and PUTs it as a stream with its exact length", async () => {
+    const bytes = Buffer.from("a file far too big to read whole, in miniature");
+    const path = fileOnDisk(bytes);
+    await withServer(200, async (url, got) => {
+      const client = clientFor(url);
+      await uploadAssetViaDirectUpload({
+        client,
+        path,
+        size: bytes.byteLength,
+        filename: "clip.mp4",
+        contentType: "video/mp4",
+      });
+      expect(client.createAssetUpload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({ checksum_sha256: sha256Hex(bytes) }),
+        }),
+      );
+      expect(got.body?.equals(bytes)).toBe(true);
+      expect(got.headers?.["content-length"]).toBe(String(bytes.byteLength));
+      expect(got.headers?.["content-type"]).toBe("video/mp4");
+    });
+  });
+
+  it("reports the status of a refused PUT", async () => {
+    const path = fileOnDisk(Buffer.from("bytes"));
+    await withServer(403, async (url) => {
+      await expect(
+        uploadAssetViaDirectUpload({
+          client: clientFor(url),
+          path,
+          size: 5,
+          filename: "clip.mp4",
+          contentType: "video/mp4",
+        }),
+      ).rejects.toThrow(/Direct upload PUT failed: 403.*SignatureDoesNotMatch/);
+    });
   });
 });

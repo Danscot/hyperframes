@@ -20,7 +20,16 @@ import { swallow } from "../diagnostics";
 
 let _lastDispatchedTime = -1;
 type SeekCompletionResult = { status: "fulfilled" } | { status: "rejected"; reason: unknown };
-let _pendingCompletions = new Set<Promise<SeekCompletionResult>>();
+/** What a seek waits on, named when the barrier stops waiting for it. */
+export type SeekHold =
+  | "video-frame"
+  | "hf-seek"
+  | "frame-source"
+  | "scene-window"
+  | "motion-blur"
+  | "vfx"
+  | "image-decode";
+let _pendingCompletions = new Map<Promise<SeekCompletionResult>, SeekHold>();
 let _pendingFailure: { reason: unknown } | undefined;
 let _activeCompletionBarriers = 0;
 
@@ -49,10 +58,24 @@ function dispatch(time: number): void {
     accepting = false;
   }
   if (pending.length === 0) return;
-  const completion = Promise.all(pending)
+  registerSeekCompletion(Promise.all(pending), "hf-seek");
+}
+
+/**
+ * Join `promise` to the seek-completion barrier: `waitForSeekCompletion` will
+ * not resolve until it settles, and its rejection (the first one) becomes the
+ * barrier's.
+ *
+ * Exported because the `"hf-seek"` event's synchronous `waitUntil()` is not
+ * the only asynchronous seek work a frame can owe. `runtime/vfx.ts` registers
+ * its preview-side capture here, so the CLI seek paths that already await this
+ * barrier wait for a `self` chain's paint instead of racing it.
+ */
+export function registerSeekCompletion(promise: Promise<unknown>, hold: SeekHold): void {
+  const completion = promise
     .then<SeekCompletionResult>(() => ({ status: "fulfilled" }))
     .catch<SeekCompletionResult>((reason: unknown) => ({ status: "rejected", reason }));
-  _pendingCompletions.add(completion);
+  _pendingCompletions.set(completion, hold);
   void completion.then((result) => {
     if (!_pendingCompletions.delete(completion)) return;
     if (result.status === "rejected" && _pendingFailure === undefined) {
@@ -86,15 +109,71 @@ export function isSeekCompletionBarrierActive(): boolean {
   return _activeCompletionBarriers > 0;
 }
 
-export async function waitForSeekCompletion(): Promise<void> {
+/** Settles with every pending completion, without consuming a failure the barrier reports. */
+export async function seekCompletionsSettled(): Promise<void> {
+  for (
+    let pending = [..._pendingCompletions.keys()];
+    pending.length > 0;
+    pending = [..._pendingCompletions.keys()]
+  ) {
+    await Promise.all(pending);
+  }
+}
+
+export function hasPendingSeekCompletion(): boolean {
+  return _pendingCompletions.size > 0;
+}
+
+/** All of `pending` settled, or null once `deadline` (epoch ms) passes first. */
+async function settledBy(
+  pending: Promise<SeekCompletionResult>[],
+  deadline: number | undefined,
+): Promise<SeekCompletionResult[] | null> {
+  if (deadline === undefined) return Promise.all(pending);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+  });
+  try {
+    return await Promise.race([Promise.all(pending), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** `videoFrames: false` skips only video-frame holds. Past a caller's `timeoutMs` it throws, naming what is pending. */
+export async function waitForSeekCompletion(options?: {
+  videoFrames?: boolean;
+  timeoutMs?: number;
+}): Promise<void> {
+  const awaited = () =>
+    [..._pendingCompletions].filter(
+      ([, hold]) => options?.videoFrames !== false || hold !== "video-frame",
+    );
+  const timeoutMs = options?.timeoutMs;
+  const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
   _activeCompletionBarriers += 1;
   let failed = _pendingFailure;
   try {
     // Let concurrently started barriers snapshot the same retained failure
     // before either one consumes it.
     await Promise.resolve();
-    while (_pendingCompletions.size > 0) {
-      const results = await Promise.all([..._pendingCompletions]);
+    for (let pending = awaited(); pending.length > 0; pending = awaited()) {
+      // Holds that keep arriving past the deadline must not outrun it.
+      const results =
+        deadline === undefined || Date.now() < deadline
+          ? await settledBy(
+              pending.map(([completion]) => completion),
+              deadline,
+            )
+          : null;
+      if (!results) {
+        const holds = [...new Set(awaited().map(([, hold]) => hold))].join(", ");
+        throw Object.assign(
+          new Error(`seek did not settle within ${timeoutMs} ms: still waiting on ${holds}`),
+          { name: "SeekNotSettledError" },
+        );
+      }
       const rejected = results.find((result) => result.status === "rejected");
       if (failed === undefined && rejected?.status === "rejected") {
         failed = { reason: rejected.reason };
@@ -116,7 +195,7 @@ export async function waitForSeekCompletion(): Promise<void> {
 /** Reset internal state — used in tests to prevent cross-test contamination. */
 export function resetSeekDispatchState(): void {
   _lastDispatchedTime = -1;
-  _pendingCompletions = new Set();
+  _pendingCompletions = new Map();
   _pendingFailure = undefined;
   _activeCompletionBarriers = 0;
 }

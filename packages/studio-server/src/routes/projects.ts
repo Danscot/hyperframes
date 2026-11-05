@@ -2,10 +2,9 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Hono } from "hono";
 import type { StudioApiAdapter } from "../types.js";
-import { isInHiddenOrVendorDir, walkDir } from "../helpers/safePath.js";
+import { isInHiddenOrVendorDir, isPrivateProjectPath, walkDir } from "../helpers/safePath.js";
+import { isCompositionSource } from "../helpers/hfIdPersist.js";
 import { resolveProjectSignature } from "../helpers/projectSignature.js";
-
-const COMPOSITION_ID_RE = /data-composition-id\s*=/;
 
 async function filterCompositionFiles(projectDir: string, files: string[]): Promise<string[]> {
   const htmlFiles = files.filter((f) => f.endsWith(".html") && !isInHiddenOrVendorDir(f));
@@ -13,7 +12,7 @@ async function filterCompositionFiles(projectDir: string, files: string[]): Prom
     htmlFiles.map(async (f) => {
       try {
         const content = await readFile(join(projectDir, f), "utf-8");
-        return COMPOSITION_ID_RE.test(content);
+        return isCompositionSource(content);
       } catch {
         return false;
       }
@@ -44,14 +43,14 @@ export function registerProjectRoutes(api: Hono, adapter: StudioApiAdapter): voi
   api.get("/projects/:id/signature", async (c) => {
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
-    return c.json({ signature: resolveProjectSignature(adapter, project.dir) });
+    return c.json({ signature: await resolveProjectSignature(adapter, project.dir) });
   });
 
   // Project file tree
   api.get("/projects/:id", async (c) => {
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
-    const files = walkDir(project.dir);
+    const files = walkDir(project.dir).filter((file) => !isPrivateProjectPath(file));
     const compositions = await filterCompositionFiles(project.dir, files);
     return c.json({ id: project.id, dir: project.dir, title: project.title, files, compositions });
   });

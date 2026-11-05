@@ -1,8 +1,12 @@
 import { useMemo } from "react";
-import { STUDIO_PREVIEW_FPS } from "../lib/time";
 import type { TimelineTimeDisplayMode } from "../../utils/studioUiPreferences";
+import { useCompositionFps } from "../../utils/linkedClipPreferences";
 import type { TimelineTimeRange } from "../lib/timelineClipIndex";
-import { generateTicks, getTimelineMajorTickInterval } from "./timelineRulerGeometry";
+import {
+  generateTicks,
+  getTimelineMajorTickInterval,
+  rulerFrameRate,
+} from "./timelineRulerGeometry";
 
 export function useTimelineTicks(
   duration: number,
@@ -10,13 +14,15 @@ export function useTimelineTicks(
   timeDisplayMode: TimelineTimeDisplayMode,
   renderTimeRange?: TimelineTimeRange,
 ) {
-  const frameRate = timeDisplayMode === "frame" ? STUDIO_PREVIEW_FPS : undefined;
+  const compositionFps = useCompositionFps();
+  const frameRate = rulerFrameRate(timeDisplayMode, compositionFps);
   const ticks = useMemo(
     () => generateTicks(duration, pixelsPerSecond, frameRate, renderTimeRange),
     [duration, frameRate, pixelsPerSecond, renderTimeRange],
   );
   return {
     ...ticks,
+    frameRate,
     majorTickInterval: getTimelineMajorTickInterval(duration, pixelsPerSecond, frameRate),
   };
 }

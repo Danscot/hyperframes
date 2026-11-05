@@ -173,3 +173,43 @@ test("HoverVideo's control does not bubble its click to a wrapping link", () => 
     "the click does not bubble to a wrapping link",
   );
 });
+
+// Mintlify prefixes caller classes before evaluating snippets. Interpolating
+// them after literal classes can join the boundary tokens and lose aspect-video.
+test("HoverVideo preserves the caller's sizing classes at the Mintlify boundary", () => {
+  const source = readFileSync(join(here, "../docs/snippets/hover-video.jsx"), "utf8");
+  const wrapper = source.match(/<div\s+ref=\{wrapRef\}([\s\S]*?)>/);
+  assert.ok(wrapper, "found the preview's layout wrapper");
+  assert.match(
+    wrapper[1],
+    /className=\{className\}/,
+    "forward sizing classes without interpolation",
+  );
+  assert.match(
+    wrapper[1],
+    /position:\s*"relative"/,
+    "anchor the absolute video inside the sized wrapper",
+  );
+  assert.match(wrapper[1], /overflow:\s*"hidden"/, "clip the preview inside its card");
+});
+
+test("the catalog player keeps native controls until the CDN player upgrades it", () => {
+  const source = readFileSync(join(here, "../docs/snippets/example-player.jsx"), "utf8");
+  assert.match(source, /createElement\("hyperframes-player"\)/);
+  assert.match(source, /player\.setAttribute\("controls", ""\)/);
+  assert.match(
+    source,
+    /\.hfp-poster\{width:100%;height:100%\}/,
+    "fit large posters in the published player instead of cropping them",
+  );
+  assert.match(source, /loading="lazy"/);
+  assert.ok(
+    source.indexOf("appendChild(fallback)") < source.indexOf("appendChild(script)"),
+    "native controls exist before the CDN request",
+  );
+  assert.match(
+    source,
+    /fallback\.readyState >= 1/,
+    "upgrade also handles metadata arriving before the CDN script",
+  );
+});

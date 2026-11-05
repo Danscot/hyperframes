@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { memo, useCallback } from "react";
 import type { StudioRightPanelsProps } from "./StudioRightPanels.types";
 
 import { PropertyPanel } from "./editor/PropertyPanel";
@@ -8,6 +8,7 @@ import { BlockParamsPanel } from "./editor/BlockParamsPanel";
 import { RenderQueuePanel } from "./renders/RenderQueuePanel";
 import { SlideshowPanel } from "./panels/SlideshowPanel";
 import { VariablesPanel } from "./panels/VariablesPanel";
+import { MotionBlurPanel } from "./panels/MotionBlurPanel";
 import { Dock } from "./dock/Dock";
 import { useDockLayoutStore } from "./dock/dockLayoutStore";
 import type { RenderJob } from "./renders/useRenderQueue";
@@ -23,17 +24,15 @@ import { useStudioPlaybackContext, useStudioShellContext } from "../contexts/Stu
 import { useFileManagerContext } from "../contexts/FileManagerContext";
 import { useDomEditContext } from "../contexts/DomEditContext";
 import { usePlayerStore } from "../player";
-import {
-  applyColorGradingScopeUpdate,
-  EMPTY_COLOR_GRADING_SCOPE_RESULT,
-  type ColorGradingScope,
-} from "./studioColorGradingScope";
 import { timelineKeysForSelections } from "../utils/studioHelpers";
 import { canHideSelections } from "../utils/timelineInspector";
 import { useRemoveBackground } from "../hooks/useRemoveBackground";
+import { useApplyColorGradingScope } from "../hooks/useApplyColorGradingScope";
 
 // fallow-ignore-next-line complexity
-export function StudioRightPanels({
+const seekToTime = (t: number) => usePlayerStore.getState().requestSeek(t);
+
+export const StudioRightPanels = memo(function StudioRightPanels({
   activeBlockParams,
   onCloseBlockParams,
   onDismissBlockParams,
@@ -49,14 +48,8 @@ export function StudioRightPanels({
   onAutoGroupCarveSources,
   onAddMediaOverlay,
 }: StudioRightPanelsProps) {
-  const {
-    previewIframeRef,
-    projectId,
-    activeCompPath,
-    showToast,
-    waitForPendingDomEditSaves,
-    renderQueue,
-  } = useStudioShellContext();
+  const { previewIframeRef, projectId, activeCompPath, showToast, renderQueue } =
+    useStudioShellContext();
   const { captionEditMode, refreshKey } = useStudioPlaybackContext();
 
   const {
@@ -72,6 +65,7 @@ export function StudioRightPanels({
     handleDomAttributeQuietCommit,
     handleDomHtmlAttributeCommit,
     handleDomAttributesCommit,
+    handleDomAttributeBatchCommit,
     handleDomPathOffsetCommit,
     handleDomBoxSizeCommit,
     handleDomRotationCommit,
@@ -114,7 +108,6 @@ export function StudioRightPanels({
     refreshFileTree,
     readProjectFile,
     writeProjectFile,
-    fileTree,
     editingFile,
   } = useFileManagerContext();
 
@@ -158,40 +151,7 @@ export function StudioRightPanels({
   });
   useCaptionDesignFocus(captionEditMode);
 
-  const handleApplyColorGradingScope = useCallback(
-    async (scope: ColorGradingScope, value: string | null) =>
-      applyColorGradingScopeUpdate({
-        scope,
-        value,
-        selectedSourceFile: domEditSelection?.sourceFile || activeCompPath || "index.html",
-        fileTree,
-        projectId,
-        waitForPendingDomEditSaves,
-        readProjectFile,
-        writeProjectFile,
-        recordEdit,
-        reloadPreview,
-        showToast,
-      }).catch((error) => {
-        showToast(
-          `Couldn't apply color grading: ${error instanceof Error ? error.message : String(error)}`,
-          "error",
-        );
-        return EMPTY_COLOR_GRADING_SCOPE_RESULT;
-      }),
-    [
-      activeCompPath,
-      domEditSelection?.sourceFile,
-      fileTree,
-      projectId,
-      readProjectFile,
-      recordEdit,
-      reloadPreview,
-      showToast,
-      waitForPendingDomEditSaves,
-      writeProjectFile,
-    ],
-  );
+  const handleApplyColorGradingScope = useApplyColorGradingScope(recordEdit, reloadPreview);
 
   const handleRemoveBackground = useRemoveBackground(projectId, refreshFileTree, showToast);
 
@@ -209,22 +169,24 @@ export function StudioRightPanels({
       handleDomAttributeLiveCommit(attr, value, undefined, { previewOnly: true }),
     [handleDomAttributeLiveCommit],
   );
-  const handleHideAllSelected = () => {
+  const handleHideAllSelected = useCallback(() => {
     // Audio has no visual to hide, and `data-hidden` on an audio element is what
-    // MUTES it — preview silences it and the render drops it from the mix. The
-    // timeline withholds the eye on an audio track for that reason
-    // (`visible={!isAudioTrack}`), and the single-selection panel gates the same
-    // write on `audioSelection`; this multi-selection path was the way back to
-    // it. Checked here as well as in the panel because the button is not the
-    // only caller.
+    // mutes it — preview silences it and the render drops it from the mix; the
+    // timeline offers that write as a mute. Checked here as well as in the panel
+    // because the button is not the only caller.
     if (!canHideSelections(domEditGroupSelections)) {
-      showToast("Audio can't be hidden — use the group's own controls", "info");
+      showToast("Audio can't be hidden. Use the group's own controls", "info");
       return;
     }
     const { elements } = usePlayerStore.getState();
     const keys = timelineKeysForSelections(domEditGroupSelections, elements, activeCompPath);
     if (keys.length > 0) void onToggleElementHidden?.(keys, true);
-  };
+  }, [domEditGroupSelections, showToast, activeCompPath, onToggleElementHidden]);
+  const convertToKeyframes = useCallback(
+    (animId: string, duration?: number) =>
+      handleGsapConvertToKeyframes(animId, undefined, duration),
+    [handleGsapConvertToKeyframes],
+  );
   const propertyPanel = (
     <DesignPanelPromoteProvider
       selection={domEditGroupSelections.length > 1 ? null : domEditSelection}
@@ -254,6 +216,7 @@ export function StudioRightPanels({
         onSetStyle={handleDomStyleCommit}
         onSetAttribute={handleDomAttributeCommit}
         onSetAttributes={handleDomAttributesCommit}
+        onSetAttributeBatch={handleDomAttributeBatchCommit}
         onSetAttributeLive={setAttributeWhileDragging}
         onSetAttributeQuiet={handleDomAttributeQuietCommit}
         onApplyColorGradingScope={handleApplyColorGradingScope}
@@ -288,10 +251,8 @@ export function StudioRightPanels({
         onCommitAnimatedProperties={commitAnimatedProperties}
         onAddKeyframe={handleGsapAddKeyframe}
         onRemoveKeyframe={handleGsapRemoveKeyframe}
-        onConvertToKeyframes={(animId, duration) =>
-          handleGsapConvertToKeyframes(animId, undefined, duration)
-        }
-        onSeekToTime={(t) => usePlayerStore.getState().requestSeek(t)}
+        onConvertToKeyframes={convertToKeyframes}
+        onSeekToTime={seekToTime}
         onSetArcPath={handleSetArcPath}
         onUpdateArcSegment={handleUpdateArcSegment}
         onUnroll={handleUnroll}
@@ -340,6 +301,14 @@ export function StudioRightPanels({
           recordEdit={recordEdit}
         />
       </Dock.Panel>
+      <Dock.Panel id="motionBlur">
+        <MotionBlurPanel
+          sdkSession={sdkSession}
+          publishSdkSession={publishSdkSession}
+          reloadPreview={reloadPreview}
+          recordEdit={recordEdit}
+        />
+      </Dock.Panel>
       <Dock.Panel id="slideshow">
         <SlideshowPanel
           scenes={slideshowScenes}
@@ -349,4 +318,4 @@ export function StudioRightPanels({
       </Dock.Panel>
     </>
   );
-}
+});

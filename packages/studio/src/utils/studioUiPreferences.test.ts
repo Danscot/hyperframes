@@ -23,15 +23,22 @@ describe("studio UI preferences", () => {
     writeStudioUiPreferences({ playbackRate: 1.5 }, storage);
     writeStudioUiPreferences({ audioMuted: true }, storage);
     writeStudioUiPreferences({ audioVolume: 0.4 }, storage);
-    writeStudioUiPreferences({ previewZoom: { zoomPercent: 160, panX: -20, panY: 12 } }, storage);
 
     expect(readStudioUiPreferences(storage)).toEqual({
       timelineVisible: false,
       playbackRate: 1.5,
       audioMuted: true,
       audioVolume: 0.4,
-      previewZoom: { zoomPercent: 160, panX: -20, panY: 12 },
     });
+  });
+
+  it("remembers the preview quality, and drops a level that is not one of the four", () => {
+    const storage = createStorage();
+    writeStudioUiPreferences({ previewQuality: 0.25 }, storage);
+    expect(readStudioUiPreferences(storage)).toEqual({ previewQuality: 0.25 });
+
+    storage.setItem("hf-studio-ui-preferences", JSON.stringify({ previewQuality: 0.75 }));
+    expect(readStudioUiPreferences(storage).previewQuality).toBeUndefined();
   });
 
   it("remembers the ruler and safe-margin toggles and drops non-boolean values", () => {
@@ -49,6 +56,15 @@ describe("studio UI preferences", () => {
     expect(readStudioUiPreferences(storage)).toEqual({});
   });
 
+  it("keeps no preview zoom, so every project opens at Fit", () => {
+    const storage = createStorage();
+    storage.setItem(
+      "hf-studio-ui-preferences",
+      JSON.stringify({ previewZoom: { zoomPercent: 245, panX: 0, panY: 0 } }),
+    );
+    expect(readStudioUiPreferences(storage)).toEqual({});
+  });
+
   it("ignores malformed stored values", () => {
     const storage = createStorage();
     storage.setItem(
@@ -58,7 +74,6 @@ describe("studio UI preferences", () => {
         playbackRate: Number.NaN,
         audioMuted: "false",
         audioVolume: 2,
-        previewZoom: { zoomPercent: 150, panX: 0, panY: "bad" },
       }),
     );
 
@@ -159,5 +174,15 @@ describe("timeline zoom pin persistence", () => {
     const prefs = readStudioUiPreferences(storage);
     expect(prefs.timelineZoomMode).toBeUndefined();
     expect(prefs.timelineManualZoomPercent).toBeUndefined();
+  });
+});
+
+describe("audioMetersVisible preference", () => {
+  it("round-trips and ignores a non-boolean", () => {
+    const storage = createStorage();
+    writeStudioUiPreferences({ audioMetersVisible: false }, storage);
+    expect(readStudioUiPreferences(storage).audioMetersVisible).toBe(false);
+    storage.setItem("hf-studio-ui-preferences", JSON.stringify({ audioMetersVisible: "no" }));
+    expect(readStudioUiPreferences(storage).audioMetersVisible).toBeUndefined();
   });
 });

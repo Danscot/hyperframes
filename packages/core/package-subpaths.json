@@ -26,6 +26,18 @@
       "types": "./dist/canaryRegistry.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./telemetry-redaction": {
+      "source": "./src/telemetryRedaction.ts",
+      "runtime": "./dist/telemetryRedaction.js",
+      "types": "./dist/telemetryRedaction.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./distributed-fps": {
+      "source": "./src/distributedFps.ts",
+      "runtime": "./dist/distributedFps.js",
+      "types": "./dist/distributedFps.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./beats": {
       "source": "./src/beats/index.ts",
       "runtime": "./dist/beats/index.js",
@@ -38,6 +50,72 @@
       "types": "./dist/utils/htmlAttrSafety.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./safe-path": {
+      "source": "./src/safePath.ts",
+      "runtime": "./dist/safePath.js",
+      "types": "./dist/safePath.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./browser-marker": {
+      "source": "./src/browserMarker.ts",
+      "runtime": "./dist/browserMarker.js",
+      "types": "./dist/browserMarker.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./atomic-file": {
+      "source": "./src/atomicFile.ts",
+      "runtime": "./dist/atomicFile.js",
+      "types": "./dist/atomicFile.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./cache-dir": {
+      "source": "./src/cacheDir.ts",
+      "runtime": "./dist/cacheDir.js",
+      "types": "./dist/cacheDir.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./remove-tree": {
+      "source": "./src/removeTree.ts",
+      "runtime": "./dist/removeTree.js",
+      "types": "./dist/removeTree.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./env-proxy": {
+      "source": "./src/envProxy.ts",
+      "runtime": "./dist/envProxy.js",
+      "types": "./dist/envProxy.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./rename-retry": {
+      "source": "./src/renameWithRetry.ts",
+      "runtime": "./dist/renameWithRetry.js",
+      "types": "./dist/renameWithRetry.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./remove-scratch": {
+      "source": "./src/removeScratch.ts",
+      "runtime": "./dist/removeScratch.js",
+      "types": "./dist/removeScratch.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./project-folders": {
+      "source": "./src/projectFolders.ts",
+      "runtime": "./dist/projectFolders.js",
+      "types": "./dist/projectFolders.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./asset-paths": {
+      "source": "./src/compiler/rewriteSubCompPaths.ts",
+      "runtime": "./dist/compiler/rewriteSubCompPaths.js",
+      "types": "./dist/compiler/rewriteSubCompPaths.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./runtime-script": {
+      "source": "./src/generated/runtime-inline.ts",
+      "runtime": "./dist/generated/runtime-inline.js",
+      "types": "./dist/generated/runtime-inline.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./rich-text-sanitize": {
       "source": "./src/utils/richTextSanitize.ts",
       "runtime": "./dist/utils/richTextSanitize.js",
@@ -48,6 +126,48 @@
       "source": "./src/compositionContract.ts",
       "runtime": "./dist/compositionContract.js",
       "types": "./dist/compositionContract.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./studio-preview-mark": {
+      "source": "./src/studioPreviewMark.ts",
+      "runtime": "./dist/studioPreviewMark.js",
+      "types": "./dist/studioPreviewMark.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./page-motion-blur": {
+      "source": "./src/pageMotionBlur.ts",
+      "runtime": "./dist/pageMotionBlur.js",
+      "types": "./dist/pageMotionBlur.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./keyframe-defaults": {
+      "source": "./src/keyframeDefaults.ts",
+      "runtime": "./dist/keyframeDefaults.js",
+      "types": "./dist/keyframeDefaults.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./html-in-canvas": {
+      "source": "./src/htmlInCanvas.ts",
+      "runtime": "./dist/htmlInCanvas.js",
+      "types": "./dist/htmlInCanvas.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./motion-blur-settings": {
+      "source": "./src/motionBlurSettings.ts",
+      "runtime": "./dist/motionBlurSettings.js",
+      "types": "./dist/motionBlurSettings.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./preview-quality": {
+      "source": "./src/previewProxyBox.ts",
+      "runtime": "./dist/previewProxyBox.js",
+      "types": "./dist/previewProxyBox.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./gsap-cdn": {
+      "source": "./src/gsapCdn.ts",
+      "runtime": "./dist/gsapCdn.js",
+      "types": "./dist/gsapCdn.d.ts",
       "environments": ["browser", "bun", "node"]
     },
     "./media-timing": {
@@ -102,6 +222,12 @@
       "source": "./src/compiler/index.ts",
       "runtime": "./dist/compiler/index.js",
       "types": "./dist/compiler/index.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./projects": {
+      "source": "./src/projects.ts",
+      "runtime": "./dist/projects.js",
+      "types": "./dist/projects.d.ts",
       "environments": ["bun", "node"]
     },
     "./audio-fx": {
@@ -164,6 +290,12 @@
       "types": "./dist/audioCarve.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./media-link": {
+      "source": "./src/mediaLink.ts",
+      "runtime": "./dist/mediaLink.js",
+      "types": "./dist/mediaLink.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./audio-groups": {
       "source": "./src/audioGroups.ts",
       "runtime": "./dist/audioGroups.js",
@@ -182,10 +314,28 @@
       "types": "./dist/clipFacts.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./audible-video": {
+      "source": "./src/audibleVideo.ts",
+      "runtime": "./dist/audibleVideo.js",
+      "types": "./dist/audibleVideo.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./audio-analysis": {
+      "source": "./src/audioAnalysis.ts",
+      "runtime": "./dist/audioAnalysis.js",
+      "types": "./dist/audioAnalysis.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./audio-gain": {
       "source": "./src/audioGain.ts",
       "runtime": "./dist/audioGain.js",
       "types": "./dist/audioGain.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./audio-fade": {
+      "source": "./src/audioFade.ts",
+      "runtime": "./dist/audioFade.js",
+      "types": "./dist/audioFade.d.ts",
       "environments": ["browser", "bun", "node"]
     },
     "./speed-ramp": {
@@ -230,6 +380,12 @@
       "types": "./dist/runtime/clipTree.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./runtime/dom-realm": {
+      "source": "./src/runtime/domRealm.ts",
+      "runtime": "./dist/runtime/domRealm.js",
+      "types": "./dist/runtime/domRealm.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./runtime/custom-ease": {
       "source": "./src/runtime/customEase.ts",
       "runtime": "./dist/runtime/customEase.js",
@@ -248,6 +404,12 @@
       "types": "./dist/runtime/startResolver.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./runtime/composition-length": {
+      "source": "./src/runtime/compositionLength.ts",
+      "runtime": "./dist/runtime/compositionLength.js",
+      "types": "./dist/runtime/compositionLength.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./runtime/protocol": {
       "source": "./src/runtime/protocol.ts",
       "runtime": "./dist/runtime/protocol.js",
@@ -258,6 +420,24 @@
       "source": "./src/runtime/clipWindow.ts",
       "runtime": "./dist/runtime/clipWindow.js",
       "types": "./dist/runtime/clipWindow.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./runtime/media-clock": {
+      "source": "./src/runtime/mediaClock.ts",
+      "runtime": "./dist/runtime/mediaClock.js",
+      "types": "./dist/runtime/mediaClock.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./runtime/media-steer": {
+      "source": "./src/runtime/mediaSteer.ts",
+      "runtime": "./dist/runtime/mediaSteer.js",
+      "types": "./dist/runtime/mediaSteer.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./runtime/clip-reveal": {
+      "source": "./src/runtime/clipReveal.ts",
+      "runtime": "./dist/runtime/clipReveal.js",
+      "types": "./dist/runtime/clipReveal.d.ts",
       "environments": ["browser", "bun", "node"]
     },
     "./runtime/stacking-context": {
@@ -272,11 +452,23 @@
       "types": "./dist/runtime/webAudioRoute.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./runtime/levelTap": {
+      "source": "./src/runtime/levelTap.ts",
+      "runtime": "./dist/runtime/levelTap.js",
+      "types": "./dist/runtime/levelTap.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./compiler/html-document": {
       "source": "./src/compiler/htmlDocument.ts",
       "runtime": "./dist/compiler/htmlDocument.js",
       "types": "./dist/compiler/htmlDocument.d.ts",
       "environments": ["browser", "bun", "node"]
+    },
+    "./compiler/png-colour-tags": {
+      "source": "./src/compiler/pngColourTags.ts",
+      "runtime": "./dist/compiler/pngColourTags.js",
+      "types": "./dist/compiler/pngColourTags.d.ts",
+      "environments": ["bun", "node"]
     },
     "./runtime/position-edits": {
       "source": "./src/runtime/positionEdits.ts",
@@ -404,6 +596,18 @@
       "types": "./dist/fonts/systemFontLocator.d.ts",
       "environments": ["bun", "node"]
     },
+    "./fonts/embed": {
+      "source": "./src/fonts/deterministicFonts.ts",
+      "runtime": "./dist/fonts/deterministicFonts.js",
+      "types": "./dist/fonts/deterministicFonts.d.ts",
+      "environments": ["bun", "node"]
+    },
+    "./fonts/embedded-data": {
+      "source": "./src/fonts/fontData.generated.ts",
+      "runtime": "./dist/fonts/fontData.generated.js",
+      "types": "./dist/fonts/fontData.generated.d.ts",
+      "environments": ["bun", "node"]
+    },
     "./figma": {
       "source": "./src/figma/index.ts",
       "runtime": "./dist/figma/index.js",
@@ -420,6 +624,12 @@
       "source": "./schemas/registry-item.json",
       "runtime": "./schemas/registry-item.json",
       "types": null,
+      "environments": ["browser", "bun", "node"]
+    },
+    "./timeline-asset-id": {
+      "source": "./src/timelineAssetId.ts",
+      "runtime": "./dist/timelineAssetId.js",
+      "types": "./dist/timelineAssetId.d.ts",
       "environments": ["browser", "bun", "node"]
     }
   }

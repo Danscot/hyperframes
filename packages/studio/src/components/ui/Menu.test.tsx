@@ -3,7 +3,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import React, { act, useState } from "react";
-import { createRoot, type Root } from "react-dom/client";
 import { compile } from "tailwindcss";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadStylesheet, STYLES_DIR } from "../../styles/styleSources";
@@ -11,27 +10,11 @@ import { ContextMenu, Menu, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparat
 import { Popover } from "./Popover";
 import { isTypingTarget } from "../../utils/typingTarget";
 import { shouldIgnorePlaybackShortcutTarget } from "../../player/lib/playbackShortcuts";
+import { cleanupMounted, mountHost as render } from "./mountHost.testHelpers";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-let mounted: { root: Root; host: HTMLElement } | null = null;
-
-function render(element: React.ReactElement): HTMLElement {
-  const host = document.createElement("div");
-  document.body.append(host);
-  const root = createRoot(host);
-  mounted = { root, host };
-  act(() => root.render(element));
-  return host;
-}
-
-afterEach(() => {
-  if (!mounted) return;
-  const { root, host } = mounted;
-  mounted = null;
-  act(() => root.unmount());
-  host.remove();
-});
+afterEach(cleanupMounted);
 
 /** Base UI moves focus into the popup one task after open, not synchronously. */
 async function settle(): Promise<void> {
@@ -62,6 +45,13 @@ function clickWithMouse(target: Element): void {
     target.dispatchEvent(new PointerEvent("pointerup", { ...init, pointerType: "mouse" }));
     target.dispatchEvent(new MouseEvent("mouseup", init));
     target.dispatchEvent(new MouseEvent("click", init));
+  });
+}
+
+function rightClick(target: Element): void {
+  const init = { bubbles: true, cancelable: true, composed: true };
+  act(() => {
+    target.dispatchEvent(new MouseEvent("contextmenu", init));
   });
 }
 
@@ -258,11 +248,7 @@ describe("ContextMenu", () => {
     expect(trigger().textContent).toBe("clip");
     expect(popup()).toBeNull();
 
-    act(() => {
-      trigger().dispatchEvent(
-        new MouseEvent("contextmenu", { bubbles: true, cancelable: true, composed: true }),
-      );
-    });
+    rightClick(trigger());
     await settle();
     expect(popup()).not.toBeNull();
 
@@ -271,6 +257,65 @@ describe("ContextMenu", () => {
 
     expect(activated).toEqual(["split"]);
     expect(popup()).toBeNull();
+  });
+});
+
+describe("container={null}", () => {
+  /** Rendered inline means inside the trigger's own parent, not a portal on the body. */
+  function expectInlineBeside(menu: HTMLElement | null): void {
+    expect(menu).not.toBeNull();
+    expect(trigger().parentElement?.contains(menu)).toBe(true);
+  }
+
+  it("opens a Menu inline, next to its trigger, and closes on Escape", async () => {
+    render(
+      <div>
+        <Menu container={null} trigger={<button data-testid="trigger">Actions</button>}>
+          <MenuItem>Bring to front</MenuItem>
+        </Menu>
+      </div>,
+    );
+    clickWithMouse(trigger());
+    await settle();
+    expectInlineBeside(popup());
+
+    key("Escape");
+    await settle();
+    expect(popup()).toBeNull();
+  });
+
+  it("opens a ContextMenu inline, next to its area", async () => {
+    render(
+      <div>
+        <ContextMenu container={null} trigger={<div data-testid="trigger">clip</div>}>
+          <MenuItem>Split</MenuItem>
+        </ContextMenu>
+      </div>,
+    );
+    rightClick(trigger());
+    await settle();
+    expectInlineBeside(popup());
+  });
+
+  it("opens a Popover inline on its first render", async () => {
+    render(
+      <div>
+        <Popover
+          container={null}
+          defaultOpen
+          trigger={<button data-testid="trigger">Speed</button>}
+        >
+          <span>1x</span>
+        </Popover>
+      </div>,
+    );
+    await settle();
+    expectInlineBeside(document.querySelector<HTMLElement>("[role=dialog]"));
+  });
+
+  it("still portals to the body when no container is passed", async () => {
+    await openActionMenu();
+    expect(trigger().parentElement?.contains(popup())).toBe(false);
   });
 });
 
@@ -297,6 +342,25 @@ describe("Popover", () => {
 
     expect(document.activeElement).toBe(input);
     expect(document.querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it("points at its trigger only when asked", async () => {
+    const renderOpen = (arrow: boolean) => {
+      render(
+        <Popover trigger={<button data-testid="trigger">Speed</button>} arrow={arrow} defaultOpen>
+          <span>1x</span>
+        </Popover>,
+      );
+    };
+    renderOpen(false);
+    await settle();
+    expect(one("[role=dialog]", "popup").querySelector("svg")).toBeNull();
+    cleanupMounted();
+
+    renderOpen(true);
+    await settle();
+    const arrow = one("[role=dialog] svg", "arrow").parentElement!;
+    expect(arrow.getAttribute("data-side")).toBe("bottom");
   });
 });
 
@@ -360,10 +424,9 @@ describe("open motion", () => {
 
   // AE4.
   it("names a motion token that zeroes itself under reduced motion", async () => {
-    // The zero-duration case lives in the `duration-open` utility itself
-    // (theme.css), not in a `motion-reduce:` class beside it, so a caller
-    // cannot use the token and forget the reduced-motion half. The menu's job
-    // is to name the token; the stylesheet's job is the media query.
+    // Reduced motion lives in the `duration-open` utility itself (theme.css),
+    // not in a `motion-reduce:` class beside it, so a caller cannot use the
+    // token and forget that half. The menu's job is to name the token.
     await openActionMenu();
 
     expect([...popup()!.classList]).toContain("duration-open");

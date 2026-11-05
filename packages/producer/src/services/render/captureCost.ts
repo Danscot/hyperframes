@@ -17,6 +17,7 @@ import {
   type CaptureSession,
   type EngineConfig,
   type WorkerSizing,
+  type WorkerSizingConfig,
   calculateOptimalWorkers,
   captureFrameToBuffer,
   closeCaptureSession,
@@ -116,11 +117,8 @@ function combineCaptureCostEstimates(
  * - Auto-sized renders only (`requestedWorkers === undefined`) — the field
  *   failure was auto sizing, and an explicit `--workers N` is the operator's
  *   own call.
- * - Not enforced as a cap yet — the per-worker budget constant is derived
- *   from one field report; the `workers_heap_*` telemetry emitted with the
- *   sizing decides whether to enforce (see the TODO on HEAP_PER_WORKER_MB in
- *   @hyperframes/engine's parallelCoordinator). The message gives the
- *   operator the actionable knobs today.
+ * - Auto sizing is capped at the heap budget (computeWorkerSizing), so the
+ *   warning cannot fire today; it stays for a budget that stops being a cap.
  *
  * Pure so the message shape + firing condition are unit-testable with a
  * synthetic `WorkerSizing` (the real one depends on the host's heap).
@@ -141,7 +139,7 @@ export function buildHeapAdvisoryWarning(
 export function resolveRenderWorkerCount(
   totalFrames: number,
   requestedWorkers: number | undefined,
-  cfg: EngineConfig,
+  cfg: EngineConfig & Pick<WorkerSizingConfig, "appleGpuDiskCapture">,
   compiled: Pick<CompiledComposition, "hasShaderTransitions" | "renderModeHints">,
   log: ProducerLogger = defaultLogger,
   measuredCaptureCost?: CaptureCostEstimate,
@@ -156,7 +154,7 @@ export function resolveRenderWorkerCount(
   const reasonCodes = new Set(compiled.renderModeHints.reasons.map((r) => r.code));
   if (reasonCodes.has("htmlInCanvas")) {
     log.warn(
-      "[Render] html-in-canvas (drawElementImage) detected — pinning to 1 worker (Chrome concurrency limitation).",
+      "[Render] html-in-canvas (drawElementImage) detected, pinning to 1 worker (Chrome concurrency limitation).",
       { requestedWorkers },
     );
     return 1;
@@ -169,7 +167,7 @@ export function resolveRenderWorkerCount(
   // every path into capture.
   if (cfg.lowMemoryMode && requestedWorkers === undefined) {
     log.info(
-      "[Render] Low-memory profile — pinning to 1 capture worker (auto-worker calibration skipped).",
+      "[Render] Low-memory profile, pinning to 1 capture worker (auto-worker calibration skipped).",
     );
     return 1;
   }
@@ -345,6 +343,8 @@ export interface CaptureCalibrationOutcome {
   probeSession: CaptureSession | null;
   /** Buffer of whichever session was active last; the sequencer uses it for the error-path tail. */
   lastBrowserConsole: string[];
+  /** The final calibration failure was a `Runtime.evaluate` timeout: the page never answered. */
+  calibrationEvaluateTimedOut: boolean;
 }
 
 /**
@@ -383,6 +383,7 @@ export async function runCaptureCalibration(input: {
   let probeSession = input.probeSession;
   let forceScreenshot = input.forceScreenshot;
   let lastBrowserConsole: string[] = [];
+  let calibrationEvaluateTimedOut = false;
 
   const fps = fpsToNumber(job.config.fps);
   // Holds whichever calibration session is currently open. The closure
@@ -442,6 +443,7 @@ export async function runCaptureCalibration(input: {
       !forceScreenshot && shouldFallbackToScreenshotAfterCalibrationError(error);
     if (!shouldFallback) {
       calibration = createFailedCaptureCalibrationEstimate("calibration-failed");
+      calibrationEvaluateTimedOut = isEvaluateTimeout(error);
       log.warn("[Render] Auto-worker calibration failed; using conservative worker budget.", {
         protocolTimeout: calibrationCfg.protocolTimeout,
         error: error instanceof Error ? error.message : String(error),
@@ -483,6 +485,7 @@ export async function runCaptureCalibration(input: {
         );
       } catch (fallbackError) {
         calibration = createFailedCaptureCalibrationEstimate("calibration-screenshot-failed");
+        calibrationEvaluateTimedOut = isEvaluateTimeout(fallbackError);
         log.warn(
           "[Render] Screenshot auto-worker calibration failed after BeginFrame fallback; using conservative worker budget.",
           {
@@ -499,7 +502,17 @@ export async function runCaptureCalibration(input: {
     }
   }
 
-  return { calibration, forceScreenshot, probeSession, lastBrowserConsole };
+  return {
+    calibration,
+    forceScreenshot,
+    probeSession,
+    lastBrowserConsole,
+    calibrationEvaluateTimedOut,
+  };
+}
+
+export function isEvaluateTimeout(error: unknown): boolean {
+  return /Runtime\.evaluate timed out/i.test(normalizeErrorMessage(error));
 }
 
 /**

@@ -68,7 +68,6 @@ export const CatalogDetail = ({
   compositionSrc,
   variables = [],
   title,
-  description,
   meta = {},
   about,
   attribution,
@@ -585,10 +584,6 @@ export const CatalogDetail = ({
     color 100ms ease;
 }
 
-.hf-ve-head-title { margin: 8px 0 28px; }
-.hf-ve-head-title h1 { margin: 0; font-size: 44px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em; color: var(--ve-fg); }
-.hf-ve-head-title p { margin: 12px 0 0; font-size: 18px; line-height: 1.5; color: var(--ve-muted); max-width: 70ch; }
-@media (max-width: 640px) { .hf-ve-head-title h1 { font-size: 32px; } }
 /* Item page anatomy: bar, stage beside Tune, tabs, tab body. */
 .hf-ve-bar {
   display: flex;
@@ -686,10 +681,13 @@ export const CatalogDetail = ({
   padding: 16px;
   border-top: 1px solid var(--ve-line);
 }
-.hf-ve-tabs-row { margin: 20px 0 0 16px; }
+/* No left inset on the tab row or the panes under it: the page gutter is the
+ * page's job, and a second 16px here put everything below the stage on a
+ * different left edge from the title, install block and stage above it. */
+.hf-ve-tabs-row { margin: 20px 0 0; }
 .hf-ve-tabs-row .hf-ve-tab { padding: 6px 16px; font-size: 14px; }
 .hf-ve-tabs-row .hf-ve-tab small { margin-left: 6px; font-weight: 400; opacity: 0.7; }
-.hf-ve-body { padding: 2rem 0 0 16px; }
+.hf-ve-body { padding: 2rem 0 0; }
 .hf-ve-install { margin: 0 0 28px; }
 .hf-ve-install-title { margin: 0 0 12px; font-size: 24px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; color: var(--ve-fg); }
 .hf-ve-about h3 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
@@ -2081,13 +2079,6 @@ export const CatalogDetail = ({
   return (
     <div className="hf-ve my-4">
       <style dangerouslySetInnerHTML={{ __html: CSS }} />
-
-      <div className="not-prose">
-        <header className="hf-ve-head-title">
-          <h1>{title}</h1>
-          {description && <p>{description}</p>}
-        </header>
-      </div>
 
       {installSlot && (
         <div className="hf-ve-install">

@@ -1,4 +1,5 @@
-import { useCallback, type ReactNode } from "react";
+import { memo, useCallback, type ReactNode } from "react";
+import { matchesKey } from "../player/components/studioShortcuts";
 import { PreviewPane } from "./nle/PreviewPane";
 import { TimelinePane } from "./nle/TimelinePane";
 import { PreviewOverlays } from "./nle/PreviewOverlays";
@@ -18,6 +19,7 @@ import type { GestureRecordingState } from "./editor/GestureRecordControl";
 import { useTimelineSelectionPreviewSync } from "../hooks/useTimelineSelectionPreviewSync";
 import { StudioAgentTools } from "../webmcp/StudioAgentTools";
 import type { TimelineDropPlacement } from "../player/components/timelineCallbacks";
+import type { TimelineProps } from "../player/components/TimelineTypes";
 import { Dock } from "./dock/Dock";
 
 type RenderClipContent = (
@@ -57,6 +59,8 @@ export interface EditorShellProps extends TimelineEditCallbackDeps {
   onPasteClip: () => Promise<void>;
   onDuplicateClip: () => Promise<boolean>;
   canPasteClip: () => boolean;
+  clipMenuItems?: TimelineProps["clipMenuItems"];
+  splitShortcut?: TimelineProps["splitShortcut"];
   setCompIdToSrc: (map: Map<string, string>) => void;
   setCompositionLoading: (loading: boolean) => void;
   shouldShowMotionPath: boolean;
@@ -79,7 +83,7 @@ export interface EditorShellProps extends TimelineEditCallbackDeps {
 // The dockable shell: every panel lives in one Dock, arranged by the user's
 // saved layout. Owns the shared player + composition-stack state via
 // NLEProvider so every panel shares one player.
-export function EditorShell({
+export const EditorShell = memo(function EditorShell({
   panels,
   timelineToolbar,
   renderClipContent,
@@ -101,10 +105,15 @@ export function EditorShell({
   handleTimelineElementSplit,
   handleRazorSplit,
   handleRazorSplitAll,
+  handleFreezeFrame,
+  handleLinkEdit,
+  handleTimelineElementDeleteOnly,
   onCopyClip,
   onPasteClip,
   onDuplicateClip,
   canPasteClip,
+  clipMenuItems,
+  splitShortcut,
   setCompIdToSrc,
   setCompositionLoading,
   shouldShowMotionPath,
@@ -160,6 +169,9 @@ export function EditorShell({
     handleTimelineElementSplit,
     handleRazorSplit,
     handleRazorSplitAll,
+    handleFreezeFrame,
+    handleLinkEdit,
+    handleTimelineElementDeleteOnly,
   });
 
   return (
@@ -201,6 +213,8 @@ export function EditorShell({
               onPasteClip={onPasteClip}
               onDuplicateClip={onDuplicateClip}
               canPasteClip={canPasteClip}
+              clipMenuItems={clipMenuItems}
+              splitShortcut={splitShortcut}
               previewOverlay={
                 <PreviewOverlays
                   shouldShowMotionPath={shouldShowMotionPath}
@@ -218,7 +232,7 @@ export function EditorShell({
       </div>
     </PreviewReadOnlyProvider>
   );
-}
+});
 
 interface EditorShellBodyProps {
   panels: ReactNode;
@@ -244,6 +258,8 @@ interface EditorShellBodyProps {
   onPasteClip: () => Promise<void>;
   onDuplicateClip: () => Promise<boolean>;
   canPasteClip: () => boolean;
+  clipMenuItems?: TimelineProps["clipMenuItems"];
+  splitShortcut?: TimelineProps["splitShortcut"];
 }
 
 function EditorShellBody({
@@ -264,6 +280,8 @@ function EditorShellBody({
   onPasteClip,
   onDuplicateClip,
   canPasteClip,
+  clipMenuItems,
+  splitShortcut,
 }: EditorShellBodyProps) {
   const { compositionStack, updateCompositionStack, containerRef } = useNLEContext();
 
@@ -276,7 +294,7 @@ function EditorShellBody({
   // Keyboard: Escape to pop composition level
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.key === "Escape" && compositionStack.length > 1) {
+      if (matchesKey(e, "cancel") && compositionStack.length > 1) {
         updateCompositionStack((prev) => prev.slice(0, -1));
       }
     },
@@ -286,9 +304,7 @@ function EditorShellBody({
   return (
     <div
       ref={containerRef}
-      // Shell canvas is a step LIGHTER than the near-black panel cards so the
-      // gaps between panels read as visible seams (CapCut-style).
-      className="flex flex-col flex-1 min-h-0 bg-panel-surface"
+      className="flex flex-col flex-1 min-h-0"
       onKeyDown={handleKeyDown}
       tabIndex={-1}
     >
@@ -318,6 +334,8 @@ function EditorShellBody({
             onPasteClip={onPasteClip}
             onDuplicateClip={onDuplicateClip}
             canPasteClip={canPasteClip}
+            clipMenuItems={clipMenuItems}
+            splitShortcut={splitShortcut}
             onSelectTimelineElement={onSelectTimelineElement}
             timelineFooter={
               captionEditMode ? (

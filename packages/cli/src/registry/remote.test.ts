@@ -14,10 +14,10 @@ vi.mock("node:os", async (importOriginal) => ({
 
 const {
   assetSourceUrl,
-  describeCauseChain,
   fetchItemFile,
   fetchItemManifest,
   fetchRegistryManifest,
+  readRegistryManifest,
   DEFAULT_REGISTRY_URL,
 } = await import("./remote.js");
 
@@ -74,6 +74,21 @@ afterEach(() => {
 
 afterAll(() => {
   rmSync(scratchHome, { recursive: true, force: true });
+});
+
+describe("readRegistryManifest", () => {
+  it("throws why when the registry host cannot be reached and nothing is cached", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("getaddrinfo ENOTFOUND raw.githubusercontent.com"), {
+          code: "ENOTFOUND",
+        }),
+      }),
+    );
+    await expect(readRegistryManifest(DEFAULT_REGISTRY_URL)).rejects.toThrow(
+      "The registry could not be read: fetch failed (getaddrinfo ENOTFOUND raw.githubusercontent.com)",
+    );
+  });
 });
 
 describe("fetchRegistryManifest", () => {
@@ -167,6 +182,94 @@ describe("fetchRegistryManifest", () => {
 });
 
 describe("fetchItemManifest", () => {
+  it("refreshes a fresh item cache when skipCache is requested", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ok(ITEM));
+    await fetchItemManifest("count-up", "hyperframes:component");
+    const updated = {
+      ...ITEM,
+      title: "Updated counter",
+      files: [{ path: "updated.html", target: "updated.html", type: "hyperframes:snippet" }],
+    };
+    fetchSpy.mockResolvedValue(ok(updated)).mockClear();
+
+    await expect(
+      fetchItemManifest("count-up", "hyperframes:component", DEFAULT_REGISTRY_URL, {
+        skipCache: true,
+      }),
+    ).resolves.toEqual(updated);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    await expect(fetchItemManifest("count-up", "hyperframes:component")).resolves.toEqual(updated);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("keeps using a fresh item cache without skipCache", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ok(ITEM));
+    await fetchItemManifest("count-up", "hyperframes:component");
+    fetchSpy.mockResolvedValue(ok({ ...ITEM, title: "Updated counter" })).mockClear();
+
+    await expect(fetchItemManifest("count-up", "hyperframes:component")).resolves.toEqual(ITEM);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([0, ONE_DAY_MS + 60_000])(
+    "keeps refresh requests offline in cache-only mode with cache age %d",
+    async (age) => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ok(ITEM));
+      await fetchItemManifest("count-up", "hyperframes:component");
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(Date.now() + age));
+      fetchSpy.mockRejectedValue(new Error("offline")).mockClear();
+
+      await expect(
+        fetchItemManifest("count-up", "hyperframes:component", DEFAULT_REGISTRY_URL, {
+          skipCache: true,
+          cacheOnly: true,
+        }),
+      ).resolves.toEqual(ITEM);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not refresh an uncached item in cache-only mode", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(ok(ITEM));
+
+    await expect(
+      fetchItemManifest("count-up", "hyperframes:component", DEFAULT_REGISTRY_URL, {
+        skipCache: true,
+        cacheOnly: true,
+      }),
+    ).rejects.toThrow("not fetched after an earlier registry timeout");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("serves the cached item when a forced refresh fails", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ok(ITEM));
+    await fetchItemManifest("count-up", "hyperframes:component");
+    fetchSpy.mockRejectedValue(new Error("HTTP 503")).mockClear();
+
+    await expect(
+      fetchItemManifest("count-up", "hyperframes:component", DEFAULT_REGISTRY_URL, {
+        skipCache: true,
+      }),
+    ).resolves.toEqual(ITEM);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a valid cached item when a forced refresh returns invalid data", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ok(ITEM));
+    await fetchItemManifest("count-up", "hyperframes:component");
+    fetchSpy.mockResolvedValue(ok({ ...ITEM, name: "different-item" })).mockClear();
+
+    await expect(
+      fetchItemManifest("count-up", "hyperframes:component", DEFAULT_REGISTRY_URL, {
+        skipCache: true,
+      }),
+    ).resolves.toEqual(ITEM);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    await expect(fetchItemManifest("count-up", "hyperframes:component")).resolves.toEqual(ITEM);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
   it("rejects a cache escape name before fetching", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     await expect(
@@ -222,50 +325,6 @@ describe("fetchItemManifest", () => {
     await expect(
       fetchItemManifest("no-such-move", "hyperframes:component", DEFAULT_REGISTRY_URL),
     ).rejects.toThrow("HTTP 404");
-  });
-});
-
-describe("describeCauseChain", () => {
-  it("surfaces the reason undici hides under cause", () => {
-    // The reported failure. `fetch failed` alone describes every network
-    // problem equally badly; the sentence that tells you what to do is one
-    // level down, and it was being dropped.
-    const err = new Error("fetch failed", {
-      cause: new Error("self-signed certificate in certificate chain"),
-    });
-
-    expect(describeCauseChain(err)).toBe(
-      "fetch failed (self-signed certificate in certificate chain)",
-    );
-  });
-
-  it("includes an errno code when the message does not already carry it", () => {
-    const inner = Object.assign(new Error("getaddrinfo ENOTFOUND example.invalid"), {
-      code: "ENOTFOUND",
-    });
-
-    // The code is already in the text, so repeating it would be noise.
-    expect(describeCauseChain(new Error("fetch failed", { cause: inner }))).toBe(
-      "fetch failed (getaddrinfo ENOTFOUND example.invalid)",
-    );
-  });
-
-  it("walks more than one level", () => {
-    const deep = new Error("a", { cause: new Error("b", { cause: new Error("c") }) });
-
-    expect(describeCauseChain(deep)).toBe("a (b; c)");
-  });
-
-  it("survives a cause cycle rather than hanging", () => {
-    const a = new Error("a");
-    const b = new Error("b", { cause: a });
-    (a as { cause?: unknown }).cause = b;
-
-    expect(describeCauseChain(a)).toBe("a (b)");
-  });
-
-  it("returns the plain message when there is no cause", () => {
-    expect(describeCauseChain(new Error("HTTP 404"))).toBe("HTTP 404");
   });
 });
 

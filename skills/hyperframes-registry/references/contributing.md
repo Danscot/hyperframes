@@ -89,6 +89,12 @@ Apply the correct template based on type. See [templates.md](templates.md) for c
 
 #### All types
 
+- **Load files the block ships through `__hyperframes.assetUrl("assets/...")`** whenever a script
+  builds the path (textures, fonts, JSON, models). Attributes like `src` and `href` are rebased
+  when the block is mounted; strings in a script are not, so a bare `"assets/..."` 404s once the
+  block lives under `compositions/<name>/`. A separate `.js` file gets the URLs from the block's
+  inline script. A block whose assets install to the project's own `assets/` (target
+  `compositions/<name>.html`) keeps plain project-root paths; `assetUrl` would look beside the file.
 - **Placeholder content is monochrome** — read
   [placeholder-material.md](placeholder-material.md) before choosing a single colour. Stand-in
   screens, images, cards, avatars, logos and chart series use four alpha steps of the
@@ -114,7 +120,7 @@ hyperframes render -o preview.mp4
 # Snapshot for visual QA
 hyperframes snapshot --at "1.0,3.0,5.0,7.0"
 
-# Publish to hyperframes.dev for review
+# Publish to hyperframes.studio for review
 npx hyperframes publish
 ```
 
@@ -146,7 +152,7 @@ npx tsx scripts/generate-registry-items.ts
 # 4. Generate catalog docs page
 npx tsx scripts/generate-catalog-pages.ts
 
-# 5. Publish to hyperframes.dev so reviewers can preview
+# 5. Publish to hyperframes.studio so reviewers can preview
 npx hyperframes publish
 
 # 6. Stage everything
@@ -155,9 +161,9 @@ git add registry/{kind}/{name}/ registry/registry.json docs/catalog/
 # 7. Commit
 git commit -m "feat(registry): add {name} — {one sentence}"
 
-# 8. Push and open PR with hyperframes.dev link
+# 8. Push and open PR with hyperframes.studio link
 git push origin feat/registry-{name}
-gh pr create --title "feat(registry): {name}" --body "preview: {hyperframes.dev-url}"
+gh pr create --title "feat(registry): {name}" --body "preview: {hyperframes.studio-url}"
 ```
 
 **If you don't have a GitHub account:** you need one to open a PR. Sign up at https://github.com/signup, then run `gh auth login`.

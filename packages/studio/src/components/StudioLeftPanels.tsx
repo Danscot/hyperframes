@@ -1,4 +1,4 @@
-import { useCallback, type ReactNode } from "react";
+import { memo, useCallback, type ReactNode } from "react";
 import { SourceEditor } from "./editor/SourceEditor";
 import { FileTree } from "./editor/FileTree";
 import { MediaPreview } from "./MediaPreview";
@@ -28,7 +28,7 @@ interface StudioLeftPanelsProps {
 
 function PanelColumn({ footer, children }: { footer: ReactNode; children: ReactNode }) {
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-neutral-950">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="flex min-h-0 flex-1 flex-col">{children}</div>
       {footer}
     </div>
@@ -36,7 +36,7 @@ function PanelColumn({ footer, children }: { footer: ReactNode; children: ReactN
 }
 
 // fallow-ignore-next-line complexity
-export function StudioLeftPanels({
+export const StudioLeftPanels = memo(function StudioLeftPanels({
   onSelectComposition,
   onAddBlock,
   onPreviewBlock,
@@ -75,8 +75,8 @@ export function StudioLeftPanels({
         return;
       }
       await waitForPendingDomEditSaves();
-      const { format, quality, fps } = getPersistedRenderSettings();
-      await renderQueue.startRender({ composition: comp, format, quality, fps });
+      const { format, quality, fps, gpu } = getPersistedRenderSettings();
+      await renderQueue.startRender({ composition: comp, format, quality, fps, gpu });
     },
     [renderQueue, waitForPendingDomEditSaves],
   );
@@ -159,7 +159,7 @@ export function StudioLeftPanels({
       </Dock.Panel>
     </>
   );
-}
+});
 
 function CodeBody({
   projectId,

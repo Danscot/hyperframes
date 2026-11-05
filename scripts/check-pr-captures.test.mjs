@@ -108,6 +108,30 @@ test("numstat keeps only watched paths and counts added plus deleted", () => {
   ]);
 });
 
+test("markdown under a watched package needs no capture", () => {
+  const files = parseNumstat(
+    "60\t4\tpackages/studio/AGENTS.md\0" + "8\t0\tpackages/player/README.md\0",
+  );
+  assert.deepEqual(files, []);
+  assert.equal(evaluate({ body: "", files }).ok, true);
+});
+
+test("test files under a watched package need no capture", () => {
+  const files = parseNumstat(
+    "28\t0\tpackages/studio/tests/e2e/edit-accuracy/server.test.mjs\0" +
+      "12\t4\tpackages/studio/tests/e2e/edit-accuracy/case.mjs\0" +
+      "6\t1\tpackages/player/src/a.spec.tsx\0" +
+      "40\t0\tpackages/studio/src/b.test.ts\0",
+  );
+  assert.deepEqual(files, []);
+  assert.equal(evaluate({ body: "", files }).ok, true);
+  const mixed = parseNumstat(
+    "3\t0\tpackages/studio/src/a.ts\0" + "40\t0\tpackages/studio/src/a.test.ts\0",
+  );
+  assert.deepEqual(mixed, [studio("packages/studio/src/a.ts", 3)]);
+  assert.equal(evaluate({ body: "", files: mixed }).ok, false);
+});
+
 test("a binary file spends the whole no-visible-change budget", () => {
   const [file] = parseNumstat("-\t-\tpackages/studio/public/logo.png\0");
   assert.equal(file.lines, 20);
@@ -183,9 +207,8 @@ test("comment fragments cannot rebuild a comment or hide a section from the read
   );
 });
 
-test("No visible change accepts a test-only .tsx change but not a component change", () => {
+test("No visible change does not cover a component change", () => {
   const body = "## No visible change\nx";
-  assert.equal(evaluate({ body, files: [studio("packages/studio/src/A.test.tsx", 5)] }).ok, true);
   assert.equal(evaluate({ body, files: [studio("packages/studio/src/A.tsx", 5)] }).ok, false);
 });
 
@@ -309,7 +332,7 @@ const ok = () => ({
 });
 const noSleep = async () => {};
 
-test("downloadAsset retries a 5xx or a network error with backoff and stops after three attempts", async () => {
+test("downloadAsset retries a 5xx or a network error with backoff and stops after five attempts", async () => {
   const outcomes = [{ ok: false, status: 502 }, new Error("socket hang up"), ok()];
   let calls = 0;
   const sleeps = [];
@@ -320,24 +343,50 @@ test("downloadAsset retries a 5xx or a network error with backoff and stops afte
   };
   assert.equal((await downloadAsset(OLD, flaky, async (ms) => sleeps.push(ms))).toString(), "x");
   assert.equal(calls, 3);
-  assert.deepEqual(sleeps, [1000, 3000]);
+  assert.deepEqual(sleeps, [5000, 15000]);
   calls = 0;
   await assert.rejects(
     downloadAsset(OLD, async () => (calls++, { ok: false, status: 500 }), noSleep),
     /HTTP 500/,
   );
-  assert.equal(calls, 3);
+  assert.equal(calls, 5);
 });
 
-test("downloadAsset does not retry a 404 or 403", async () => {
-  for (const status of [404, 403]) {
-    let calls = 0;
-    await assert.rejects(
-      downloadAsset(OLD, async () => (calls++, { ok: false, status }), noSleep),
-      new RegExp(`HTTP ${status}`),
-    );
-    assert.equal(calls, 1);
-  }
+test("downloadAsset does not retry a 403, even on an attachment host", async () => {
+  let calls = 0;
+  await assert.rejects(
+    downloadAsset(OLD, async () => (calls++, { ok: false, status: 403 }), noSleep),
+    /HTTP 403/,
+  );
+  assert.equal(calls, 1);
+});
+
+// Reproduced this week: the same attachment URL 404'd, then 200'd minutes
+// later with no edit to the PR in between — a fresh upload lagging GitHub's
+// own read-path, not a missing asset.
+test("downloadAsset retries a 404 on a GitHub attachment host", async () => {
+  const outcomes = [{ ok: false, status: 404 }, { ok: false, status: 404 }, ok()];
+  let calls = 0;
+  const sleeps = [];
+  await downloadAsset(
+    OLD,
+    async () => outcomes[calls++],
+    async (ms) => sleeps.push(ms),
+  );
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [5000, 15000]);
+});
+
+// The retry is scoped to the attachment host: a 404 anywhere else (a typo'd
+// link, a deleted gist) still means "does not exist," not "not replicated yet."
+test("downloadAsset does not retry a 404 on a non-attachment host", async () => {
+  const other = "https://example.com/not-an-attachment.png";
+  let calls = 0;
+  await assert.rejects(
+    downloadAsset(other, async () => (calls++, { ok: false, status: 404 }), noSleep),
+    /HTTP 404/,
+  );
+  assert.equal(calls, 1);
 });
 
 const redirect = (location) => ({ ok: false, status: 302, headers: new Headers({ location }) });
@@ -523,7 +572,18 @@ function runCli(env, body = bodyWith(`[a](${OLD})`, `[b](${NEW})`)) {
   const copy = join(dir, "check.mjs");
   copyFileSync(new URL("./check-pr-captures.mjs", import.meta.url), copy);
   const preload = join(dir, "no-network.mjs");
-  writeFileSync(preload, "globalThis.fetch = async () => ({ ok: false, status: 404 });\n");
+  writeFileSync(
+    preload,
+    [
+      "globalThis.fetch = async () => ({ ok: false, status: 404 });",
+      // The gate's retry backoff (up to 110s per asset) is real production
+      // behavior we want covered end to end, but a test shouldn't sit through
+      // it: collapse every delay to fire on the next tick.
+      "const realSetTimeout = globalThis.setTimeout;",
+      "globalThis.setTimeout = (fn, _ms, ...args) => realSetTimeout(fn, 0, ...args);",
+      "",
+    ].join("\n"),
+  );
   return spawnSync("node", ["--import", preload, copy, "--base", "main", "--head", "HEAD"], {
     cwd: dir,
     encoding: "utf8",

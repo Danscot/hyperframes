@@ -3,6 +3,11 @@ import type { DomEditSelection } from "../components/editor/domEditing";
 import type { SelectElementOptions, TimelineElement } from "../player";
 import type { RightPanelTab } from "../utils/studioHelpers";
 
+export interface DomSelectionResult {
+  changed: boolean;
+  count: number;
+}
+
 export interface ApplyDomSelectionOptions {
   revealPanel?: boolean;
   additive?: boolean;
@@ -18,6 +23,7 @@ export interface ResolveDomSelectionOptions {
   activeGroupElement?: HTMLElement | null;
   /** Resolve this node itself instead of applying human group-capture behavior. */
   exactTarget?: boolean;
+  previous?: DomEditSelection | null;
 }
 
 // Shared by every hook that needs the project/timeline/panel context a DOM
@@ -83,7 +89,9 @@ export interface UseDomSelectionReturn {
     element: TimelineElement,
   ) => Promise<DomEditSelection | null>;
   handleTimelineElementSelect: (element: TimelineElement | null) => Promise<void>;
-  refreshDomEditSelectionFromPreview: (selection: DomEditSelection) => Promise<void>;
-  refreshDomEditGroupSelectionsFromPreview: (selections: DomEditSelection[]) => Promise<void>;
-  applyMarqueeSelection: (selections: DomEditSelection[], additive: boolean) => void;
+  refreshDomEditSelectionFromPreview: (
+    selection: DomEditSelection,
+    iframe?: HTMLIFrameElement | null,
+  ) => Promise<void>;
+  applyMarqueeSelection: (selections: DomEditSelection[], additive: boolean) => DomSelectionResult;
 }

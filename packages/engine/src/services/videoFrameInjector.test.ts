@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type Page } from "puppeteer-core";
 import { COMPLETE_SENTINEL } from "./extractionCache.js";
 
@@ -25,7 +25,7 @@ vi.mock("./screenshotService.js", () => ({
 }));
 
 import { __testing, createVideoFrameInjector } from "./videoFrameInjector.js";
-import { type FrameLookupTable } from "./videoFrameExtractor.js";
+import { type ExtractedFrames, FrameLookupTable } from "./videoFrameExtractor.js";
 import { type BeforeCaptureHook } from "./frameCapture.js";
 import { DEFAULT_CONFIG } from "../config.js";
 
@@ -178,6 +178,7 @@ describe("createVideoFrameInjector cache hygiene against page-side skips", () =>
   // table is exercised exhaustively in videoFrameExtractor.test.ts.
   function fakeTable(payload: { videoId: string; framePath: string; frameIndex: number }) {
     return {
+      frameDirs: () => [],
       getActiveFramePayloads: () =>
         new Map([
           [payload.videoId, { framePath: payload.framePath, frameIndex: payload.frameIndex }],
@@ -230,18 +231,22 @@ describe("createVideoFrameInjector cache hygiene against page-side skips", () =>
     injectVideoFramesBatchMock.mockResolvedValueOnce([]);
     await hook!(fakePage, 0);
     expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(1);
-    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(fakePage, [
-      { videoId: "pip", dataUri: "data:image/png;base64,fake-/p" },
-    ]);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(
+      fakePage,
+      [{ videoId: "pip", dataUri: "data:image/png;base64,fake-/p" }],
+      [],
+    );
 
     // Second call: same frameIndex, but the previous call did not really
     // paint. The cache must NOT short-circuit; the inject must run again.
     injectVideoFramesBatchMock.mockResolvedValueOnce(["pip"]);
     await hook!(fakePage, 0);
     expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(2);
-    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(fakePage, [
-      { videoId: "pip", dataUri: "data:image/png;base64,fake-/p" },
-    ]);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(
+      fakePage,
+      [{ videoId: "pip", dataUri: "data:image/png;base64,fake-/p" }],
+      [],
+    );
   });
 
   it("does cache normally when the page reports the id as injected", async () => {
@@ -264,8 +269,48 @@ describe("createVideoFrameInjector cache hygiene against page-side skips", () =>
     expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(1);
 
     await hook!(fakePage, 0);
-    // Cache hit — no second inject for the same frameIndex.
+    // Cache hit: the picture is not sent again, only the video's style is re-copied.
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(2);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(fakePage, [], ["pip"]);
+  });
+
+  it("leaves a held video's style alone on a motion-blur sub-sample", async () => {
+    const fakePage = { evaluate: async () => undefined } as unknown as Page;
+    const hook = createVideoFrameInjector(
+      fakeTable({ videoId: "pip", framePath: "/p", frameIndex: 5 }),
+      { frameSrcResolver: inlineResolver },
+    );
+
+    injectVideoFramesBatchMock.mockResolvedValueOnce(["pip"]);
+    await hook!(fakePage, 0.5, 0.5);
+    await hook!(fakePage, 0.48, 0.5);
     expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands out a fresh hook for a second page and leaves this hook's cache untouched", async () => {
+    const renderPage = { evaluate: async () => undefined } as unknown as Page;
+    const truthPage = { evaluate: async () => undefined } as unknown as Page;
+    const hook = createVideoFrameInjector(
+      fakeTable({ videoId: "pip", framePath: "/p", frameIndex: 5 }),
+      { frameSrcResolver: inlineResolver },
+    );
+    const fresh = hook?.fresh?.();
+    expect(fresh).toBeTruthy();
+
+    await hook!(renderPage, 0);
+    await fresh!(truthPage, 0);
+    // The fresh hook paints its own page even though the first hook already painted frame 5.
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(2);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(
+      truthPage,
+      [{ videoId: "pip", dataUri: "data:image/png;base64,fake-/p" }],
+      [],
+    );
+
+    await hook!(renderPage, 0);
+    // The first hook still remembers frame 5 on its page: it only re-copies the style.
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(3);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(renderPage, [], ["pip"]);
   });
 
   it("reinjects frame zero when a whole-chunk retry uses a fresh hook and page", async () => {
@@ -321,6 +366,60 @@ describe("createVideoFrameInjector cache hygiene against page-side skips", () =>
   });
 });
 
+describe("createVideoFrameInjector holds video frames for motion blur (#5144)", () => {
+  // Scene A's video plays until 1 s, scene B's from 1 s; frame index = 10 × time.
+  const clips = [
+    { videoId: "a", start: 0, end: 1 },
+    { videoId: "b", start: 1, end: 2 },
+  ];
+  const table = {
+    frameDirs: () => [],
+    getActiveFramePayloads: (time: number) =>
+      new Map(
+        clips
+          .filter((clip) => time >= clip.start && time < clip.end)
+          .map((clip) => {
+            const frameIndex = Math.floor(time * 10);
+            return [clip.videoId, { framePath: `/${clip.videoId}/${frameIndex}`, frameIndex }];
+          }),
+      ),
+  } as unknown as FrameLookupTable;
+  const page = { evaluate: vi.fn(async () => undefined) } as unknown as Page;
+
+  beforeEach(() => {
+    injectVideoFramesBatchMock.mockReset();
+    injectVideoFramesBatchMock.mockImplementation(async (_page, updates) =>
+      updates.map((u) => u.videoId),
+    );
+    syncVideoFrameVisibilityMock.mockReset();
+    syncVideoFrameVisibilityMock.mockResolvedValue(undefined);
+  });
+
+  it("shows the held frame of a video on screen at both times", async () => {
+    const hook = createVideoFrameInjector(table, { frameSrcResolver: inlineResolver });
+
+    // The sample alone would pick frame 14; the held frame time picks 15.
+    await hook!(page, 1.42, 1.5);
+
+    expect(syncVideoFrameVisibilityMock).toHaveBeenLastCalledWith(page, ["b"]);
+    expect(injectVideoFramesBatchMock.mock.calls[0]?.[1]).toEqual([
+      { videoId: "b", dataUri: inlineResolver("/b/15") },
+    ]);
+  });
+
+  it("follows the sample time across a cut, so neither scene's video drops out", async () => {
+    const hook = createVideoFrameInjector(table, { frameSrcResolver: inlineResolver });
+
+    // Frame 1.0 is scene B's first frame; a sample just before it still shows scene A.
+    await hook!(page, 0.98, 1.0);
+
+    expect(syncVideoFrameVisibilityMock).toHaveBeenLastCalledWith(page, ["a"]);
+    expect(injectVideoFramesBatchMock.mock.calls[0]?.[1]).toEqual([
+      { videoId: "a", dataUri: inlineResolver("/a/9") },
+    ]);
+  });
+});
+
 describe("createVideoFrameInjector extraction-cache lease renewal", () => {
   // Regression: a render can hold a compiled-dir symlink into a shared
   // extraction-cache entry far longer than the entry's one-time cache-hit
@@ -338,6 +437,7 @@ describe("createVideoFrameInjector extraction-cache lease renewal", () => {
 
   function makeHook(framePath: string): BeforeCaptureHook {
     const table = {
+      frameDirs: () => [dirname(framePath)],
       getActiveFramePayloads: () => new Map([["v", { framePath, frameIndex: 0 }]]),
     } as unknown as FrameLookupTable;
     const hook = createVideoFrameInjector(table, { frameSrcResolver: inlineResolver });
@@ -374,6 +474,18 @@ describe("createVideoFrameInjector extraction-cache lease renewal", () => {
     const hook = makeHook(join(cacheDir, "frame_00001.jpg"));
 
     await hook(fakePage, 0);
+
+    expect(sentinelMtimeMs()).toBeGreaterThan(before);
+  });
+
+  it("renews the entry of a clip that is not on screen yet", async () => {
+    const table = new FrameLookupTable();
+    const lateClip = { videoId: "late", outputDir: cacheDir, framePaths: new Map() };
+    table.addVideo(lateClip as unknown as ExtractedFrames, 3600, 3660, 0);
+    const hook = createVideoFrameInjector(table, { frameSrcResolver: inlineResolver });
+    const before = sentinelMtimeMs();
+
+    await hook?.(fakePage, 0);
 
     expect(sentinelMtimeMs()).toBeGreaterThan(before);
   });

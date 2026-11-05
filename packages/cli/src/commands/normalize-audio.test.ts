@@ -73,14 +73,14 @@ describe("loudnessMeasureArgs", () => {
     // bounding: ffmpeg keeps feeding the graph and ebur128 integrates audio the
     // clip never plays. Measured on a fixture whose played window is -61.8 LUFS,
     // output-side `-t` reported -33.8.
-    const args = loudnessMeasureArgs("clip.wav", { mediaStart: 2, duration: 4 });
+    const args = loudnessMeasureArgs("clip.wav", { mediaStart: 2, duration: 4 }, 0);
     expect(args.indexOf("-ss")).toBeLessThan(args.indexOf("-i"));
     expect(args.indexOf("-t")).toBeLessThan(args.indexOf("-i"));
     expect(args.slice(args.indexOf("-ss"), args.indexOf("-i"))).toEqual(["-ss", "2", "-t", "4"]);
   });
 
   it("leaves an untrimmed clip unbounded", () => {
-    const args = loudnessMeasureArgs("clip.wav", { mediaStart: 0, duration: null });
+    const args = loudnessMeasureArgs("clip.wav", { mediaStart: 0, duration: null }, 0);
     expect(args).not.toContain("-ss");
     expect(args).not.toContain("-t");
   });
@@ -172,6 +172,16 @@ describe("updateAudioVolume", () => {
   it("adds data-volume when it is absent", () => {
     expect(updateAudioVolume(`<audio id="target" src="b.wav" />`, "target", 2)).toBe(
       `<audio id="target" src="b.wav" data-volume="2" />`,
+    );
+  });
+});
+
+describe("normalize-audio on video clips", () => {
+  it("finds a video with sound as a target and skips a muted one", () => {
+    const html = `<video id="a-roll" src="talk.mp4" data-has-audio="true"></video><video id="b-roll" src="b.mp4" muted></video><audio id="music" src="m.mp3"></audio>`;
+    expect(audioTags(html).map((tag) => tag.id)).toEqual(["a-roll", "music"]);
+    expect(updateAudioVolume(html, "a-roll", 0.5)).toContain(
+      `<video id="a-roll" src="talk.mp4" data-has-audio="true" data-volume="0.5"></video>`,
     );
   });
 });

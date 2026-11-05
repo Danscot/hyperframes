@@ -1,11 +1,14 @@
 import type { LintContext, HyperframeLintFinding, OpenTag } from "../context";
-import { readDecodedAttr } from "../utils";
+import { readDecodedAttr, truncateSnippet } from "../utils";
 import {
   isSubCompositionHost,
   topLevelElements,
   trackKindOf,
   type StructureNode,
 } from "@hyperframes/parsers/top-level-elements";
+import { readClipTiming } from "@hyperframes/parsers/composition-contract";
+import { readDataDurationSeconds } from "@hyperframes/parsers/media-duration";
+import { TIMING_TOLERANCE_SECONDS } from "@hyperframes/parsers/composition-duration";
 
 interface TagNode extends StructureNode<TagNode> {
   children: TagNode[];
@@ -58,6 +61,7 @@ const NODE_ATTRS = [
   "data-track-kind",
   "data-composition-id",
   "data-composition-src",
+  "data-hf-media-start-basis",
 ];
 
 function toNode(open: OpenTag): TagNode {
@@ -167,6 +171,63 @@ function captionFindings(rows: TagNode[], severity: Severity): HyperframeLintFin
   return findings;
 }
 
+const hundredths = (seconds: number) => Math.round(seconds * 100) / 100;
+
+function clipsPastRootFindings(root: TagNode, rows: TagNode[]): HyperframeLintFinding[] {
+  if (root.attrs["data-composition-id"] === undefined) return [];
+  const rootDuration = readDataDurationSeconds((name) => root.attrs[name]);
+  if (rootDuration === null) return [];
+  const limit = hundredths(rootDuration);
+  return rows.flatMap((row) => {
+    const { start, end } = readClipTiming({ getAttribute: (name) => row.attrs[name] ?? null });
+    if (start === null || end === null || end <= rootDuration + TIMING_TOLERANCE_SECONDS) return [];
+    return [
+      {
+        code: "clip_ends_past_root_duration",
+        severity: "warning",
+        message: `${describe(row)} runs from ${hundredths(start)}s to ${hundredths(end)}s, past the root composition's data-duration of ${limit}s, so it is cut off in previews, posters and renders.`,
+        elementId: row.attrs.id,
+        fixHint: `Extend the root data-duration to ${hundredths(end)}, or make ${describe(row)} end at or before ${limit}s.`,
+        snippet: truncateSnippet(row.open.raw),
+      },
+    ];
+  });
+}
+
+function followsParentVisibility(clip: TagNode): boolean {
+  return clip.tag !== "audio" && clip.attrs["data-hf-media-start-basis"] !== "global";
+}
+
+function isTimed(timing: {
+  start: number | null;
+  end: number | null;
+}): timing is { start: number; end: number } {
+  return timing.start !== null && timing.end !== null;
+}
+
+/** The runtime shows a nested clip only while its parent shows, and both data-starts count from the composition. */
+function neverVisibleNestedFindings(parent: TagNode, severity: Severity): HyperframeLintFinding[] {
+  const window = readClipTiming({ getAttribute: (name) => parent.attrs[name] ?? null });
+  return topLevelElements(parent).flatMap((clip) => {
+    const inner = isSubCompositionHost(clip) ? [] : neverVisibleNestedFindings(clip, severity);
+    const own = readClipTiming({ getAttribute: (name) => clip.attrs[name] ?? null });
+    if (!followsParentVisibility(clip) || !isTimed(window) || !isTimed(own)) return inner;
+    if (own.end > window.start && own.start < window.end) return inner;
+    const shows = `${hundredths(window.start)}s to ${hundredths(window.end)}s`;
+    return [
+      {
+        code: "nested_clip_never_visible",
+        severity,
+        message: `${describe(clip)} plays from ${hundredths(own.start)}s to ${hundredths(own.end)}s, but it sits inside ${describe(parent)}, which only shows from ${shows}, so it never appears. A nested data-start counts from the composition's start, not from ${describe(parent)}.`,
+        elementId: clip.attrs.id,
+        fixHint: `Give ${describe(clip)} a data-start between ${shows} in composition time, or move it out of ${describe(parent)}.`,
+        snippet: truncateSnippet(clip.open.raw),
+      },
+      ...inner,
+    ];
+  });
+}
+
 export const structureRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   (ctx) => {
     // The timeline shows the root composition's rows; a sub-composition file is the leaf where layout lives.
@@ -179,6 +240,15 @@ export const structureRules: Array<(ctx: LintContext) => HyperframeLintFinding[]
       ...nestedStructureFindings(rows, severity),
       ...missingDurationFindings(rows, severity),
       ...captionFindings(rows, severity),
+      ...clipsPastRootFindings(root, rows),
     ];
+  },
+  (ctx) => {
+    const root = buildTree(ctx);
+    if (!root) return [];
+    const severity = ctx.options.host === "studio" ? "error" : "warning";
+    return topLevelElements(root)
+      .filter((row) => !isSubCompositionHost(row))
+      .flatMap((row) => neverVisibleNestedFindings(row, severity));
   },
 ];

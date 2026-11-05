@@ -1,10 +1,13 @@
-import { failCommand } from "../utils/commandResult.js";
-import { defineCommand } from "citty";
+import { DEFAULT_MAX_SCREENSHOTS } from "../capture/types.js";
+import { failCommand, scheduleCliExit, failUsage } from "../utils/commandResult.js";
+import { defineCommand } from "../utils/defineCommand.js";
 import { resolve } from "node:path";
 import type { Example } from "./_examples.js";
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import { diag } from "../ui/diagnostics.js";
 import type { CapturePhaseProgress } from "../capture/types.js";
+import { parseCaptureDeadline } from "../capture/captureWatchdog.js";
+import { jsonFailure } from "../utils/jsonError.js";
 
 const CAPTURE_PHASE_PREFIX = "HYPERFRAMES_CAPTURE_PHASE ";
 
@@ -12,12 +15,16 @@ function emitCapturePhase(event: CapturePhaseProgress): void {
   diag.notice(`${CAPTURE_PHASE_PREFIX}${JSON.stringify(event)}`);
 }
 
-function parseCaptureBudget(raw: string | undefined): number | undefined {
+function parsePositiveInteger(
+  raw: string | undefined,
+  flag: string,
+  unit = "",
+): number | undefined {
   if (raw === undefined) return undefined;
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    console.error("--capture-budget must be a positive integer in milliseconds.");
-    failCommand();
+    console.error(`${flag} must be a positive integer${unit}.`);
+    failUsage();
   }
   return parsed;
 }
@@ -26,9 +33,18 @@ export const examples: Example[] = [
   ["Capture a website into ./capture/", "hyperframes capture https://stripe.com"],
   ["Capture to a different directory", "hyperframes capture https://linear.app -o linear-video"],
   ["JSON output for AI agents", "hyperframes capture https://example.com --json"],
+  ["Capture a local HTML file", "hyperframes capture --local-file ./site/index.html -o site-video"],
+  [
+    "Let a local page read files from a parent directory",
+    "hyperframes capture --local-file ./site/pages/about.html --local-root ./site",
+  ],
   [
     "Pull a video from the captured manifest by index",
     "hyperframes capture --video ./linear-video --index 0",
+  ],
+  [
+    "Send all capture traffic through an egress proxy",
+    "HYPERFRAMES_CAPTURE_PROXY=http://127.0.0.1:3128 hyperframes capture https://example.com",
   ],
   [
     "List videos referenced in the captured manifest",
@@ -44,8 +60,18 @@ export default defineCommand({
   args: {
     url: {
       type: "positional",
-      description: "Website URL to capture (omit when using --video)",
+      description: "Website URL to capture (omit when using --local-file or --video)",
       required: false,
+    },
+    "local-file": {
+      type: "string",
+      description:
+        "Capture a local HTML file (or a directory's index.html) instead of a URL; remote subresources still go through the public-address policy",
+    },
+    "local-root": {
+      type: "string",
+      description:
+        "(--local-file) Directory the page may read local files from (default: the HTML file's directory)",
     },
     output: {
       type: "string",
@@ -64,7 +90,7 @@ export default defineCommand({
     },
     "max-screenshots": {
       type: "string",
-      description: "Maximum screenshots to capture (default: 24)",
+      description: `Maximum page-capture files including the full-page plate, excluding derived contact sheets (default: ${DEFAULT_MAX_SCREENSHOTS})`,
     },
     timeout: {
       type: "string",
@@ -101,6 +127,14 @@ export default defineCommand({
   },
   // fallow-ignore-next-line complexity
   async run({ args }) {
+    const { captureUpstreamProxy } = await import("../capture/upstreamProxy.js");
+    try {
+      captureUpstreamProxy();
+    } catch (error) {
+      console.error(normalizeErrorMessage(error));
+      failCommand();
+    }
+
     if (args.video) {
       const { runVideoMode } = await import("./capture/video.js");
       await runVideoMode({
@@ -112,22 +146,50 @@ export default defineCommand({
       return;
     }
 
-    const url = args.url as string | undefined;
-    if (!url) {
-      console.error(
-        "Missing URL. Pass a website URL, or use --video <project> for video download.",
-      );
-      failCommand();
+    const localFile = args["local-file"] as string | undefined;
+    const localRoot = args["local-root"] as string | undefined;
+    let url = args.url as string | undefined;
+    if (localFile !== undefined) {
+      if (url) {
+        console.error("Pass either a URL or --local-file, not both.");
+        failUsage();
+      }
+      const { resolveLocalCaptureTarget } = await import("../capture/localPage.js");
+      try {
+        url = resolveLocalCaptureTarget(localFile, localRoot).fileUrl;
+      } catch (err) {
+        console.error(normalizeErrorMessage(err));
+        failCommand();
+      }
+    } else {
+      if (localRoot !== undefined) {
+        console.error("--local-root requires --local-file.");
+        failUsage();
+      }
+      if (!url) {
+        console.error(
+          "Missing URL. Pass a website URL, --local-file <path>, or --video <project> for video download.",
+        );
+        failUsage();
+      }
+      try {
+        new URL(url);
+      } catch {
+        console.error(`Invalid URL: ${url}`);
+        failUsage();
+      }
     }
 
-    try {
-      new URL(url);
-    } catch {
-      console.error(`Invalid URL: ${url}`);
-      failCommand();
-    }
+    const captureBudgetMs = parsePositiveInteger(
+      args["capture-budget"] as string | undefined,
+      "--capture-budget",
+      " in milliseconds",
+    );
 
-    const captureBudgetMs = parseCaptureBudget(args["capture-budget"] as string | undefined);
+    const maxScreenshots = parsePositiveInteger(
+      args["max-screenshots"] as string | undefined,
+      "--max-screenshots",
+    );
 
     const isDefaultOutput = !args.output;
     let outputName = (args.output as string | undefined) ?? "capture";
@@ -163,18 +225,20 @@ export default defineCommand({
 
     const { captureWebsite } = await import("../capture/index.js");
 
+    let captureFailed = false;
     try {
       const result = await captureWebsite(
         {
           url,
+          localFile,
+          localRoot,
           outputDir,
           skipAssets: args["skip-assets"] as boolean,
           skipVision: args["skip-vision"] as boolean,
-          maxScreenshots: args["max-screenshots"]
-            ? parseInt(args["max-screenshots"] as string)
-            : undefined,
+          maxScreenshots,
           timeout: args.timeout ? parseInt(args.timeout as string) : undefined,
           postNavigationBudgetMs: captureBudgetMs,
+          captureDeadlineMs: parseCaptureDeadline(process.env.HYPERFRAMES_CAPTURE_DEADLINE_MS),
           json: isJson,
           onPhase: emitCapturePhase,
         },
@@ -196,6 +260,7 @@ export default defineCommand({
             },
       );
 
+      captureFailed = !result.ok;
       if (isJson) {
         // Output structured JSON for Claude Code / programmatic use
         console.log(
@@ -225,7 +290,9 @@ export default defineCommand({
       } else {
         const { c } = await import("../ui/colors.js");
         console.log();
-        console.log(c.success("◇") + `  Captured ${c.bold(result.title)} → ${c.dim(outputDir)}`);
+        const icon = result.ok ? c.success("◇") : c.error("✗");
+        const status = result.ok ? "Captured" : "Capture failed";
+        console.log(icon + `  ${status} ${c.bold(result.title)} → ${c.dim(outputDir)}`);
         console.log();
         console.log(`  ${c.dim("Screenshots:")} ${result.screenshots.length}`);
         console.log(`  ${c.dim("Assets:")} ${result.assets.length}`);
@@ -267,11 +334,12 @@ export default defineCommand({
     } catch (err) {
       const errMsg = normalizeErrorMessage(err);
       try {
-        const { mkdirSync, writeFileSync } = await import("node:fs");
+        const { mkdirSync } = await import("node:fs");
         const { formatCaptureFailureReason } = await import("../capture/captureTimeout.js");
+        const { writeCaptureFileSync } = await import("../capture/captureFile.js");
         mkdirSync(outputDir, { recursive: true });
         const reason = formatCaptureFailureReason(errMsg);
-        writeFileSync(
+        writeCaptureFileSync(
           `${outputDir}/BLOCKED.md`,
           `# Capture Failed\n\n${reason}\n\nURL: ${url}\n\n## What to try\n\n- Re-run with a longer timeout: \`--timeout 60000\`\n- The site may block headless browsers (anti-bot protection)\n- Try capturing a different page on the same domain\n`,
           "utf-8",
@@ -280,11 +348,14 @@ export default defineCommand({
         /* best-effort */
       }
       if (isJson) {
-        console.log(JSON.stringify({ ok: false, error: errMsg }));
+        console.log(JSON.stringify(jsonFailure("runtime_error", errMsg)));
       } else {
         console.error(`\n  ✗ Capture failed: ${errMsg}\n`);
       }
+      scheduleCliExit(1);
       failCommand();
     }
+    scheduleCliExit(captureFailed ? 1 : 0);
+    if (captureFailed) failCommand();
   },
 });

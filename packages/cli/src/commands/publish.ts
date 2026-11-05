@@ -1,31 +1,35 @@
 import { join, posix, relative, resolve } from "node:path";
 import { failCommand, setCommandExitCode } from "../utils/commandResult.js";
 import { existsSync } from "node:fs";
-import { defineCommand } from "citty";
-import * as clack from "@clack/prompts";
+import { defineCommand } from "../utils/defineCommand.js";
+import * as clack from "../ui/prompts.js";
 
 import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
+import { isUnattended } from "../utils/attendedTerminal.js";
 import {
   definitiveEntryMismatchComposition,
   hasDefinitiveEntryMismatch,
   lintProject,
 } from "../utils/lintProject.js";
 import { formatLintStartupMessage } from "../utils/lintFormat.js";
+import { envCredentialVar } from "../auth/resolver.js";
 import {
   buildPublishFileMap,
   publishProjectArchive,
+  resolvePublishCredential,
   zipPublishFileMap,
 } from "../utils/publishProject.js";
 import { bakeMediaProxies } from "../utils/publishProxyBake.js";
+import type { ResolvedCredential } from "../auth/resolver.js";
 import { resolveAutoProxy } from "../utils/projectConfig.js";
-import { tryResolveCredential } from "../auth/index.js";
 import {
   ensureProjectId,
   readProjectLink,
   readTeamProject,
   writeTeamProject,
 } from "../utils/projectLink.js";
+import { cliSourced } from "../utils/sourceTag.js";
 
 export const examples: Example[] = [
   ["Publish the current project privately to a stable URL", "hyperframes publish"],
@@ -92,6 +96,9 @@ export default defineCommand({
     },
   },
   async run({ args }) {
+    if (args.yes !== true && isUnattended()) {
+      clack.confirmationRequired("hyperframes publish", "Pass --yes to publish without asking.");
+    }
     const rawArg = args.dir;
     const dir = resolve(rawArg ?? ".");
     const indexPath = join(dir, "index.html");
@@ -163,14 +170,34 @@ export default defineCommand({
     const spaceOverride =
       typeof args.space === "string" && args.space.trim() ? args.space.trim() : undefined;
 
-    // --update / --space only take effect for an authenticated owner. Fail loudly rather
-    // than silently minting a fresh URL — the exact failure mode this feature removes.
+    // Resolved once and passed to the upload: a second lookup after the bake could fall back
+    // from an expired login to a saved API key and silently drop --update / --space.
+    let credential: ResolvedCredential | null;
+    try {
+      credential = await resolvePublishCredential();
+    } catch (err: unknown) {
+      console.error();
+      console.error(`  ${(err as Error).message}`);
+      console.error();
+      setCommandExitCode(1);
+      return;
+    }
+
+    // --update / --space only take effect for a login (an API-key publish is never owned).
+    // Fail loudly rather than silently minting a fresh URL.
     if (updateTarget || spaceOverride) {
-      const credential = await tryResolveCredential();
-      if (!credential) {
+      if (credential?.type !== "oauth") {
+        const flag = updateTarget ? "--update" : "--space";
+        const envKey = credential && envCredentialVar(credential.source);
         console.log();
         console.log(
-          `  ${c.error(`${updateTarget ? "--update" : "--space"} requires authentication. Run 'hyperframes auth login' first.`)}`,
+          `  ${c.error(
+            !credential
+              ? `${flag} requires authentication. Run 'hyperframes auth login' first.`
+              : envKey
+                ? `${flag} requires a login; ${envKey} cannot own a project. Run 'hyperframes auth login'.`
+                : `${flag} requires a login; an API key cannot own a project. Run 'hyperframes auth login'.`,
+          )}`,
         );
         console.log();
         setCommandExitCode(1);
@@ -215,6 +242,7 @@ export default defineCommand({
         projectId: requestedProjectId,
         spaceId,
         archive,
+        credential,
       });
       publishSpinner.stop(c.success("Project published"));
 
@@ -286,30 +314,18 @@ export default defineCommand({
       } else {
         const claimUrl = new URL(published.url);
         claimUrl.searchParams.set("claim_token", published.claimToken);
-        console.log(`  ${c.dim("Claim URL")}  ${c.accent(claimUrl.toString())}`);
+        console.log(`  ${c.dim("Claim URL")}  ${c.accent(cliSourced(claimUrl.toString()))}`);
         console.log(`  ${c.dim("Access")}     ${c.accent("Sign in required to claim")}`);
         console.log();
-        if (updateTarget || spaceOverride) {
-          // The pre-publish gate saw a credential, but the server didn't accept it (expired
-          // or invalid) and fell back to anonymous — say so loudly instead of pretending the
-          // requested update happened.
-          console.log(
-            `  ${c.error(`Your login looks expired or invalid, so ${updateTarget ? "--update" : "--space"} was ignored and a NEW url was created above.`)}`,
-          );
-          console.log(
-            `  ${c.dim("Run 'hyperframes auth login' again, then re-publish to update in place.")}`,
-          );
-        } else {
-          console.log(
-            `  ${c.dim("Open the claim URL on hyperframes.dev, sign in, and claim the project to continue editing.")}`,
-          );
-          console.log();
-          const visibilityTip =
-            args.public === true
-              ? "--public applies to the claimed project; this claim URL still requires sign-in."
-              : "Run 'hyperframes auth login' first for a stable link you can re-publish to; add --public to allow signed-out viewing.";
-          console.log(`  ${c.dim(`Tip: ${visibilityTip}`)}`);
-        }
+        console.log(
+          `  ${c.dim("Open the claim URL on hyperframes.studio, sign in, and claim the project to continue editing.")}`,
+        );
+        console.log();
+        const visibilityTip =
+          args.public === true
+            ? "--public applies to the claimed project; this claim URL still requires sign-in."
+            : "Run 'hyperframes auth login' first for a stable link you can re-publish to; add --public to allow signed-out viewing.";
+        console.log(`  ${c.dim(`Tip: ${visibilityTip}`)}`);
         console.log();
       }
       return;

@@ -1,7 +1,7 @@
 import { buildProjectApiPath } from "../../utils/projectRouting";
 import { useContext, useState, useCallback, useRef, useEffect, type ReactNode } from "react";
-import { useTimelinePlayer, usePlayerStore } from "../../player";
-import type { TimelineElement } from "../../player";
+import { useTimelinePlayer } from "../../player/hooks/useTimelinePlayer";
+import { usePlayerStore, type TimelineElement } from "../../player/store/playerStore";
 import type { PreviewIframeSlot } from "../../player/hooks/useTimelineSyncCallbacks";
 import type { CompositionLevel } from "./CompositionBreadcrumb";
 import { useCompositionStack } from "./useCompositionStack";
@@ -9,6 +9,8 @@ import { setCompositionSourceMap } from "../editor/domEditingDom";
 import { ensureMotionPathPluginLoaded } from "../../utils/gsapSoftReload";
 import { useAssetPreviewStore } from "../../utils/assetPreviewStore";
 import { createStableContext } from "../../utils/hmrStableContext";
+import { studioApiFetch } from "../../utils/studioApiFetch";
+import { previewReloadBegun } from "../../player/previewReloading";
 
 export function shouldDisableTimelineWhileCompositionLoading(compositionLoading: boolean): boolean {
   return compositionLoading;
@@ -18,8 +20,10 @@ export interface NLEContextValue {
   projectId: string;
   // player (from useTimelinePlayer — single instance for the whole shell)
   iframeRef: React.MutableRefObject<HTMLIFrameElement | null>;
+  play: () => void;
+  pause: () => void;
   togglePlay: () => void;
-  seek: (time: number, options?: { keepPlaying?: boolean }) => boolean;
+  seek: (time: number, options?: { keepPlaying?: boolean; follow?: boolean }) => boolean;
   refreshPlayer: () => void;
   onIframeLoad: () => void;
   // The hidden reload iframe NLEPreview renders next to the live one during a full reload.
@@ -84,6 +88,8 @@ export function NLEProvider({
   const containerRef = useRef<HTMLDivElement>(null);
   const {
     iframeRef,
+    play,
+    pause,
     togglePlay,
     seek,
     onIframeLoad: baseOnIframeLoad,
@@ -125,9 +131,13 @@ export function NLEProvider({
   // Lightweight reload: change iframe src instead of destroying the Player.
   const prevRefreshKeyRef = useRef(refreshKey);
   useEffect(() => {
-    if (refreshKey === prevRefreshKeyRef.current) return;
-    prevRefreshKeyRef.current = refreshKey;
-    refreshPlayer();
+    try {
+      if (refreshKey === prevRefreshKeyRef.current) return;
+      prevRefreshKeyRef.current = refreshKey;
+      refreshPlayer();
+    } finally {
+      previewReloadBegun();
+    }
   }, [refreshKey, refreshPlayer]);
 
   // Steps that follow every load of the live iframe, including a reload promoted in place.
@@ -205,7 +215,7 @@ export function NLEProvider({
     setCompositionSourceMap(emptyMap);
     onCompIdToSrcChangeRef.current?.(emptyMap);
 
-    fetch(buildProjectApiPath(projectId, `/files/index.html`), {
+    studioApiFetch(buildProjectApiPath(projectId, `/files/index.html`), {
       signal: controller.signal,
     })
       .then((r) => {
@@ -298,6 +308,8 @@ export function NLEProvider({
   const value: NLEContextValue = {
     projectId,
     iframeRef,
+    play,
+    pause,
     containerRef,
     togglePlay,
     seek,
