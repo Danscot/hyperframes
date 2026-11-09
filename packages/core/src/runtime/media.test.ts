@@ -1,9 +1,10 @@
 // fallow-ignore-file code-duplication
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, onTestFinished } from "vitest";
 import { mediaElementTime } from "./mediaClock";
 import {
   evictMediaSyncState,
   hasMediaSyncStateForTest,
+  isUnplayable,
   primeMediaForLaterStarts,
   readElementPlaybackRate,
   readElementPlaybackStart,
@@ -1051,6 +1052,80 @@ describe("syncRuntimeMedia", () => {
       expect(clip.el.play).not.toHaveBeenCalled();
     });
 
+    function askedToPlayAtHeader(
+      networkState: number,
+      play?: () => Promise<void>,
+      readyState: number = HTMLMediaElement.HAVE_METADATA,
+    ) {
+      vi.useFakeTimers({ toFake: ["performance"] });
+      onTestFinished(() => vi.useRealTimers());
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      onTestFinished(() => warn.mockRestore());
+      const clip = createMockClip({ start: 0, end: 10 });
+      clip.el.src = "/alpha.webm";
+      if (play) clip.el.play = vi.fn(play);
+      Object.defineProperty(clip.el, "readyState", { value: readyState, configurable: true });
+      Object.defineProperty(clip.el, "networkState", { value: networkState, configurable: true });
+      syncRuntimeMedia({ clips: [clip], timeSeconds: 1, playing: true, playbackRate: 1 });
+      expect(clip.el.play).toHaveBeenCalledTimes(1);
+      return { el: clip.el, warn };
+    }
+
+    it("skips a clip whose fetch stopped at its header 5 s after it was asked to play", () => {
+      const { el, warn } = askedToPlayAtHeader(HTMLMediaElement.NETWORK_IDLE);
+      vi.advanceTimersByTime(4999);
+      expect(isUnplayable(el)).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(isUnplayable(el)).toBe(true);
+      expect(isUnplayable(el)).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("/alpha.webm");
+    });
+
+    it("keeps waiting on a clip still loading at its header 5 s after it was asked to play", () => {
+      const { el, warn } = askedToPlayAtHeader(HTMLMediaElement.NETWORK_LOADING);
+      vi.advanceTimersByTime(60_000);
+      expect(isUnplayable(el)).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("skips and names a clip the browser never started loading 5 s after it was asked to play", () => {
+      const { el, warn } = askedToPlayAtHeader(
+        HTMLMediaElement.NETWORK_LOADING,
+        undefined,
+        HTMLMediaElement.HAVE_NOTHING,
+      );
+      vi.advanceTimersByTime(4999);
+      expect(isUnplayable(el)).toBe(false);
+      vi.advanceTimersByTime(1);
+      expect(isUnplayable(el)).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain(
+        'alpha.webm": the browser never started loading it',
+      );
+    });
+
+    it("keeps waiting on a clip with no data yet whose bytes are arriving", () => {
+      const { el, warn } = askedToPlayAtHeader(
+        HTMLMediaElement.NETWORK_LOADING,
+        undefined,
+        HTMLMediaElement.HAVE_NOTHING,
+      );
+      el.dispatchEvent(new Event("progress"));
+      vi.advanceTimersByTime(60_000);
+      expect(isUnplayable(el)).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("keeps waiting on a clip at its header whose play() the browser refused", async () => {
+      const refused = () => Promise.reject(new DOMException("needs a tap", "NotAllowedError"));
+      const { el, warn } = askedToPlayAtHeader(HTMLMediaElement.NETWORK_IDLE, refused);
+      await Promise.resolve();
+      vi.advanceTimersByTime(5000);
+      expect(isUnplayable(el)).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
     it("plays again once the element recovers (error clears)", () => {
       const clip = createMockClip({ start: 0, end: 10 });
       Object.defineProperty(clip.el, "error", { value: { code: 4 }, configurable: true });
@@ -1547,6 +1622,53 @@ describe("syncRuntimeMedia", () => {
     });
 
     expect(onElementVolume).toHaveBeenLastCalledWith(clip.el, 0.5, 1, 0.8);
+  });
+
+  describe("a muted video's own audio track", () => {
+    // A muted video still takes its clock from its audio track; a late track start stalls the picture after a cut.
+    const withTracks = (el: HTMLMediaElement, tracks: Array<{ enabled: boolean }>) =>
+      Object.defineProperty(el, "audioTracks", { value: tracks, configurable: true });
+    const tick = (clip: RuntimeMediaClip) =>
+      syncRuntimeMedia({ clips: [clip], timeSeconds: 5, playing: true, playbackRate: 1 });
+
+    it("is switched off for a video the author muted", () => {
+      const clip = createMockClip({ start: 0, end: 10 });
+      clip.el.setAttribute("muted", "");
+      const tracks = [{ enabled: true }];
+      withTracks(clip.el, tracks);
+      tick(clip);
+      expect(tracks[0].enabled).toBe(false);
+    });
+
+    it("stays on for a video that can sound", () => {
+      const clip = createMockClip({ start: 0, end: 10 });
+      const tracks = [{ enabled: true }];
+      withTracks(clip.el, tracks);
+      tick(clip);
+      expect(tracks[0].enabled).toBe(true);
+    });
+
+    it("stays on for a video that is muted by script and unmuted later", () => {
+      const clip = createMockClip({ start: 0, end: 10 });
+      const tracks = [{ enabled: true }];
+      withTracks(clip.el, tracks);
+      clip.el.muted = true;
+      tick(clip);
+      clip.el.muted = false;
+      tick(clip);
+      expect(tracks[0].enabled).toBe(true);
+    });
+
+    it("is switched off when the browser lists it after the first tick", () => {
+      const clip = createMockClip({ start: 0, end: 10 });
+      clip.el.setAttribute("muted", "");
+      const tracks: Array<{ enabled: boolean }> = [];
+      withTracks(clip.el, tracks);
+      tick(clip);
+      tracks.push({ enabled: true });
+      tick(clip);
+      expect(tracks[0].enabled).toBe(false);
+    });
   });
 
   describe("per-element mute (Web Audio ownership)", () => {

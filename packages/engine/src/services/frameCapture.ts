@@ -53,6 +53,7 @@ import {
   describePageMotionBlur,
   describePageMotionBlurAtEnd,
   installPageMotionBlur,
+  pageMotionBlurRecorder,
 } from "./pageMotionBlur.js";
 
 // ── Extracted modules ───────────────────────────────────────────────────────
@@ -84,9 +85,10 @@ import {
 import {
   classifyGpuRenderer,
   detectGpuBackend,
+  drawElementGate,
+  type DrawElementGateReason,
   injectDrawElementCanvas,
   captureDrawElementFrame,
-  resolveDrawElementCaptureMode,
   forcePreservedDrawingBuffer,
   instrumentAcceleratedCanvases,
   initDrawElementWorkerEncode,
@@ -114,6 +116,7 @@ import type {
   CapturePerfSummary,
   CaptureWarning,
   HfSeekOptions,
+  PageMotionBlurSummary,
   SubTimelineWaitMemo,
   SubTimelineWaitOutcome,
 } from "../types.js";
@@ -150,7 +153,8 @@ type CaptureStep =
   | "waiting for page seek handlers"
   | "loading color-grading LUTs"
   | "compositing the page"
-  | "capturing the frame";
+  | "capturing the frame"
+  | "waiting for a late image";
 
 export interface CaptureSession {
   browser: Browser;
@@ -179,6 +183,7 @@ export interface CaptureSession {
   lastFrameAbsoluteIndex?: number;
   /** Count of frames served from a reused buffer (dedup telemetry). */
   staticDedupCount?: number;
+  pageMotionBlur?: PageMotionBlurSummary;
   /** Live Chrome memory sampler; started in initializeSession, stopped in closeCaptureSession. */
   chromeMemory?: ChromeMemorySampler;
   /**
@@ -242,6 +247,8 @@ export interface CaptureSession {
   subTimelineWaitMemo: SubTimelineWaitMemo;
   /** Structured readiness warnings surfaced to the producer's render policy. */
   warnings: CaptureWarning[];
+  /** Images still loading when capture began: a frame that shows one waits for it (waitForShownLateImages). */
+  lateImages?: Set<string>;
   initTelemetry?: {
     initDurationMs: number;
     tweenCount: number;
@@ -540,7 +547,10 @@ export async function decodeDynamicCssBackgroundImages(page: Page): Promise<stri
           image.src = url;
           let timer: ReturnType<typeof setTimeout> | undefined;
           const expired = new Promise<"late">((resolve) => {
-            timer = setTimeout(() => resolve("late"), limitMs);
+            timer = (window.__HF_VIRTUAL_TIME__?.originalSetTimeout ?? setTimeout)(
+              () => resolve("late"),
+              limitMs,
+            );
           });
           try {
             const outcome = await Promise.race([
@@ -971,6 +981,18 @@ async function waitForCloseWithTimeout(promise: Promise<unknown>): Promise<boole
   return !timedOut;
 }
 
+const DE_GATE_MESSAGES: Record<DrawElementGateReason, string> = {
+  swiftshader:
+    "SwiftShader (software rasterizer, no GPU egress to skip, drawElement is " +
+    "parity-or-slower; see fast-capture-limitations.md)",
+  webgl_unavailable:
+    "WebGL is unavailable (no GPU behind this browser, so it rasterizes in software and " +
+    "drawElement has no GPU egress to skip)",
+  beginframe_no_self_verify:
+    "this browser was launched for BeginFrame capture, whose self-verify truth page has no " +
+    "BeginFrame driver, so drawElement frames could not be checked",
+};
+
 /**
  * Post-readiness capture-surface init, shared by the screenshot and BeginFrame
  * init paths (called after the page is fully ready). When `useDrawElement` is
@@ -1125,18 +1147,21 @@ async function initDrawElementOrTransparentBackground(
     // Both reproduced on Chrome <=150 (video+caption-fade ~12 dB; stacked fade
     // 24.5 dB) and both render correctly on 151 (verified: video+nested-fade repro
     // PSNR=inf; efb59c5b 24.5→47.4 dB, 0 damaged frames). 151 is the pinned floor.
-    const mode = resolveDrawElementCaptureMode(session.isSwiftShader, transparent);
-    if (mode === "screenshot") {
-      session.deGateReason = "swiftshader";
-      session.deFallbackTrigger = "swiftshader";
+    const gateReason = drawElementGate({
+      backend: gpuBackend,
+      launchCaptureMode: session.launchCaptureMode,
+      forceDE,
+    });
+    if (gateReason !== null) {
+      session.deGateReason = gateReason;
+      session.deFallbackTrigger = gateReason;
       // Fall back to the browser's LAUNCH mode, not unconditionally to
       // "screenshot": on a BeginFrame-launched browser (Linux fast capture)
       // Page.captureScreenshot hangs for the full protocol timeout, while
       // beginFrameCapture is the platform's normal baseline path.
       console.error(
         `[engine] fast capture falls back to ${session.launchCaptureMode} capture: ` +
-          "SwiftShader (software rasterizer, no GPU egress to skip, drawElement is " +
-          "parity-or-slower; see fast-capture-limitations.md)",
+          DE_GATE_MESSAGES[gateReason],
       );
       await routeToFallback();
     } else {
@@ -1342,7 +1367,7 @@ async function cssEffectRiskFrames(
       fps,
       totalFrames,
       totalFrames * MAX_RISK_FRAME_FRACTION,
-      { onProgress: session.options.onEffectScanProgress },
+      { onProgress: session.options.onEffectScanProgress, onEnd: session.options.onEffectScanEnd },
     );
     return live && withFramesAfterCallback(live, scan.callbackFrom, fps, totalFrames);
   } catch (error) {
@@ -1856,7 +1881,9 @@ export const HF_READY_DIAGNOSTIC_EXPR = `(async function() {
         function() { settled[key] = "rejected"; },
       );
     });
-    await new Promise(function(r) { setTimeout(r, 0); });
+    await new Promise(function(r) {
+      (window.__HF_VIRTUAL_TIME__ && window.__HF_VIRTUAL_TIME__.originalSetTimeout || setTimeout)(r, 0);
+    });
   }
   // A thenable resolving via its own setTimeout(0) can still misreport as
   // pending here (macrotask registration order, not resolution order), a
@@ -1889,13 +1916,17 @@ export interface HfDiagnostic {
 }
 
 // fallow-ignore-next-line complexity
-export function buildZeroDurationDiagnostic(diag: HfDiagnostic): string {
+export function buildZeroDurationDiagnostic(diag: HfDiagnostic, timeoutMs?: number): string {
   const hints: string[] = [];
   if (diag.pendingBuildReadyKeys.length > 0) {
     hints.push(
       `window.__hf.buildReady never resolved for: ${diag.pendingBuildReadyKeys.join(", ")}. ` +
         "The runtime holds render-ready until every registered buildReady promise settles. " +
-        "Find where the composition registers that key and confirm it actually resolves.",
+        "Find where the composition registers that key and confirm it actually resolves. " +
+        "During a render, Date and performance.now stay at 0 and requestAnimationFrame " +
+        "callbacks wait until the first frame, so setup that awaits an animation frame or " +
+        "the clock never finishes. Await the library's own readiness promise instead (for " +
+        "Three.js, renderer.compileAsync).",
     );
   }
   if (diag.rejectedBuildReadyKeys.length > 0) {
@@ -1907,7 +1938,7 @@ export function buildZeroDurationDiagnostic(diag: HfDiagnostic): string {
   if (!diag.hasPlayer) {
     hints.push("window.__player was never set: the HyperFrames runtime did not initialize.");
   }
-  if (!diag.hasTimeline) {
+  if (diag.renderReady && !diag.hasTimeline) {
     hints.push(
       "No GSAP timeline registered (window.__timelines is empty). " +
         "CSS/WAAPI/Lottie animations are usually auto-detected (the runtime infers " +
@@ -1925,8 +1956,12 @@ export function buildZeroDurationDiagnostic(diag: HfDiagnostic): string {
   if (diag.hasSeek && diag.duration === 0 && diag.renderReady) {
     hints.push("The runtime finished initializing but reported zero duration. This is permanent.");
   }
+  const within = timeoutMs === undefined ? "" : ` within ${timeoutMs}ms`;
+  const headline = diag.renderReady
+    ? "Composition has zero duration."
+    : `Composition setup did not finish${within}.`;
   return (
-    `[FrameCapture] Composition has zero duration.\n` +
+    `[FrameCapture] ${headline}\n` +
     `  Runtime ready: ${diag.renderReady}, __player: ${diag.hasPlayer}, ` +
     `__hf.seek: ${diag.hasSeek}, GSAP timeline: ${diag.hasTimeline}, ` +
     `data-duration: ${diag.declaredDuration > 0 ? diag.declaredDuration + "s" : "not set"}\n` +
@@ -1995,7 +2030,7 @@ export async function pollHfReady(
 
   const diag = await evaluateHfDiagnostic(page);
   if (diag.hasSeek && diag.duration === 0) {
-    throw new Error(buildZeroDurationDiagnostic(diag));
+    throw new Error(buildZeroDurationDiagnostic(diag, timeoutMs));
   }
   throw new Error(
     `[FrameCapture] window.__hf not ready after ${timeoutMs}ms. ` +
@@ -2492,6 +2527,99 @@ function recordCaptureWarnings(session: CaptureSession, warnings: readonly Captu
   }
 }
 
+function recordReadiness(session: CaptureSession, warnings: readonly CaptureWarning[]): void {
+  recordCaptureWarnings(session, warnings);
+  for (const warning of warnings) {
+    if (warning.code !== "media_readiness_timeout" || warning.details?.mediaType !== "image")
+      continue;
+    session.lateImages ??= new Set();
+    for (const source of warning.details.sources ?? []) session.lateImages.add(source);
+  }
+}
+
+/** Thrown when a frame would show an image that never arrived: the video would silently lack it. */
+export class ImageMissingFromFrameError extends Error {
+  constructor(
+    readonly frameIndex: number,
+    readonly sources: readonly string[],
+    readonly failedToLoad: boolean,
+  ) {
+    super(
+      `Frame ${frameIndex} shows ${sources.join(", ")}, which ${failedToLoad ? "failed to load" : "did not load in time"}, ` +
+        `so the render stopped rather than make a video missing it. ` +
+        (failedToLoad
+          ? `Check that the image exists and can be opened.`
+          : `Try fewer workers (--workers 1) or a longer --player-ready-timeout.`),
+    );
+    this.name = "ImageMissingFromFrameError";
+  }
+}
+
+const LATE_IMAGE_POLL_MS = 100;
+
+/** Before a frame: wait for any late image it shows, for as long as the page was given to get ready, else stop. */
+export async function waitForShownLateImages(
+  session: CaptureSession,
+  frameIndex: number,
+): Promise<void> {
+  const lateImages = session.lateImages;
+  if (!lateImages?.size) return;
+  session.captureStep = "waiting for a late image";
+  const timeoutMs = session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const { arrived, waiting, broken } = await session.page.evaluate(async (urls: string[]) => {
+      const listed = new Set(urls);
+      const found = Array.from(document.querySelectorAll("img")).filter((img) =>
+        listed.has(img.src),
+      );
+      const loaded = found.filter((img) => img.complete && img.naturalWidth > 0);
+      await Promise.allSettled(loaded.map((img) => img.decode()));
+      const inViewport = (img: HTMLImageElement) => {
+        const box = img.getBoundingClientRect();
+        return (
+          box.width > 0 &&
+          box.height > 0 &&
+          box.right > 0 &&
+          box.bottom > 0 &&
+          box.left < window.innerWidth &&
+          box.top < window.innerHeight
+        );
+      };
+      const shown = found.filter(
+        (img) =>
+          !loaded.includes(img) &&
+          img.checkVisibility({ opacityProperty: true, visibilityProperty: true }) &&
+          inViewport(img),
+      );
+      return {
+        arrived: loaded.map((img) => img.src),
+        waiting: shown.filter((img) => !img.complete).map((img) => img.src),
+        broken: shown.filter((img) => img.complete).map((img) => img.src),
+      };
+    }, Array.from(lateImages));
+    for (const source of arrived) lateImages.delete(source);
+    const missing = Date.now() >= deadline ? [...waiting, ...broken] : broken;
+    if (missing.length > 0) {
+      const stopped = new ImageMissingFromFrameError(
+        frameIndex,
+        [...new Set(missing.map(sanitizeDiagnosticUrl))].sort(),
+        broken.length > 0,
+      );
+      recordCaptureWarnings(session, [
+        {
+          code: "image_missing_from_frame",
+          message: stopped.message,
+          details: { mediaType: "image", sources: [...stopped.sources] },
+        },
+      ]);
+      throw stopped;
+    }
+    if (waiting.length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, LATE_IMAGE_POLL_MS));
+  }
+}
+
 /** Report background urls that timed out decoding; the shown url drops credentials and query. */
 export function recordBackgroundDecodeTimeouts(
   session: CaptureSession,
@@ -2551,8 +2679,8 @@ export function recordSubTimelineWarning(session: CaptureSession, timeoutMs: num
           `${pendingSuffix} (${sources.join(", ")}). Fix the error; a composition animated by ` +
           `CSS or rAF rather than a GSAP timeline must mark its host with data-no-timeline.`
         : scriptFailure
-          ? `A sub-composition timeline script failed to load (${sources.join(", ")})` +
-            scriptLoadCauseSuffix(loadCauses)
+          ? `A sub-composition timeline script failed to load${scriptLoadCauseSuffix(loadCauses)} ` +
+            `(${sources.join(", ")})`
           : `Sub-composition timelines did not become ready within ${timeoutMs}ms${pendingSuffix}. ` +
             `This can be intentional: a composition driven by CSS animations or rAF never registers ` +
             `window.__timelines[id], and marking its host with data-no-timeline skips the wait entirely. ` +
@@ -2773,9 +2901,28 @@ export interface ScriptLoadCause {
   origin: ScriptLoadOrigin;
   /** `net::ERR_*`, `http-<status>` or `unknown`. */
   code: string;
+  /** `name@x.y.z` of a public CDN's npm package, so a report says which library failed; never the URL. */
+  lib?: string;
 }
 
 const CDN_HOSTS = /^(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com)$/;
+
+const LIB = "([a-z0-9][a-z0-9._-]{0,48})";
+const VERSION = "(\\d+\\.\\d+\\.\\d+)";
+const LIB_PATHS = [
+  ["cdn.jsdelivr.net", new RegExp(`^/npm/${LIB}@${VERSION}/`)],
+  ["unpkg.com", new RegExp(`^/${LIB}@${VERSION}/`)],
+  ["cdnjs.cloudflare.com", new RegExp(`^/ajax/libs/${LIB}/${VERSION}/`)],
+] as const;
+
+/** `name@x.y.z` for an unscoped package at one exact version on a public CDN, else undefined. */
+function cdnLib(url: URL): string | undefined {
+  for (const [host, path] of LIB_PATHS) {
+    const match = url.hostname === host ? path.exec(url.pathname) : null;
+    if (match) return `${match[1]}@${match[2]}`;
+  }
+  return undefined;
+}
 
 /** Where a failed script came from and why, never its URL, host or path. */
 export function classifyScriptLoadCause(
@@ -2794,12 +2941,16 @@ export function classifyScriptLoadCause(
       : /^net::ERR_[A-Z0-9_]{1,40}$/.test(failure)
         ? failure
         : "unknown";
-  return { origin, code };
+  const lib = origin === "cdn" ? cdnLib(new URL(url)) : undefined;
+  return lib ? { origin, code, lib } : { origin, code };
 }
 
+/** Each cause's origin and code, then the failed libraries in a bracket the first bracket's readers ignore. */
 function scriptLoadCauseSuffix(causes: readonly ScriptLoadCause[]): string {
   const shown = causes.slice(0, 4).map((c) => `${c.origin}/${c.code}`);
-  return shown.length === 0 ? "" : ` [script_load: ${shown.join(", ")}]`;
+  if (shown.length === 0) return "";
+  const libs = [...new Set(causes.slice(0, 4).flatMap((c) => (c.lib ? [c.lib] : [])))];
+  return ` [script_load: ${shown.join(", ")}]${libs.length > 0 ? ` [script_lib: ${libs.join(", ")}]` : ""}`;
 }
 
 const CANCELLED_BY_THE_PAGE_NOT_REFUSED = "net::ERR_ABORTED";
@@ -3082,7 +3233,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
           `Continuing render. Affected videos will appear as blank/black frames.`,
       );
     }
-    recordCaptureWarnings(
+    recordReadiness(
       session,
       await collectMediaReadinessWarnings(page, skipVideoIds, pageReadyTimeout),
     );
@@ -3224,7 +3375,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
           `Continuing render. Affected videos will appear as blank/black frames.`,
       );
     }
-    recordCaptureWarnings(
+    recordReadiness(
       session,
       await collectMediaReadinessWarnings(page, bfSkipVideoIds, pageReadyTimeout),
     );
@@ -3399,6 +3550,7 @@ async function prepareFrameForCapture(
   const seekStart = Date.now();
   session.captureStep = "seeking the timeline";
   const hasPendingComposite = await seekPageTimeline(page, quantizedTime, seekOptions);
+  await waitForShownLateImages(session, frameIndex);
 
   session.captureStep = "decoding CSS background images";
   // Mocked pages answer evaluate() with undefined, so tolerate a missing list.
@@ -4833,6 +4985,7 @@ async function captureAccumulatedFrame(
   const eventfulSeekStart = Date.now();
   session.captureStep = "seeking the timeline";
   await seekPageTimeline(session.page, frameTime, undefined);
+  await waitForShownLateImages(session, frameIndex);
   const totals = { seekMs: Date.now() - eventfulSeekStart, beforeCaptureMs: 0, screenshotMs: 0 };
   if (session.onBeforeCapture) {
     // Sub-samples leave a video's style alone: inject at frameTime first so the held frame
@@ -4956,7 +5109,10 @@ async function captureFrameCore(
     session.capturePerf.totalMs += captureTimeMs;
     session.capturePerf.frameMs.push(captureTimeMs);
     if (session.capturePerf.frames === 1) {
-      const blur = await describePageMotionBlur(session.page).catch(() => null);
+      const blur = await describePageMotionBlur(
+        session.page,
+        pageMotionBlurRecorder(session),
+      ).catch(() => null);
       if (blur) console.error(blur);
     }
 
@@ -5253,6 +5409,19 @@ export async function captureFramesBatchPipelined(
   }
   assertVfxIntact(session);
   for (const frameIndex of frameIndices) assertNotRiskFrame(session, frameIndex);
+  // The fused batch seeks inside the page, with no stop between frames to wait for a late image.
+  if (session.lateImages?.size) {
+    const oneByOne: Array<{ frameIndex: number; encodeResult: Promise<Buffer> }> = [];
+    for (const [i, frameIndex] of frameIndices.entries()) {
+      const { encodeResult } = await captureFrameToBufferPipelined(
+        session,
+        frameIndex,
+        times[i] ?? 0,
+      );
+      oneByOne.push({ frameIndex, encodeResult });
+    }
+    return oneByOne;
+  }
   const startTime = Date.now();
   const fps = fpsToNumber(options.fps);
   const quantized = times.map((t) => quantizeTimeToFrame(t, fps));
@@ -5407,7 +5576,11 @@ export async function closeCaptureSession(session: CaptureSession): Promise<void
     await waitForCloseWithTimeout(session.chromeMemory.sampleOnce());
   }
   if (session.page && !session.pageReleased) {
-    const blur = await describePageMotionBlurAtEnd(session.page);
+    const blur = await describePageMotionBlurAtEnd(
+      session.page,
+      undefined,
+      pageMotionBlurRecorder(session),
+    );
     if (blur) console.error(blur);
   }
   // Realized static-dedup telemetry: how much the cache actually helped this
@@ -5567,7 +5740,7 @@ export async function seekDeVerifyTruth(
   );
 }
 
-async function captureDeVerificationFrames(
+export async function captureDeVerificationFrames(
   session: CaptureSession,
   page: Page,
   logInitPhase: (phase: string) => void,
@@ -5750,6 +5923,7 @@ export function getCapturePerfSummary(session: CaptureSession): CapturePerfSumma
     chromeGpuProcessSeenLastSample: session.chromeMemory?.stats().gpuProcessSeenLastSample,
     chromeMemorySamples: session.chromeMemory?.stats().samples,
     deGateReason: session.deGateReason,
+    motionBlur: session.pageMotionBlur,
     deFallbackTrigger: session.deFallbackTrigger,
     deWorkerEncode: session.workerEncodeEnabled ?? false,
     deVerifyArmed: session.deVerifyFrames?.size ?? 0,

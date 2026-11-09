@@ -2089,6 +2089,21 @@ describe("checkRenderResolutionPreflight", () => {
       ).toBeUndefined();
     });
 
+    it("clears a landscape-1440p preset on a portrait 720p composition (an exact 2×)", async () => {
+      expect(
+        await checkRenderResolutionPreflight(comp(720, 1280), "landscape-1440p", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("refuses `--resolution 1440p` on a 1920×1080 composition: 4/3 is not an integer scale", async () => {
+      const result = await checkRenderResolutionPreflight(
+        landscapeHtml,
+        "landscape-1440p",
+        agnostic,
+      );
+      expect(result?.kind).toBe("non-integer-scale");
+    });
+
     it("clears a landscape preset on a square composition", async () => {
       // aspect > 1 → landscape, aspect = 1 → square. Both self-heal.
       expect(
@@ -2370,6 +2385,9 @@ describe("normalizeStageCode", () => {
     expect(normalizeStageCode("Encoding frame 600/600")).toBe("encoding_video");
     expect(normalizeStageCode("Encoding frame 12/90")).toBe("encoding_video");
     expect(normalizeStageCode("Capturing frame 120/600 (6 workers)")).toBe("capturing_frame");
+    expect(normalizeStageCode("Checking effects, 240 of 240 frames")).toBe(
+      normalizeStageCode("Checking effects, 12 of 90 frames"),
+    );
     expect(normalizeStageCode("Streaming frame 3/40 (segment 1/2, 2 workers)")).toBe(
       "streaming_frame",
     );

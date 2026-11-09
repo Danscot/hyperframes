@@ -14,6 +14,7 @@ export class Fix extends Error {
   constructor(
     problem: string,
     readonly fix: string,
+    readonly url?: string,
   ) {
     super(problem);
     this.name = "Fix";
@@ -71,6 +72,7 @@ export interface VideoInfo {
   /** The container's frame rate and the stream's average differ: frames are not evenly spaced. */
   vfr: boolean;
   hdr: boolean;
+  transfer?: string;
   codec: string;
 }
 
@@ -159,6 +161,7 @@ export function probeVideo(path: string): VideoInfo {
     avgFps: avg || fps,
     vfr: avg > 0 && Math.abs(avg - fps) / fps > 0.01,
     hdr: /smpte2084|arib-std-b67/.test(video.color_transfer ?? ""),
+    transfer: video.color_transfer,
     codec: video.codec_name ?? "",
   };
 }
@@ -225,7 +228,10 @@ export function readClip(clip: Clip, opts: Omit<ReadOptions, "start" | "seconds"
   if (fps) filters.push(`fps=${fps}`);
   let [w, h] = [clip.width, clip.height];
   if (roi) {
-    filters.push(`crop=${roi[2]}:${roi[3]}:${roi[0]}:${roi[1]}`);
+    filters.push(
+      `format=${gray ? "gray" : "rgb24"}`,
+      `crop=${roi[2]}:${roi[3]}:${roi[0]}:${roi[1]}`,
+    );
     [w, h] = [roi[2], roi[3]];
   }
   if (width && width !== w) {
